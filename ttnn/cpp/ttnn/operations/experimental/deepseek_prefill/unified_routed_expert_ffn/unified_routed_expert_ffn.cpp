@@ -84,7 +84,8 @@ ttnn::Tensor unified_routed_expert_moe(
     const std::vector<ttnn::Tensor>& up_projs,
     const std::vector<ttnn::Tensor>& down_projs,
     uint32_t max_dispatched_tokens_per_expert,
-    const std::optional<const ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
+    const std::optional<const ttnn::DeviceComputeKernelConfig>& compute_kernel_config,
+    const std::optional<tt::tt_metal::GlobalSemaphore>& global_semaphore) {
     TT_FATAL(
         gate_projs.size() == up_projs.size() && gate_projs.size() == down_projs.size(),
         "gate/up/down projection lists must have the same length (got {}, {}, {})",
@@ -144,6 +145,13 @@ ttnn::Tensor unified_routed_expert_moe(
             std::nullopt);
         expert_outputs = ttnn::insert(
             expert_outputs, ffn_out, expert_region_offsets, expert_token_counts, global_expert_idx_table, local_expert);
+
+        // Bump the overlap semaphore by one per processed expert. Starting from 0
+        // this leaves it at `experts_per_chip` once the loop completes. reset_*
+        // sets the absolute value, so we write `local_expert + 1`.
+        if (global_semaphore.has_value()) {
+            global_semaphore->reset_semaphore_value(local_expert + 1);
+        }
     }
     return expert_outputs;
 }

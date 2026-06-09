@@ -57,6 +57,9 @@ from models.demos.deepseek_v3_d_p.tt.moe.visualization_helpers import (
 from models.demos.deepseek_v3_d_p.utils.fast_cache_checker import init_checker
 from tests.ttnn.utils_for_testing import comp_pcc
 
+# L1_SMALL region reserved global semaphore allocation.
+MOE_L1_SMALL_REGION_SIZE = 1024
+
 
 # dispatch_buffer_capacity_factor below is ceil(N/2) of the most conservative
 # integer N such that dgs*seq*N >= theoretical worst-case dispatch buffer.
@@ -579,6 +582,7 @@ def run_model(
                 "fabric_router_config": create_fabric_router_config(
                     max_payload_size=DeepSeekV3Config.FABRIC_PAYLOAD_SIZE
                 ),
+                "l1_small_size": MOE_L1_SMALL_REGION_SIZE,
             },
             2 if is_blackhole() else 1,
             ttnn.Topology.Linear,
@@ -592,6 +596,7 @@ def run_model(
                 "fabric_router_config": create_fabric_router_config(
                     max_payload_size=DeepSeekV3Config.FABRIC_PAYLOAD_SIZE
                 ),
+                "l1_small_size": MOE_L1_SMALL_REGION_SIZE,
             },
             2 if is_blackhole() else 1,
             ttnn.Topology.Linear,
@@ -619,6 +624,7 @@ def run_model(
                 "fabric_router_config": create_fabric_router_config(
                     max_payload_size=DeepSeekV3Config.FABRIC_PAYLOAD_SIZE
                 ),
+                "l1_small_size": MOE_L1_SMALL_REGION_SIZE,
             },
             2 if is_blackhole() else 1,
             ttnn.Topology.Linear,
@@ -632,6 +638,7 @@ def run_model(
                 "fabric_router_config": create_fabric_router_config(
                     max_payload_size=DeepSeekV3Config.FABRIC_PAYLOAD_SIZE
                 ),
+                "l1_small_size": MOE_L1_SMALL_REGION_SIZE,
             },
             2 if is_blackhole() else 1,
             ttnn.Topology.Linear,
@@ -726,6 +733,7 @@ def test_ds_moe(
             {
                 "fabric_config": ttnn.FabricConfig.FABRIC_1D,
                 "fabric_router_config": create_fabric_router_config(max_payload_size=KimiK26Config.FABRIC_PAYLOAD_SIZE),
+                "l1_small_size": MOE_L1_SMALL_REGION_SIZE,
             },
             2 if is_blackhole() else 1,
             ttnn.Topology.Linear,
