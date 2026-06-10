@@ -40,6 +40,7 @@ void kernel_main() {
 
     Noc noc;
     CircularBuffer cb_out0(cb_id_out0);
+    const uint32_t single_tile_size_bytes = cb_out0.get_tile_size();
 
     if (!out1_only) {
         uint32_t z_stride_cum = 0;
