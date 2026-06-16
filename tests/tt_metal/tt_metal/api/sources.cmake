@@ -31,6 +31,7 @@ set(UNIT_TESTS_API_SOURCES
     test_kernel_thread_sync.cpp
     tensor/test_tensor_sharding.cpp
     tensor/test_host_tensor.cpp
+    tensor/test_host_tensor_to_layout.cpp
     tensor/test_mesh_tensor.cpp
     tensor/test_tensor_types.cpp
     test_banked.cpp
