@@ -37,8 +37,12 @@ namespace ring_attention_all_gather_async_detail {
 // All-gather reader runtime-arg layout: [0]=dim, [1]=ring_size, [2]=out_ready_sem,
 // followed by one tensor-descriptor block per gathered input.
 constexpr uint32_t kReaderRuntimeArgHeaderCount = 3;
-constexpr uint32_t kTensorDescriptorFieldCount = 8;
+// Per-input fields: Wt, Ht, out_Wt, out_Ht, batch_head_size, tile_id_start, tile_id_end,
+// input_batch_base, write_local. The trailing write_local (offset 8) is consumed by the writer
+// (local-slice completion); the reader skips it for index alignment.
+constexpr uint32_t kTensorDescriptorFieldCount = 9;
 constexpr uint32_t kInputBatchBaseFieldOffset = 7;
+constexpr uint32_t kWriteLocalFieldOffset = 8;
 
 inline uint32_t input_batch_base_pages(
     uint32_t batch_idx, uint32_t num_heads, uint32_t tensor_height_tiles, uint32_t tensor_width_tiles) {
@@ -75,6 +79,11 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     // When set, gather only this batch slot (dim-0 index) of `input_tensor` into slot 0 of
     // `output_tensor` — lets a consumer keep a full KV cache as input with a batch-1 gathered buffer
     // (a full-batch output also works; only slot 0 is written). std::nullopt => full batch (default).
-    std::optional<uint32_t> input_batch_slice_idx = std::nullopt);
+    std::optional<uint32_t> input_batch_slice_idx = std::nullopt,
+    // When set, inputs with index >= this value also have their local slice written into this
+    // device's own gathered output buffer (write_local). Lets a consumer (ring-joint SDPA sharded
+    // joint) read the gathered buffer as a complete full-length replica. std::nullopt => off for all
+    // inputs (default: local slice omitted from the gathered buffer, the startup-latency optimization).
+    std::optional<uint32_t> write_local_from_input_idx = std::nullopt);
 
 }  // namespace ttnn

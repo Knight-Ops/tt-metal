@@ -124,6 +124,8 @@ void kernel_main() {
         input_tile_id_start[input_idx] = get_arg_val<uint32_t>(arg_idx++);
         input_tile_id_end[input_idx] = get_arg_val<uint32_t>(arg_idx++);
         input_batch_base[input_idx] = get_arg_val<uint32_t>(arg_idx++);
+        // write_local: writer-only (local-slice completion). Read here for arg-index alignment.
+        (void)get_arg_val<uint32_t>(arg_idx++);
     }
 
     auto inputs_tuple = make_tensor_accessor_tuple(inputs_args, arg_idx);
