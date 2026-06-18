@@ -72,24 +72,34 @@ template <typename T>
 concept ProgramDescriptorFactoryConcept = (requires { &T::create_descriptor; } || WorkloadDescriptorConcept<T>) &&
                                           !ProgramFactoryConcept<T> && !MeshWorkloadFactoryConcept<T>;
 
-// Metal 2.0 op-porting stepping-stone factory concept: factories that return
-// ProgramArtifacts (a ProgramSpec + ProgramRunArgs + any op-owned tensors) from
-// create_program_artifacts. The framework adapter stamps a Program from the spec onto
-// each mesh coordinate range on cache miss, and patches every TensorArg (io and
-// op-owned alike) via experimental::UpdateTensorArgs on cache hit.
+// Metal 2.0 op-porting factory concept: factories that return ProgramArtifacts (a ProgramSpec +
+// ProgramRunArgs) from create_program_artifacts. The framework adapter stamps a Program from the spec
+// onto each mesh coordinate range on cache miss, and re-applies run args on cache hit.
 //
-// NOTE: Each TensorArgument in ProgramRunArgs MUST reference a MeshTensor reachable from
-// the factory's `tensor_args` / `tensor_return_value` parameters, OR one of the
-// MeshTensors the factory places in `ProgramArtifacts::op_owned_tensors` — the adapter
-// matches by pointer identity. Referencing a copy or any other MeshTensor will TT_FATAL
-// at runtime.
+// NOTE: Each TensorArgument in ProgramRunArgs MUST reference a MeshTensor reachable from the factory's
+// `tensor_args` / `tensor_return_value` parameters (or, for owned-tensor ops, one ttnn supplies via
+// MetalV2OwnedTensorsFactoryConcept below) — the adapter matches by pointer identity. Referencing a
+// copy or any other MeshTensor will TT_FATAL at runtime.
 //
-// NOTE: This is a stepping-stone concept for incremental migration of operations to
-// Metal 2.0. It is not designed for production use — the cache-hit fast path re-patches
-// op-owned tensors redundantly rather than skipping them.
+// NOTE: stepping-stone concept for incremental migration of operations to Metal 2.0.
 template <typename T>
 concept MetalV2FactoryConcept = requires { &T::create_program_artifacts; } && !ProgramFactoryConcept<T> &&
                                 !MeshWorkloadFactoryConcept<T> && !ProgramDescriptorFactoryConcept<T>;
+
+// Opt-in extension for ops that must allocate their OWN device tensors (scratch / config /
+// workspace), e.g. conv / pool / halo-style ops. Such a factory additionally implements
+//     std::vector<MeshTensor> get_owned_tensors(attrs, tensor_args, tensor_return_value)
+// plus a create_program_artifacts(attrs, tensor_args, tensor_return_value, std::span<const MeshTensor>)
+// overload whose run_params reference the supplied (ttnn-parked) owned tensors. ttnn retrieves the
+// owned tensors via get_owned_tensors, parks them at a stable address, and hands them to
+// create_program_artifacts; they are never part of ProgramArtifacts or the ProgramSpec.
+//
+// WARNING: if you need this, you are almost certainly doing something wrong. Owned tensors exist ONLY
+// to keep an op's private scratch OUT OF the ProgramSpec — the spec is the program-cache key, and a
+// per-dispatch-allocated tensor's identity must never enter it. New ops should express every tensor as
+// an io arg (input / output) and must NOT implement this. Reach for it only if the op genuinely cannot.
+template <typename T>
+concept MetalV2OwnedTensorsFactoryConcept = MetalV2FactoryConcept<T> && requires { &T::get_owned_tensors; };
 
 // Detect operations that put create_descriptor directly on the operation struct
 // (no program_factory_t wrapper needed for single-descriptor operations).

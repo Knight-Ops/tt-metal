@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <span>
 #include <array>
 #include <tuple>
 #include "ttnn/distributed/types.hpp"
@@ -635,7 +636,8 @@ public:
     //
     // Contract: every TensorArgument returned by the factory must reference a
     // MeshTensor reachable from tensor_args / tensor_return_value, or one of the
-    // MeshTensors the factory placed in ProgramArtifacts::op_owned_tensors.
+    // owned tensors ttnn retrieved via get_owned_tensors and handed to create_program_artifacts
+    // (see MetalV2OwnedTensorsFactoryConcept).
     //
     // TODO: consider replacing with a general MeshWorkloadSpecFactoryAdapter?
     // -----------------------------------------------------------------------
@@ -707,7 +709,8 @@ public:
                 TT_FATAL(
                     it != mesh_tensors.end(),
                     "TensorArgument '{}' must reference a MeshTensor reachable from tensor_args / "
-                    "tensor_return_value, or one of the factory's op_owned_tensors (got an unowned MeshTensor)",
+                    "tensor_return_value, or one supplied by the factory's get_owned_tensors (got an "
+                    "unowned MeshTensor)",
                     tensor_parameter_name);
                 bindings.push_back(
                     {tensor_parameter_name, static_cast<std::size_t>(std::distance(mesh_tensors.begin(), it))});
@@ -735,23 +738,36 @@ public:
             // across all coordinate ranges. Bindings derive from the (single) set of
             // factory tensor_args and are identical for every stamped program; copy
             // per range into the cached shared state.
-            auto artifacts = MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
+            // Op-owned tensors (if the factory opts into MetalV2OwnedTensorsFactoryConcept) are
+            // retrieved and parked at a stable address BEFORE the artifacts are built, so run_params can
+            // reference the parked tensors. They are never part of ProgramArtifacts or the ProgramSpec --
+            // that is what keeps them out of the program-cache key. Allocated once here (cache miss) and
+            // reused on every cache hit.
+            auto op_owned_tensors = std::make_shared<std::vector<tt::tt_metal::MeshTensor>>();
+            if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
+                *op_owned_tensors = MetalV2Factory::get_owned_tensors(attrs, tensor_args, tensor_return_value);
+            }
 
-            // Enumerate io tensors (inputs + outputs), then append the factory's
-            // op-owned tensors. resolve_bindings maps each TensorArgument to an
-            // index in this combined order, which the cache-hit path reproduces.
+            ProgramArtifacts artifacts = [&] {
+                if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
+                    return MetalV2Factory::create_program_artifacts(
+                        attrs,
+                        tensor_args,
+                        tensor_return_value,
+                        std::span<const tt::tt_metal::MeshTensor>(*op_owned_tensors));
+                } else {
+                    return MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
+                }
+            }();
+
+            // Enumerate io tensors (inputs + outputs), then append the parked op-owned tensors.
+            // resolve_bindings maps each TensorArgument to an index in this combined order, which the
+            // cache-hit path reproduces.
             auto mesh_tensors = collect_mesh_tensors(tensor_args, tensor_return_value);
-            for (const auto& op_owned_tensor : artifacts.op_owned_tensors) {
+            for (const auto& op_owned_tensor : *op_owned_tensors) {
                 mesh_tensors.push_back(std::cref(op_owned_tensor));
             }
             auto bindings = resolve_bindings(artifacts.run_params.tensor_args, mesh_tensors);
-
-            // Park op-owned tensors in a shared vector so the move-only MeshTensors
-            // outlive this call and every stamped program references the same set.
-            // (A vector move preserves element addresses, so the references held by
-            // artifacts.run_params stay valid for the SetProgramRunArgs calls below.)
-            auto op_owned_tensors =
-                std::make_shared<std::vector<tt::tt_metal::MeshTensor>>(std::move(artifacts.op_owned_tensors));
 
             tt::tt_metal::distributed::MeshWorkload mesh_workload;
             std::unordered_map<ttnn::MeshCoordinateRange, shared_variables_t> shared_variables;
@@ -810,7 +826,15 @@ public:
         ttsl::hash::hash_t hash = std::visit(
             [&](auto&& factory) -> ttsl::hash::hash_t {
                 using Factory = std::decay_t<decltype(factory)>;
-                if constexpr (MetalV2FactoryConcept<Factory>) {
+                if constexpr (MetalV2OwnedTensorsFactoryConcept<Factory>) {
+                    // The spec is owned-tensor-independent (owned tensors are kept out of it), so build
+                    // it for the key with an empty owned set -- no need to allocate the op's owned
+                    // tensors just to hash. The run_params are discarded here; only the spec is hashed.
+                    auto artifacts = Factory::create_program_artifacts(
+                        attrs, tensor_args, tensor_return_value, std::span<const tt::tt_metal::MeshTensor>{});
+                    return ttsl::hash::hash_objects(
+                        ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
+                } else if constexpr (MetalV2FactoryConcept<Factory>) {
                     auto artifacts = Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
                     return ttsl::hash::hash_objects(
                         ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
