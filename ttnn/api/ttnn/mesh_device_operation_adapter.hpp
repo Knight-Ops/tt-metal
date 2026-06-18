@@ -22,7 +22,6 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
-#include <span>
 #include <array>
 #include <tuple>
 #include "ttnn/distributed/types.hpp"
@@ -743,29 +742,33 @@ public:
             // reference the parked tensors. They are never part of ProgramArtifacts or the ProgramSpec --
             // that is what keeps them out of the program-cache key. Allocated once here (cache miss) and
             // reused on every cache hit.
-            auto op_owned_tensors = std::make_shared<std::vector<tt::tt_metal::MeshTensor>>();
+            // Op-owned tensors: null unless the factory opts into MetalV2OwnedTensorsFactoryConcept, in
+            // which case ttnn allocates + parks them (stable address, reused on every cache hit) and hands
+            // the pointer to create_program_artifacts so run_params can reference them. They are never part
+            // of ProgramArtifacts or the ProgramSpec -- that is what keeps them out of the cache key.
+            std::shared_ptr<std::vector<tt::tt_metal::MeshTensor>> op_owned_tensors;
             if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
-                *op_owned_tensors = MetalV2Factory::get_owned_tensors(attrs, tensor_args, tensor_return_value);
+                op_owned_tensors = std::make_shared<std::vector<tt::tt_metal::MeshTensor>>(
+                    MetalV2Factory::get_owned_tensors(attrs, tensor_args, tensor_return_value));
             }
 
             ProgramArtifacts artifacts = [&] {
                 if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
                     return MetalV2Factory::create_program_artifacts(
-                        attrs,
-                        tensor_args,
-                        tensor_return_value,
-                        std::span<const tt::tt_metal::MeshTensor>(*op_owned_tensors));
+                        attrs, tensor_args, tensor_return_value, op_owned_tensors.get());
                 } else {
                     return MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
                 }
             }();
 
-            // Enumerate io tensors (inputs + outputs), then append the parked op-owned tensors.
+            // Enumerate io tensors (inputs + outputs), then append the parked op-owned tensors (if any).
             // resolve_bindings maps each TensorArgument to an index in this combined order, which the
             // cache-hit path reproduces.
             auto mesh_tensors = collect_mesh_tensors(tensor_args, tensor_return_value);
-            for (const auto& op_owned_tensor : *op_owned_tensors) {
-                mesh_tensors.push_back(std::cref(op_owned_tensor));
+            if (op_owned_tensors) {
+                for (const auto& op_owned_tensor : *op_owned_tensors) {
+                    mesh_tensors.push_back(std::cref(op_owned_tensor));
+                }
             }
             auto bindings = resolve_bindings(artifacts.run_params.tensor_args, mesh_tensors);
 
@@ -827,11 +830,11 @@ public:
             [&](auto&& factory) -> ttsl::hash::hash_t {
                 using Factory = std::decay_t<decltype(factory)>;
                 if constexpr (MetalV2OwnedTensorsFactoryConcept<Factory>) {
-                    // The spec is owned-tensor-independent (owned tensors are kept out of it), so build
-                    // it for the key with an empty owned set -- no need to allocate the op's owned
-                    // tensors just to hash. The run_params are discarded here; only the spec is hashed.
-                    auto artifacts = Factory::create_program_artifacts(
-                        attrs, tensor_args, tensor_return_value, std::span<const tt::tt_metal::MeshTensor>{});
+                    // The spec is owned-tensor-independent (owned tensors are kept out of it), so build it
+                    // for the key with a null owned pointer -- no need to allocate the op's owned tensors
+                    // just to hash. The run_params are discarded here; only the spec is hashed.
+                    auto artifacts =
+                        Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value, nullptr);
                     return ttsl::hash::hash_objects(
                         ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
                 } else if constexpr (MetalV2FactoryConcept<Factory>) {
