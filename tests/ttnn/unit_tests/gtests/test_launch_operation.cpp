@@ -148,7 +148,7 @@ TEST(LaunchOperationTest, MetalV2AdapterCompiles) {
     using Adapter = device_operation::MeshDeviceOperationAdapter<MetalV2MinimalOp>::MetalV2MeshWorkloadFactoryAdapter<
         MetalV2Factory>;
     [[maybe_unused]] auto create = &Adapter::create_mesh_workload;
-    [[maybe_unused]] auto apply = &Adapter::apply_descriptor;
+    [[maybe_unused]] auto apply = &Adapter::apply_program_spec;
     [[maybe_unused]] auto resolve = &Adapter::resolve_bindings;
     SUCCEED();
 }
