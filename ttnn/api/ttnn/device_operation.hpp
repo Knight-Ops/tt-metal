@@ -270,8 +270,14 @@ void handle_mesh_adapter_cache_hit(
         using cached_mesh_workload_t = typename WorkloadFactory::cached_mesh_workload_t;
         auto& cached_mesh_workload = cached_program_factory.cached_program.template get<cached_mesh_workload_t>();
 
+        // Three distinct cache-hit hooks, one per architecture, so the paths never share an entry
+        // point: apply_descriptor (ProgramDescriptor path), apply_program_spec (Metal 2.0 spec path),
+        // override_runtime_arguments (legacy ProgramFactory path).
         if constexpr (requires { &WorkloadFactory::apply_descriptor; }) {
             WorkloadFactory::apply_descriptor(
+                cached_mesh_workload, operation_attributes, tensor_args, tensor_return_value);
+        } else if constexpr (requires { &WorkloadFactory::apply_program_spec; }) {
+            WorkloadFactory::apply_program_spec(
                 cached_mesh_workload, operation_attributes, tensor_args, tensor_return_value);
         } else {
             WorkloadFactory::override_runtime_arguments(
@@ -376,8 +382,8 @@ void launch_operation_with_adapter(
     auto is_program_cache_enabled = program_cache.is_enabled();
     if (is_program_cache_enabled) {
         // Use device_operation's compute_program_hash if available
-        program_hash =
-            mesh_device_operation_t::compute_mesh_workload_hash(mesh_device, operation_attributes, tensor_args);
+        program_hash = mesh_device_operation_t::compute_mesh_workload_hash(
+            mesh_device, operation_attributes, tensor_args, tensor_return_value);
         program_cache_hit = program_cache.contains(program_hash);
         if (!program_cache_hit && !program_cache.cache_misses_allowed()) {
             auto op_name = get_operation_name<mesh_device_operation_t>(operation_attributes);

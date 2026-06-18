@@ -27,6 +27,7 @@
 #include "ttnn/distributed/types.hpp"
 #include "ttnn/mesh_device_operation_utils.hpp"
 #include "ttnn/metal_v2_artifacts.hpp"
+#include "ttnn/metal_v2_program_spec_hash.hpp"
 #include "ttnn/operation_concepts.hpp"
 #include "ttnn/operation.hpp"
 #include <tt_stl/reflection.hpp>
@@ -764,12 +765,11 @@ public:
             return cached_mesh_workload_t{std::move(mesh_workload), std::move(shared_variables)};
         }
 
-        // The framework's cache-hit dispatcher (handle_mesh_adapter_cache_hit in
-        // device_operation.hpp) prefers a method named `apply_descriptor` over
-        // `override_runtime_arguments` when both exist. We adopt the name to
-        // slot into that hook directly — the "descriptor" word here is the
-        // dispatcher's historical naming, not a reference to ProgramDescriptor.
-        static void apply_descriptor(
+        // Cache-hit hook for the Metal 2.0 spec path. The dispatcher (handle_mesh_adapter_cache_hit
+        // in device_operation.hpp) routes three distinct, by-name hooks so the three architectures
+        // never share a cache-hit entry point: apply_descriptor (ProgramDescriptor path),
+        // apply_program_spec (this, the spec path), override_runtime_arguments (legacy ProgramFactory).
+        static void apply_program_spec(
             cached_mesh_workload_t& cached_workload,
             const operation_attributes_t& /*attrs*/,
             const tensor_args_t& tensor_args,
@@ -799,15 +799,29 @@ public:
     static ttsl::hash::hash_t compute_mesh_workload_hash(
         tt::tt_metal::distributed::MeshDevice* mesh_device,
         const operation_attributes_t& attrs,
-        const tensor_args_t& tensor_args) {
-        ttsl::hash::hash_t hash;
-
-        if constexpr (requires { DeviceOperation::compute_program_hash(attrs, tensor_args); }) {
-            hash = DeviceOperation::compute_program_hash(attrs, tensor_args);
-        } else {
-            hash =
-                ttsl::hash::hash_objects_with_default_seed(ttsl::hash::type_hash<DeviceOperation>, attrs, tensor_args);
-        }
+        const tensor_args_t& tensor_args,
+        tensor_return_value_t& tensor_return_value) {
+        // Metal 2.0 spec factories key the cache on the ProgramSpec content: the spec fully defines
+        // the compiled Program, so it is a correct-by-construction cache key that needs no
+        // hand-maintained compute_program_hash. The spec is built here once per dispatch to hash it
+        // (and again on a cache miss when the workload is created) -- the accepted cost of keying on
+        // program identity. Mixed-factory ops fall back to the attribute hash for any non-spec
+        // alternative that select_program_factory picks.
+        ttsl::hash::hash_t hash = std::visit(
+            [&](auto&& factory) -> ttsl::hash::hash_t {
+                using Factory = std::decay_t<decltype(factory)>;
+                if constexpr (MetalV2FactoryConcept<Factory>) {
+                    auto artifacts = Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
+                    return ttsl::hash::hash_objects(
+                        ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
+                } else if constexpr (requires { DeviceOperation::compute_program_hash(attrs, tensor_args); }) {
+                    return DeviceOperation::compute_program_hash(attrs, tensor_args);
+                } else {
+                    return ttsl::hash::hash_objects_with_default_seed(
+                        ttsl::hash::type_hash<DeviceOperation>, attrs, tensor_args);
+                }
+            },
+            select_program_factory(attrs, tensor_args));
 
         // Combine with the mesh coordinates the workload is targeting.
         for (const auto& coord : mesh_device_operation_utils::extract_tensor_coordinates(tensor_args, mesh_device)) {
