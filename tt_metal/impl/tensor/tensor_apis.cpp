@@ -216,17 +216,11 @@ void enqueue_write_tensor(distributed::MeshCommandQueue& cq, const HostTensor& h
         cq.enqueue_write(mesh_buffer, distributed_host_buffer, /*blocking=*/false);
     }
 
-<<<<<<< HEAD
-    device_tensor = MeshTensor(
-        mesh_buffer,
+    device_tensor = MeshTensor::from_buffer(
+        std::move(*mesh_buffer),
         TensorSpec(
             host_tensor.tensor_spec().logical_shape(),
             host_tensor.tensor_spec().tensor_layout().with_memory_config(device_tensor.memory_config())),
-=======
-    device_tensor = MeshTensor::from_buffer(
-        std::move(*mesh_buffer),
-        host_tensor.tensor_spec().with_memory_config(device_tensor.memory_config()),
->>>>>>> dc93b00ce8b (create from_buffer factory functions for runtime tensors)
         host_tensor.tensor_topology());
 }
 
@@ -412,7 +406,7 @@ void h2d_as_replicate_tensor_on_1x1_mesh(
     auto topology = TensorTopology::create_fully_replicated_tensor_topology(mesh_device_shape);
     const auto& old_spec = host_tensor.tensor_spec();
     device_tensor = MeshTensor::from_buffer(
-        mesh_buffer,
+        std::move(*mesh_buffer),
         TensorSpec(
             old_spec.logical_shape(), old_spec.tensor_layout().with_memory_config(device_tensor.memory_config())),
         topology);
@@ -509,17 +503,11 @@ std::vector<distributed::MeshCoordinate> enqueue_write_tensor(
     coords.reserve(shard_coords.size());
     std::copy(shard_coords.begin(), shard_coords.end(), std::back_inserter(coords));
 
-<<<<<<< HEAD
     const auto& old_spec = host_tensor.tensor_spec();
-    device_tensor = MeshTensor(
-        mesh_buffer,
-        TensorSpec(
-            old_spec.logical_shape(), old_spec.tensor_layout().with_memory_config(device_tensor.memory_config())),
-=======
     device_tensor = MeshTensor::from_buffer(
         std::move(*mesh_buffer),
-        host_tensor.tensor_spec().with_memory_config(device_tensor.memory_config()),
->>>>>>> dc93b00ce8b (create from_buffer factory functions for runtime tensors)
+        TensorSpec(
+            old_spec.logical_shape(), old_spec.tensor_layout().with_memory_config(device_tensor.memory_config())),
         host_tensor.tensor_topology());
 
     return coords;
