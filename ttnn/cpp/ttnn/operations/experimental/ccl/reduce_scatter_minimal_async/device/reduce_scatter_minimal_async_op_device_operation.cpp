@@ -130,17 +130,47 @@ std::vector<tt::tt_metal::TensorTopology> ReduceScatterMinimalAsyncDeviceOperati
     const auto& input_topology = tensor_args.input_tensor.tensor_topology();
     auto output_placements = input_topology.placements();
 
-    auto shard_placement =
-        tt::tt_metal::distributed::MeshMapperConfig::Shard{static_cast<int>(operation_attributes.dim)};
+    // Normalize the scatter dim to a non-negative index so placements are stored consistently
+    // (a raw negative `dim` such as -1 compared against a positive Shard{3} would otherwise leave
+    // two mesh axes claiming the same tensor dim, e.g. [Shard(-1), Shard(3)]).
+    const int rank = static_cast<int>(tensor_args.input_tensor.logical_shape().rank());
+    const int dim = ((static_cast<int>(operation_attributes.dim) % rank) + rank) % rank;
+    const auto shard_placement = tt::tt_metal::distributed::MeshMapperConfig::Shard{dim};
+
+    // Drop any stale Shard on the same (normalized) tensor dim from another mesh axis. After
+    // reduce_scatter, `dim` is sharded only across `cluster_axis`; leaving it sharded elsewhere
+    // would violate the uniqueness invariant required by xtensor::concat_ndim on readback
+    // (TT_FATAL @ partition.cpp:152 "dims must be unique").
+    auto clear_same_dim = [&](auto& placement) {
+        if (auto* shard = std::get_if<tt::tt_metal::distributed::MeshMapperConfig::Shard>(&placement)) {
+            if (((shard->dim % rank) + rank) % rank == dim) {
+                placement = tt::tt_metal::distributed::MeshMapperConfig::Replicate{};
+            }
+        }
+    };
 
     if (operation_attributes.cluster_axis.has_value()) {
         const auto axis = operation_attributes.cluster_axis.value();
         if (axis < output_placements.size()) {
+            for (size_t i = 0; i < output_placements.size(); ++i) {
+                if (i != axis) {
+                    clear_same_dim(output_placements[i]);
+                }
+            }
             output_placements[axis] = shard_placement;
         }
     } else {
-        for (auto& placement : output_placements) {
-            placement = shard_placement;
+        // No cluster_axis: reduce_scatter spans the whole mesh, but only mesh axes with extent > 1
+        // actually carry scattered chunks. Shard those along `dim` and replicate the trivial
+        // (size-1) axes; sharding a size-1 axis on `dim` would duplicate the dim already sharded by
+        // the real axis and break the uniqueness invariant required by concat_ndim on readback.
+        const auto& mesh_shape = input_topology.distribution_shape();
+        for (size_t i = 0; i < output_placements.size(); ++i) {
+            if (i < mesh_shape.dims() && mesh_shape[static_cast<int>(i)] > 1) {
+                output_placements[i] = shard_placement;
+            } else {
+                output_placements[i] = tt::tt_metal::distributed::MeshMapperConfig::Replicate{};
+            }
         }
     }
 
