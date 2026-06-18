@@ -3,6 +3,10 @@ name: "(Blackhole) e2e tests"
 on:
   workflow_dispatch:
     inputs:
+      use-artifacts-from-run:
+        description: "Reuse build+wheel from this run id (skip rebuild) — trial only"
+        required: false
+        type: string
       system-type:
         description: 'Select system type to test'
         required: false
@@ -39,6 +43,7 @@ on:
           - all
           - sdpa
           - bh-sdpa-nightly-integration
+          - bh-qb2-deepseek-prefill-op-tests
       build-type:
         required: false
         type: choice
@@ -134,6 +139,7 @@ jobs:
       tracy: true
       platform: ${{ inputs.platform || 'Ubuntu 22.04' }}
       enable-lto: ${{ inputs.enable-lto || false }}
+      use-artifacts-from-run: ${{ inputs.use-artifacts-from-run || '' }}
   blackhole-e2e-tests:
     needs: [check-harbor, build-artifact, generate-card-matrix]
     secrets: inherit
@@ -200,7 +206,7 @@ jobs:
           echo "run-result=$RESULT" >> "$GITHUB_OUTPUT"
       - id: ai-run-summary
         continue-on-error: true
-        uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/run@main
+        uses: tenstorrent/tt-github-actions/.github/actions/ai_summary/run@ppetrovic/ai-summary-log-finish-line
         with:
           config: |
             {
