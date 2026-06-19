@@ -253,7 +253,7 @@ void kernel_main() {
                     // noc_inline_dw_write_set_state above
                     noc_inline_dw_write_with_state<false, true, true, false, true>(++semaphore_value);
 
-                    noc1_obj.async_posted_writes_flushed(1);
+                    noc1_obj.async_writes_flushed<NocOptions::POSTED>();
                 }
             }
 
@@ -330,7 +330,7 @@ void kernel_main() {
                 }
             }
 
-            noc1_obj.async_posted_writes_flushed(1);
+            noc1_obj.async_writes_flushed<NocOptions::POSTED>();
             cb_c2s_out.pop_front(tokens_per_chunk_combine);
 
             // Signal tilize drain that this chunk has been consumed
@@ -351,5 +351,7 @@ void kernel_main() {
             get_noc_addr(output_shard_core_map[2 * idx], output_shard_core_map[2 * idx + 1], combine_semaphore_addr);
         noc_semaphore_inc(dest_sem_noc_addr, 1, 1, vchannel);
     }
-    noc_obj.async_atomic_barrier(1);
+    // The noc_semaphore_inc calls above issue on NoC 1 (matching the original
+    // noc_async_atomic_barrier(/*noc=*/1) call), so barrier on noc1_obj.
+    noc1_obj.async_atomic_barrier();
 }

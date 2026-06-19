@@ -27,14 +27,16 @@ FORCE_INLINE uint64_t get_safe_multicast_noc_addr(
 
 FORCE_INLINE void noc_async_write_linked_multicast(
     Noc& noc, uint32_t src_local_l1_addr, uint64_t dst_noc_addr_multicast, uint32_t size, uint32_t num_dests) {
+    // Device 2.0 migration: legacy primitive retained: Noc::async_write_multicast does not accept
+    // a raw uint64_t precomposed multicast destination (matching the sibling tilize_reader pattern).
     while (size > NOC_MAX_BURST_SIZE) {
-        noc.async_write_multicast(
-            {.offset_bytes = src_local_l1_addr}, dst_noc_addr_multicast, NOC_MAX_BURST_SIZE, num_dests, true);
+        noc_async_write_multicast(
+            src_local_l1_addr, dst_noc_addr_multicast, NOC_MAX_BURST_SIZE, num_dests, true, noc.get_noc_id());
         src_local_l1_addr += NOC_MAX_BURST_SIZE;
         dst_noc_addr_multicast += NOC_MAX_BURST_SIZE;
         size -= NOC_MAX_BURST_SIZE;
     }
-    noc.async_write_multicast({.offset_bytes = src_local_l1_addr}, dst_noc_addr_multicast, size, num_dests, false);
+    noc_async_write_multicast(src_local_l1_addr, dst_noc_addr_multicast, size, num_dests, false, noc.get_noc_id());
 }
 
 template <
