@@ -7,12 +7,12 @@ Test for TtPrefillBlock — verifies composition of norm → MLA → residual �
 
 Validates output shapes and PCC against torch reference.
 
-Uses HF DeepseekV3Model layer as the reference: creates a model with random weights,
-extracts those weights into our TT state_dict format, and compares forward passes.
+Reference: when pretrained weights are available the layer's input/output are taken from a
+real forward pass over layers 0..layer_idx (as in test_prefill_transformer); otherwise the
+test falls back to a randomly-initialized HF reference layer so it still runs without weights.
 """
 
 from dataclasses import dataclass
-from pathlib import Path
 
 import pytest
 import torch
@@ -39,9 +39,14 @@ from models.demos.deepseek_v3_d_p.utils.transformer_helpers import (
     ABC_1K_PATH,
     PROMPT_5K_PATH,
     PROMPT_25K_PATH,
+    ReferenceCacheKey,
+    check_reference_cache_exists,
     create_hf_model,
     extract_layer_state_dict,
     get_4d_causal_mask,
+    load_and_compute_layer_by_layer,
+    load_reference_cache,
+    save_reference_cache,
     tokenize_prompt_to_isl,
 )
 
@@ -80,6 +85,8 @@ def run_model(
     pcc_validation,
     input_source,
     tokenizer,
+    model_path,
+    weight_cache_path,
     is_ci_env,
     is_ci_v2_env,
     thresholds: PrefillBlockThresholds,
@@ -113,8 +120,11 @@ def run_model(
     emb_dim = config.hidden_size
     isl_per_chip = isl_total // sp_factor
 
-    # layer_idx=0 for dense (< NUM_DENSE_LAYERS=3), layer_idx=3 for MoE (>= 3)
+    # layer_idx=0 for dense (< NUM_DENSE_LAYERS), layer_idx=first_k_dense_replace for the first MoE layer.
     layer_idx = 0 if layer_type == "dense" else config.first_k_dense_replace
+    is_dense = layer_idx < config.first_k_dense_replace
+    # We drive a single block at `layer_idx`, so the host reference only needs layers 0..layer_idx.
+    num_layers = layer_idx + 1
 
     logger.info(f"mesh_shape={mesh_shape}, sp_factor={sp_factor}, tp_factor={tp_factor}")
     logger.info(
@@ -123,127 +133,131 @@ def run_model(
         f"input_source={input_source}"
     )
 
-    # --- Cache setup ---
-    is_dense = layer_idx < config.first_k_dense_replace
-    cache_dir = Path(f"/tmp/{variant.name}_prefill_block/{layer_type}_{sp_factor}x{tp_factor}mesh_{isl_total}isl")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-
-    init_checker(cache_dir)
-    ttnn_cache_complete = TtPrefillBlock.check_cache_complete(cache_dir, layer_idx, is_dense)
-    torch_ref_cache = cache_dir / f"torch_reference_{input_source}.pt"
-
-    ref_cache_loadable = torch_ref_cache.exists() and (pcc_validation or input_source in _PROMPT_PATHS)
-    need_hf_model = not ttnn_cache_complete or (
-        (pcc_validation or input_source in _PROMPT_PATHS) and not ref_cache_loadable
-    )
-    logger.info(
-        f"Cache status: TTNN={ttnn_cache_complete}, ref_cache={torch_ref_cache.exists()}, "
-        f"need_hf_model={need_hf_model}"
-    )
-
-    # --- Build HF reference model and extract weights ---
-    num_layers = layer_idx + 1
-    hf_model = None
-    if need_hf_model:
-        profiler.start("weights_creation")
-        torch.manual_seed(42)
-        hf_model = create_hf_model(variant, config, num_layers)
-        hf_sd = hf_model.state_dict()
-        state_dict = extract_layer_state_dict(variant, hf_sd, layer_idx, hf_model.layers[layer_idx])
-        profiler.end("weights_creation")
-    else:
-        logger.info("TTNN cache complete, skipping torch weight creation")
-        state_dict = {}
-
-    # --- Resolve torch_input and torch reference (single decision point for ref_cache) ---
+    # --- Weight source: real pretrained weights + bias when available, else random (seed 42). ---
+    # The pretrained path mirrors test_prefill_transformer (real forward over layers 0..layer_idx);
+    # the random path keeps the test runnable without a checkpoint. Both feed the shared block build
+    # below via (block_state_dict, block_cache_path, torch_input, torch_output, ref_kvpe).
+    use_pretrained = variant.supports_pretrained and weight_cache_path is not None
     torch_output = None
     ref_kvpe = None
-    if ref_cache_loadable:
-        logger.info(f"Loading cached reference from {torch_ref_cache}")
-        profiler.start("reference_loading")
-        ref_cached = torch.load(torch_ref_cache, weights_only=True)
-        torch_input = ref_cached["torch_input"]
-        if pcc_validation:
-            torch_output = ref_cached["torch_output"]
-            ref_kvpe = ref_cached["ref_kvpe"]
-        profiler.end("reference_loading")
-    elif input_source in _PROMPT_PATHS:
-        profiler.start("tokenization")
-        prompt_path = _PROMPT_PATHS[input_source]
-        prompts = load_prompts_from_json(str(prompt_path))
-        prompt_text = prompts[0] if isinstance(prompts, list) else prompts
-        token_ids, attention_mask, tokens = tokenize_prompt_to_isl(
-            tokenizer, max_isl=isl_total, prompt_text=prompt_text
+
+    if use_pretrained:
+        # Shared pretrained TTNN cache (same layout as test_prefill_transformer): <cache>/<rows>x<cols>.
+        block_cache_path = weight_cache_path / f"{sp_factor}x{tp_factor}"
+        block_cache_path.mkdir(parents=True, exist_ok=True)
+        init_checker(block_cache_path)
+        block_state_dict = {}  # weights are read from the prebuilt cache
+
+        experts_per_chip = variant.model_config.NUM_ROUTED_EXPERTS // (sp_factor * tp_factor)
+        ttnn_cache_complete = TtPrefillBlock.check_cache_complete(
+            block_cache_path, layer_idx, is_dense=is_dense, experts_per_chip=experts_per_chip
         )
-        attention_mask = get_4d_causal_mask(attention_mask, causal_only=True)
-        profiler.end("tokenization")
+
+        # Host reference cache (per-layer snapshots), keyed identically to test_prefill_transformer.
+        cache_key = ReferenceCacheKey(
+            weight_type="pretrained",
+            input_source=input_source,
+            isl_total=isl_total,
+            num_layers=num_layers,
+            n_routed_experts=config.n_routed_experts,
+            padding_side=tokenizer.padding_side,
+        )
+        ref_cache_exists = check_reference_cache_exists(variant, cache_key) if pcc_validation else False
+        need_reference = pcc_validation and not ref_cache_exists
+        need_weights = not ttnn_cache_complete
         logger.info(
-            f"Tokenized {input_source} input shape: {token_ids.shape}, first 10 tokens: {token_ids[0, :10].tolist()}"
+            f"Cache status: TTNN={ttnn_cache_complete}, ref_cache={ref_cache_exists}, "
+            f"need_reference={need_reference}, need_weights={need_weights}"
         )
-        with torch.no_grad():
-            torch_input = hf_model.embed_tokens(token_ids).to(torch.bfloat16)
-        logger.info(f"Embedded input shape: {torch_input.shape}")
-    else:
-        torch.manual_seed(123)
-        torch_input = torch.randn(1, isl_total, emb_dim, dtype=torch.bfloat16)
 
-    if pcc_validation and torch_output is None:
-        profiler.start("torch_reference")
-        logger.info("Running torch reference forward...")
-        position_ids = torch.arange(isl_total, dtype=torch.long).unsqueeze(0)
-        attention_mask = get_4d_causal_mask(torch.ones(1, isl_total), causal_only=True).to(torch.bfloat16)
-        ref_cache = DynamicCache()
-        with torch.no_grad():
-            layer_out = hf_model.layers[layer_idx](
-                torch_input,
+        ref_snapshots = ref_kvpe_list = None
+        if need_reference or need_weights:
+            if input_source in _PROMPT_PATHS:
+                prompts = load_prompts_from_json(str(_PROMPT_PATHS[input_source]))
+                prompt_text = prompts[0] if isinstance(prompts, list) else prompts
+                token_ids, attention_mask, _ = tokenize_prompt_to_isl(
+                    tokenizer, max_isl=isl_total, prompt_text=prompt_text
+                )
+            else:
+                token_ids = torch.randint(0, config.vocab_size, (1, isl_total), dtype=torch.int64)
+                attention_mask = torch.ones(1, isl_total, dtype=torch.int64)
+            result = load_and_compute_layer_by_layer(
+                variant=variant,
+                model_path=model_path,
+                config=config,
+                num_layers=num_layers,
+                token_ids=token_ids,
                 attention_mask=attention_mask,
-                position_ids=position_ids,
-                past_key_value=ref_cache,
-                use_cache=True,
+                compute_reference=need_reference,
+                build_ttnn_cache=need_weights,
+                weight_cache_path=block_cache_path,
+                mesh_device=mesh_device,
+                seq_len=isl_total,
+                num_links=num_links,
+                topology=topology,
+                sp_axis=sp_axis,
+                tp_axis=tp_axis,
+                gate_fallback_mode=gate_fallback_mode,
             )
-            torch_output = layer_out[0]
-        logger.info(f"Torch reference output shape: {torch_output.shape}")
-        if ref_cache is not None:
-            ref_kvpe = ref_cache.key_cache[layer_idx]
-            logger.info(f"Reference KVPE shape: {ref_kvpe.shape}")
-        profiler.end("torch_reference")
+            ref_snapshots, ref_kvpe_list = result.ref_snapshots, result.ref_kvpe_list
+            if need_reference and ref_snapshots is not None:
+                save_reference_cache(variant, cache_key, ref_snapshots, ref_kvpe_list)
 
-        logger.info(f"Saving reference to {torch_ref_cache}")
-        torch.save(
-            {"torch_input": torch_input, "torch_output": torch_output, "ref_kvpe": ref_kvpe},
-            torch_ref_cache,
+        if pcc_validation:
+            if ref_snapshots is None:
+                ref_snapshots, ref_kvpe_list = load_reference_cache(variant, cache_key)
+            # snapshots are [embed, layer_0_out, ...]: input to layer L is snapshot[L], output snapshot[L+1].
+            torch_input = ref_snapshots[layer_idx].to(torch.bfloat16)
+            torch_output = ref_snapshots[layer_idx + 1]
+            ref_kvpe = ref_kvpe_list[layer_idx]
+        else:
+            torch.manual_seed(123)
+            torch_input = torch.randn(1, isl_total, emb_dim, dtype=torch.bfloat16)
+    else:
+        # Random-weight fallback (no checkpoint). Seed 42 + the reference model's reset_parameters
+        # (which now initializes the MoE gate bias) make weights and routing deterministic. The block
+        # builds straight from these torch weights, so no on-disk cache is needed.
+        logger.info("Pretrained weights unavailable; building from random weights (seed 42)")
+        block_cache_path = None
+        torch.manual_seed(42)
+        hf_model = create_hf_model(variant, config, num_layers)
+        block_state_dict = extract_layer_state_dict(
+            variant, hf_model.state_dict(), layer_idx, hf_model.layers[layer_idx]
         )
 
-    # Free HF model early
-    if hf_model is not None:
+        if input_source in _PROMPT_PATHS:
+            prompts = load_prompts_from_json(str(_PROMPT_PATHS[input_source]))
+            prompt_text = prompts[0] if isinstance(prompts, list) else prompts
+            token_ids, _, _ = tokenize_prompt_to_isl(tokenizer, max_isl=isl_total, prompt_text=prompt_text)
+            with torch.no_grad():
+                torch_input = hf_model.embed_tokens(token_ids).to(torch.bfloat16)
+        else:
+            torch.manual_seed(123)
+            torch_input = torch.randn(1, isl_total, emb_dim, dtype=torch.bfloat16)
+
+        if pcc_validation:
+            position_ids = torch.arange(isl_total, dtype=torch.long).unsqueeze(0)
+            attention_mask = get_4d_causal_mask(torch.ones(1, isl_total), causal_only=True).to(torch.bfloat16)
+            ref_cache = DynamicCache()
+            with torch.no_grad():
+                layer_out = hf_model.layers[layer_idx](
+                    torch_input,
+                    attention_mask=attention_mask,
+                    position_ids=position_ids,
+                    past_key_value=ref_cache,
+                    use_cache=True,
+                )
+            torch_output = layer_out[0]
+            ref_kvpe = ref_cache.key_cache[layer_idx]
         del hf_model
 
-    # --- Build TTNN cache if needed ---
-    if not ttnn_cache_complete:
-        logger.info("Building TTNN cache...")
-        profiler.start("ttnn_cache_build")
-        TtPrefillBlock.build_ttnn_cache(
-            state_dict=state_dict,
-            layer_idx=layer_idx,
-            cache_path=cache_dir,
-            mesh_device=mesh_device,
-            config=config,
-            model_cfg=variant.model_config,
-            seq_len=isl_total,
-            num_links=num_links,
-            topology=topology,
-            sp_axis=sp_axis,
-            tp_axis=tp_axis,
-        )
-        profiler.end("ttnn_cache_build")
-
-    # --- TT block ---
+    # --- TT block (cache-backed for pretrained, torch-weight-backed for the random fallback). ---
     profiler.start("tt_block_creation")
     block_kwargs = dict(
         mesh_device=mesh_device,
         config=config,
         model_cfg=variant.model_config,
-        state_dict=state_dict,
+        state_dict=block_state_dict,
         layer_idx=layer_idx,
         seq_len=isl_total,
         dispatch_buffer_capacity_factor=dispatch_buffer_capacity_factor,
@@ -251,7 +265,7 @@ def run_model(
         topology=topology,
         sp_axis=sp_axis,
         tp_axis=tp_axis,
-        weight_cache_path=cache_dir,
+        weight_cache_path=block_cache_path,
         is_balanced=is_balanced,
     )
     if gate_fallback_mode is not None:
@@ -497,6 +511,8 @@ def test_ds_prefill_block(
     pcc_validation,
     input_source,
     tokenizer,
+    model_path,
+    weight_cache_path,
     is_ci_env,
     is_ci_v2_env,
     determinism_check,
@@ -517,6 +533,8 @@ def test_ds_prefill_block(
         pcc_validation,
         input_source,
         tokenizer,
+        model_path,
+        weight_cache_path,
         is_ci_env,
         is_ci_v2_env,
         determinism_check=determinism_check,
@@ -580,6 +598,8 @@ def test_kimi_prefill_block(
     pcc_validation,
     input_source,
     tokenizer,
+    model_path,
+    weight_cache_path,
     is_ci_env,
     is_ci_v2_env,
     determinism_check,
@@ -600,6 +620,8 @@ def test_kimi_prefill_block(
         pcc_validation,
         input_source,
         tokenizer,
+        model_path,
+        weight_cache_path,
         is_ci_env,
         is_ci_v2_env,
         determinism_check=determinism_check,
