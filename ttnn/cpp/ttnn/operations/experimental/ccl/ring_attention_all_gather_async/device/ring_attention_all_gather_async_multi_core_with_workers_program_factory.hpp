@@ -82,6 +82,12 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
     // When set, gather only this batch slot (dim-0 index) of `input_tensor` into slot 0 of
     // `output_tensor` — lets a consumer keep a full KV cache as input with a batch-1 gathered buffer
     // (a full-batch output also works; only slot 0 is written). std::nullopt => full batch (default).
-    std::optional<uint32_t> input_batch_slice_idx = std::nullopt);
+    std::optional<uint32_t> input_batch_slice_idx = std::nullopt,
+    // When set, gather only the first `gather_valid_Ht` tile-rows per (batch,head) instead of the
+    // full input height — lets a consumer keep an oversized (growing) KV cache as input while moving
+    // only the valid (e.g. logical_n-sized) prefix. Capped to the input height per gathered tensor.
+    // std::nullopt => gather the full input (default). The fused ring_joint_sdpa path also re-patches
+    // this per dispatch on cache hits (see apply_ring_joint_scalar_runtime_args).
+    std::optional<uint32_t> gather_valid_Ht = std::nullopt);
 
 }  // namespace ttnn
