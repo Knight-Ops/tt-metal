@@ -56,11 +56,34 @@ std::vector<PhysicalPipelineStageConfig> maybe_override_asic_locations_for_force
             //   - exit  tray 5 (asic 0): the chip whose port 2 is cabled to the next host's
             //     tray 1 port 1
             // Entry and exit are thus distinct chips → CrossDeviceSend src != dst.
-            stage_config.entry_node_tray_id = 1;
+            stage_config.entry_node_tray_id = 5;
             stage_config.entry_node_asic_location = 0;
-            stage_config.exit_node_tray_id = 5;
+            stage_config.exit_node_tray_id = 1;
             stage_config.exit_node_asic_location = 0;
         }
+        // The virtual loopback stage (last entry) receives the token returning from the final
+        // pipeline stage back to stage 0.  If its entry_node_tray_id is left as 1 (same as
+        // stage 0), both the h2d_receiver and the loopback D2D-exchange receiver would be
+        // dispatched to the same ASIC (tray1).  In slow-dispatch mode programs on the same
+        // ASIC execute sequentially, so the loopback receiver would queue behind the
+        // persistent h2d_receiver and never run — causing a hang.
+        //
+        // Using tray 2 (a free tray on rank 0's 4×2 mesh) for the loopback entry breaks the
+        // conflict: the loopback receiver runs on tray 2 while h2d_receiver owns tray 1.
+        // Stage 3 sends its fabric packet to tray 2 on rank 0; the mesh fabric router on
+        // tray 1 (where the inter-host ETH cable lands) forwards it to tray 2 internally.
+        pipeline_stage_configs.back().entry_node_tray_id = 6;
+        // Similarly, the virtual loopback exit (d2h_sender) must not share device 4 (tray 5)
+        // with stage 0's exit D2D exchange.  Both would be submitted to device 4's pipeline
+        // command queue; d2h_sender is a persistent infinite-loop kernel, so the exit D2D
+        // exchange queued behind it never runs — stage 0's embedding output never reaches
+        // rank 1, causing a complete deadlock.
+        //
+        // Moving the loopback exit to tray 6 (device 5, another free ASIC on rank 0) gives
+        // d2h_sender its own device while device 4 is left exclusively for the exit D2D
+        // exchange.  The upstream local socket now runs tray 2 → tray 6, which is an
+        // intra-host path accessible via PCIe from the host.
+        pipeline_stage_configs.back().exit_node_tray_id = 2;
     }
     return pipeline_stage_configs;
 }
