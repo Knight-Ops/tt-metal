@@ -1,0 +1,1 @@
+../generic_lut_activation/generate_test_inputs.py

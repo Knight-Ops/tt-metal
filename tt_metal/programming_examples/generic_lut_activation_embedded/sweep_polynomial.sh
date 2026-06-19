@@ -1,0 +1,1 @@
+../generic_lut_activation/sweep_polynomial.sh

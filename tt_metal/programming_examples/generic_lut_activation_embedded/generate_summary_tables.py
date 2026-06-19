@@ -1,0 +1,1 @@
+../generic_lut_activation/generate_summary_tables.py

@@ -1,0 +1,1 @@
+../generic_lut_activation/sweep_depth_degree_host.sh

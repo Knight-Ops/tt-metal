@@ -4,6 +4,7 @@ Test all activation functions with Sollya to identify which ones are unsupported
 This script does NOT use any piecewise workarounds - it tests direct Sollya support.
 """
 
+import os
 import sys
 from pathlib import Path
 
