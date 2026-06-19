@@ -47,7 +47,6 @@ void kernel_main() {
     constexpr uint32_t kWeightAddrBase = 1;
 
     Semaphore<>(sem_id).wait(1);
-    Semaphore<>(sem_input_id).wait(1);
     // Both semaphores observed: expert ids (cb_bcast) and activations (cb_input) are in L1.
 
     Noc noc;
@@ -62,4 +61,5 @@ void kernel_main() {
         col_start_tile,
         gate_up_args,
         kWeightAddrBase);
+    Semaphore<>(sem_input_id).wait(1);
 }

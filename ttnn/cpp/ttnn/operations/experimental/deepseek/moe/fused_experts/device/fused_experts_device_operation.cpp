@@ -48,6 +48,33 @@ void FusedExpertsDeviceOperation::validate_on_program_cache_miss(
         rw.logical_shape()[-1],
         num_experts);
 
+    // gate_up weights must be DRAM ND-sharded so that each shard is exactly one core's
+    // [K, 64] column slice (read in a single NoC read by the dataflow kernels). The 8x8
+    // compute grid owns 64 column slices of 2 tiles (64 cols) each.
+    constexpr uint32_t kColsPerCore = 64;
+    for (uint32_t e = 0; e < num_experts; ++e) {
+        const auto& w = tensor_args.gate_up_weights[e];
+        TT_FATAL(
+            w.buffer()->buffer_type() == tt::tt_metal::BufferType::DRAM,
+            "fused_experts: gate_up_weights[{}] must be in DRAM",
+            e);
+        const auto& nd = w.memory_config().nd_shard_spec();
+        TT_FATAL(nd.has_value(), "fused_experts: gate_up_weights[{}] must be ND-sharded (one shard per core)", e);
+        const auto& shard_shape = nd->shard_shape;
+        TT_FATAL(
+            static_cast<uint32_t>(shard_shape[-1]) == kColsPerCore,
+            "fused_experts: gate_up_weights[{}] shard last dim ({}) must be {} (one core's 2-tile column slice)",
+            e,
+            shard_shape[-1],
+            kColsPerCore);
+        TT_FATAL(
+            static_cast<uint32_t>(shard_shape[-2]) == static_cast<uint32_t>(w.logical_shape()[-2]),
+            "fused_experts: gate_up_weights[{}] shard must span the full K dim ({} rows), got {}",
+            e,
+            w.logical_shape()[-2],
+            shard_shape[-2]);
+    }
+
     // Decode-only: sequence length T == 1.
     TT_FATAL(
         static_cast<uint32_t>(x.logical_shape()[-2]) == 1,

@@ -8,6 +8,8 @@
 #include "api/dataflow/noc.h"
 #include "api/dataflow/circular_buffer.h"
 #include "api/core_local_mem.h"
+#include "api/tensor/noc_traits.h"
+#include "api/tensor/tensor_accessor.h"
 
 // Per-core gate_up weight fetch (shared by all kernels in this op).
 //
@@ -16,11 +18,15 @@
 // of shape [K, N] (K == H rows, N == 2I cols) laid out in TILE layout, this core
 // needs the [K, 64] column slice, i.e. k_tiles * 2 tiles.
 //
+// The gate_up weights are stored DRAM ND-sharded so that each shard is exactly one
+// core's [K, 64] column slice (shard shape [K, 64] in elements -> [k_tiles, 2] in
+// tiles). The shards are round-robin distributed across the DRAM banks, and the
+// pages of a shard are contiguous within its bank, so this core's entire weight
+// slice for one expert can be pulled in a *single* NoC read of the whole shard.
+// Shard id == this core's compute index == col_start_tile / 2.
+//
 // The expert ids (compacted at the front of cb_bcast, sentinel-padded) tell the
 // core which experts are active; the slice is fetched once per active expert.
-//
-// Tiles of a [K, N] TILE tensor are laid out row-major in tiles, so the page index
-// of tile (r, c) is r * n_tiles + c.
 //
 // Arguments:
 //   noc               NoC instance to use for the reads.
@@ -52,6 +58,9 @@ void fetch_gate_up_slices(
 
     constexpr uint32_t kTilesPerCore = 2;
     const uint32_t slice_tiles = k_tiles * kTilesPerCore;
+    // One DRAM shard == this core's whole [K, 64] slice; read it in one shot.
+    const uint32_t slice_bytes = slice_tiles * tile_bytes;
+    const uint32_t shard_id = col_start_tile / kTilesPerCore;
 
     CircularBuffer cb_bcast(cb_bcast_id);
     CircularBuffer cb_weights(cb_weights_id);
@@ -70,14 +79,9 @@ void fetch_gate_up_slices(
         const uint32_t w_addr = get_arg_val<uint32_t>(rt_w_addr_base + e);
         const auto w = TensorAccessor(gate_up_args, w_addr);
 
-        uint32_t dst_offset = 0;
-        for (uint32_t r = 0; r < k_tiles; ++r) {
-            for (uint32_t c = 0; c < kTilesPerCore; ++c) {
-                const uint32_t page = r * n_tiles + (col_start_tile + c);
-                noc.async_read(w, cb_weights, tile_bytes, {.page_id = page}, {.offset_bytes = dst_offset});
-                dst_offset += tile_bytes;
-            }
-        }
+        // Single NoC read of this expert's entire shard for this core.
+        ShardView w_shard(w);
+        noc.async_read(w_shard, cb_weights, slice_bytes, {.shard_id = shard_id}, {.offset_bytes = 0});
         noc.async_read_barrier();
     }
 }
