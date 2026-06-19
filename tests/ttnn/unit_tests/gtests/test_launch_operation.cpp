@@ -3,7 +3,10 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <gmock/gmock.h>
+#include <optional>
+#include <span>
 #include <type_traits>
+#include <vector>
 
 #include "ttnn/distributed/api.hpp"
 #include "ttnn/distributed/distributed_tensor.hpp"
@@ -147,6 +150,39 @@ static_assert(!ttnn::device_operation::ProgramDescriptorFactoryConcept<MetalV2Fa
 TEST(LaunchOperationTest, MetalV2AdapterCompiles) {
     using Adapter = device_operation::MeshDeviceOperationAdapter<MetalV2MinimalOp>::MetalV2MeshWorkloadFactoryAdapter<
         MetalV2Factory>;
+    [[maybe_unused]] auto create = &Adapter::create_mesh_workload;
+    [[maybe_unused]] auto apply = &Adapter::apply_program_spec;
+    [[maybe_unused]] auto resolve = &Adapter::resolve_bindings;
+    SUCCEED();
+}
+
+// Owned-tensor variant of the factory: opts into MetalV2OwnedTensorsFactoryConcept by adding
+// get_owned_tensors plus the 4-arg create_program_artifacts(..., std::optional<std::span<const
+// MeshTensor>>) overload. The base MetalV2Factory above provides neither, so its compile-coverage test
+// never instantiates the adapter's owned-tensor branches (the get_owned_tensors call, the
+// std::span/std::nullopt create_program_artifacts paths, the parked-tensor enumeration). This factory
+// exists solely to force those branches to compile.
+struct MetalV2OwnedFactory {
+    static std::vector<tt::tt_metal::MeshTensor> get_owned_tensors(
+        const OperationAttributes& /*attrs*/, const Tensor& /*tensor_args*/, Tensor& /*tensor_return_value*/) {
+        return {};
+    }
+    static ttnn::device_operation::ProgramArtifacts create_program_artifacts(
+        const OperationAttributes& /*attrs*/,
+        const Tensor& /*tensor_args*/,
+        Tensor& /*tensor_return_value*/,
+        std::optional<std::span<const tt::tt_metal::MeshTensor>> /*owned*/) {
+        return ttnn::device_operation::ProgramArtifacts{};
+    }
+};
+
+static_assert(ttnn::device_operation::MetalV2FactoryConcept<MetalV2OwnedFactory>);
+static_assert(ttnn::device_operation::MetalV2OwnedTensorsFactoryConcept<MetalV2OwnedFactory>);
+
+// Compile-coverage for the adapter's owned-tensor branches (never dispatched).
+TEST(LaunchOperationTest, MetalV2OwnedAdapterCompiles) {
+    using Adapter = device_operation::MeshDeviceOperationAdapter<MetalV2MinimalOp>::MetalV2MeshWorkloadFactoryAdapter<
+        MetalV2OwnedFactory>;
     [[maybe_unused]] auto create = &Adapter::create_mesh_workload;
     [[maybe_unused]] auto apply = &Adapter::apply_program_spec;
     [[maybe_unused]] auto resolve = &Adapter::resolve_bindings;

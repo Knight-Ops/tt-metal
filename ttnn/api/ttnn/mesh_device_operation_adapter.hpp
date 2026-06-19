@@ -22,6 +22,7 @@
 #include <unordered_map>
 #include <variant>
 #include <vector>
+#include <span>
 #include <array>
 #include <tuple>
 #include "ttnn/distributed/types.hpp"
@@ -737,15 +738,11 @@ public:
             // across all coordinate ranges. Bindings derive from the (single) set of
             // factory tensor_args and are identical for every stamped program; copy
             // per range into the cached shared state.
-            // Op-owned tensors (if the factory opts into MetalV2OwnedTensorsFactoryConcept) are
-            // retrieved and parked at a stable address BEFORE the artifacts are built, so run_params can
-            // reference the parked tensors. They are never part of ProgramArtifacts or the ProgramSpec --
-            // that is what keeps them out of the program-cache key. Allocated once here (cache miss) and
-            // reused on every cache hit.
             // Op-owned tensors: null unless the factory opts into MetalV2OwnedTensorsFactoryConcept, in
-            // which case ttnn allocates + parks them (stable address, reused on every cache hit) and hands
-            // the pointer to create_program_artifacts so run_params can reference them. They are never part
-            // of ProgramArtifacts or the ProgramSpec -- that is what keeps them out of the cache key.
+            // which case ttnn allocates + parks them at a stable address (allocated once here on the cache
+            // miss, reused on every cache hit) and hands a span to create_program_artifacts so run_params
+            // can reference the parked tensors. They are never part of ProgramArtifacts or the ProgramSpec
+            // -- that is what keeps them out of the program-cache key.
             std::shared_ptr<std::vector<tt::tt_metal::MeshTensor>> op_owned_tensors;
             if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
                 op_owned_tensors = std::make_shared<std::vector<tt::tt_metal::MeshTensor>>(
@@ -754,8 +751,13 @@ public:
 
             ProgramArtifacts artifacts = [&] {
                 if constexpr (MetalV2OwnedTensorsFactoryConcept<MetalV2Factory>) {
+                    // Non-null span over the parked tensors (op_owned_tensors is always allocated in this
+                    // branch); converts implicitly to the factory's std::optional<std::span> parameter.
                     return MetalV2Factory::create_program_artifacts(
-                        attrs, tensor_args, tensor_return_value, op_owned_tensors.get());
+                        attrs,
+                        tensor_args,
+                        tensor_return_value,
+                        std::span<const tt::tt_metal::MeshTensor>(*op_owned_tensors));
                 } else {
                     return MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
                 }
@@ -831,10 +833,10 @@ public:
                 using Factory = std::decay_t<decltype(factory)>;
                 if constexpr (MetalV2OwnedTensorsFactoryConcept<Factory>) {
                     // The spec is owned-tensor-independent (owned tensors are kept out of it), so build it
-                    // for the key with a null owned pointer -- no need to allocate the op's owned tensors
-                    // just to hash. The run_params are discarded here; only the spec is hashed.
-                    auto artifacts =
-                        Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value, nullptr);
+                    // for the key with an empty owned set (std::nullopt) -- no need to allocate the op's
+                    // owned tensors just to hash. The run_params are discarded here; only the spec is hashed.
+                    auto artifacts = Factory::create_program_artifacts(
+                        attrs, tensor_args, tensor_return_value, std::nullopt);
                     return ttsl::hash::hash_objects(
                         ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
                 } else if constexpr (MetalV2FactoryConcept<Factory>) {

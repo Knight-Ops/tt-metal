@@ -37,19 +37,22 @@ namespace detail {
 // else about the parameter is identity-relevant and always hashed.)
 inline std::size_t hash_tensor_parameter(const tt::tt_metal::experimental::TensorParameter& p) {
     const auto& spec = p.spec;
-    std::size_t seed = ttsl::hash::hash_objects_with_default_seed(
+    // Data type, layout and memory config (which carries the sharding configuration) are always
+    // identity-relevant, so they always go into the hash. Only the *shape* is folded in conditionally,
+    // per the parameter's declared relaxations below.
+    std::size_t hash = ttsl::hash::hash_objects_with_default_seed(
         p.unique_id.get(), spec.data_type(), spec.layout(), spec.memory_config());
 
     if (p.advanced_options.dynamic_tensor_shape) {
         // Program depends only on element/page count, not on tensor shape.
-        seed = ttsl::hash::hash_objects(seed, static_cast<uint64_t>(spec.padded_shape().volume()));
+        hash = ttsl::hash::hash_objects(hash, static_cast<uint64_t>(spec.padded_shape().volume()));
     } else if (p.advanced_options.match_padded_shape_only) {
         // Logical shape may vary; the padded shape (and thus access pattern) is fixed.
-        seed = ttsl::hash::hash_objects(seed, spec.padded_shape());
+        hash = ttsl::hash::hash_objects(hash, spec.padded_shape());
     } else {
-        seed = ttsl::hash::hash_objects(seed, spec.logical_shape(), spec.padded_shape());
+        hash = ttsl::hash::hash_objects(hash, spec.logical_shape(), spec.padded_shape());
     }
-    return seed;
+    return hash;
 }
 
 }  // namespace detail
@@ -64,7 +67,7 @@ inline std::size_t program_spec_cache_key(const tt::tt_metal::experimental::Prog
     // this count) so the new field participates in the key.
     static_assert(reflect::size<tt::tt_metal::experimental::ProgramSpec>() == 7);
 
-    std::size_t seed = ttsl::hash::hash_objects_with_default_seed(
+    std::size_t hash = ttsl::hash::hash_objects_with_default_seed(
         spec.name,
         spec.kernels,
         spec.dataflow_buffers,
@@ -73,9 +76,9 @@ inline std::size_t program_spec_cache_key(const tt::tt_metal::experimental::Prog
         spec.work_units);
 
     for (const auto& p : spec.tensor_parameters) {
-        seed = ttsl::hash::hash_objects(seed, detail::hash_tensor_parameter(p));
+        hash = ttsl::hash::hash_objects(hash, detail::hash_tensor_parameter(p));
     }
-    return seed;
+    return hash;
 }
 
 }  // namespace ttnn::device_operation

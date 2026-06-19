@@ -89,9 +89,10 @@ concept MetalV2FactoryConcept = requires { &T::create_program_artifacts; } && !P
 // Opt-in extension for ops that must allocate their OWN device tensors (scratch / config /
 // workspace), e.g. conv / pool / halo-style ops. Such a factory additionally implements
 //     std::vector<MeshTensor> get_owned_tensors(attrs, tensor_args, tensor_return_value)
-// plus a create_program_artifacts(attrs, tensor_args, tensor_return_value, const std::vector<MeshTensor>*)
-// overload whose run_params reference the supplied (ttnn-parked) owned tensors when the pointer is
-// non-null (it is null only during key computation, where the spec is owned-independent). ttnn
+// plus a create_program_artifacts(attrs, tensor_args, tensor_return_value,
+//                                  std::optional<std::span<const MeshTensor>>)
+// overload whose run_params reference the supplied (ttnn-parked) owned tensors when the span is present
+// (it is std::nullopt only during key computation, where the spec is owned-independent). ttnn
 // retrieves the owned tensors via get_owned_tensors, parks them at a stable address, and hands them to
 // create_program_artifacts; they are never part of ProgramArtifacts or the ProgramSpec.
 //
