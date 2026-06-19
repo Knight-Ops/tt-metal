@@ -436,11 +436,12 @@ jobs:
           # credential chain, so export them to the job environment.
           echo "AWS_ACCESS_KEY_ID=${{ secrets.GARAGE_S3_ACCESS_KEY }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.GARAGE_S3_SECRET_KEY }}" >> $GITHUB_ENV
-          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=garage" >> $GITHUB_ENV
           # crsh: is ccache's custom remote storage protocol. The first path is the
           # IPC socket the helper listens on; ccache derives the helper binary name
           # (ccache-storage-s3) from the s3:// url scheme and looks it up in libexec.
-          CCACHE_REMOTE_STORAGE="crsh:/tmp/ccache-s3.sock|url=s3://${CCACHE_S3_BUCKET}|region=us-east-1|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
+          # Garage's s3_region is configured as "garage" — must match exactly or signing fails.
+          CCACHE_REMOTE_STORAGE="crsh:/tmp/ccache-s3.sock|url=s3://${CCACHE_S3_BUCKET}|region=garage|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
           if [ "${CCACHE_S3_READONLY}" = "true" ]; then
             CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
           fi
