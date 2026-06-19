@@ -20,26 +20,29 @@ struct operation_attributes_t {
     // Clamp limit applied inside the SwiGLU activation: silu(clamp(gate, max=limit)) * clamp(up, -limit, limit).
     float swiglu_limit{};
 
-    // Routing-weight column index for each weight pair (i.e. the original expert id of each "hit").
-    // expert_ids[i] selects the column of `routing_weights` that scales the i-th expert's output.
-    std::vector<uint32_t> expert_ids{};
-
     tt::tt_metal::MemoryConfig output_memory_config{};
 };
 
 // All tensors flowing in/out of the operation. This op is the concrete example of an op that takes
-// an *array* of tensors: one gate_up / down weight tensor per selected ("hit") expert.
+// an *array* of tensors: one gate_up / down weight tensor per expert.
+//
+// Decode-only: sequence length T == 1, so activations are effectively [1, 1, 1, H].
+//
+// Expert selection/scaling is fully on-device: the i-th weight pair is scaled by column i of the
+// on-device `routing_weights` tensor (no host-side `expert_ids` / "hit" list). Experts whose routing
+// weight is zero contribute nothing.
 struct tensor_args_t {
-    // Activations, [1, 1, T, H].
+    // Activations, [1, 1, 1, H] (decode, T == 1).
     const Tensor& input_tensor;
 
-    // Per-token routing weights, [1, 1, T, E]. Columns indexed by operation_attributes_t::expert_ids.
+    // Per-token routing weights, [1, 1, 1, E], where E == gate_up_weights.size(). Column i scales the
+    // i-th expert's output.
     const Tensor& routing_weights;
 
-    // One gate_up weight tensor per selected expert, each [H, 2I] (matmul-ready / transposed).
+    // One gate_up weight tensor per expert, each [H, 2I] (matmul-ready / transposed).
     std::vector<Tensor> gate_up_weights;
 
-    // One down weight tensor per selected expert, each [I, H] (matmul-ready / transposed).
+    // One down weight tensor per expert, each [I, H] (matmul-ready / transposed).
     std::vector<Tensor> down_weights;
 };
 

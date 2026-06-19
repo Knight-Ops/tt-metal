@@ -13,17 +13,24 @@ void bind_fused_experts(nb::module_& mod) {
     ttnn::bind_function<"fused_experts", "ttnn.experimental.deepseek.moe.">(
         mod,
         R"doc(
-        Experimental fused routed-expert FFN for DeepSeek V4-Flash.
+        Experimental fused routed-expert FFN for DeepSeek V4-Flash decode (sequence length 1).
 
         Fuses the per-expert matmul -> SwiGLU -> matmul -> weighted-accumulate loop
-        into a single device operation.
+        into a single device operation. Expert selection/scaling is read on-device from
+        ``routing_weights``: the i-th weight pair is scaled by ``routing_weights`` column i,
+        so experts with zero routing weight contribute nothing (no host-side expert-id list).
+
+        FIRST VERSION: a single core reads ``routing_weights`` and computes the selected
+        ("hit") expert ids on-device, returning them as a [1, 1, 1, E] UINT32 tensor (sorted
+        hit ids compacted at the front, remaining slots padded with E). ``routing_weights``
+        must be ROW_MAJOR bfloat16. The full fused FFN output is a later milestone.
 
         Args:
-            input_tensor: Activations, [1, 1, T, H].
-            routing_weights: Per-token routing weights, [1, 1, T, E].
-            gate_up_weights: List of [H, 2I] weight tensors, one per selected expert.
-            down_weights: List of [I, H] weight tensors, one per selected expert.
-            expert_ids: Routing-weight column index for each weight pair.
+            input_tensor: Activations, [1, 1, 1, H].
+            routing_weights: Per-token routing weights, [1, 1, 1, E] (ROW_MAJOR bfloat16),
+                with E == len(gate_up_weights).
+            gate_up_weights: List of [H, 2I] weight tensors, one per expert.
+            down_weights: List of [I, H] weight tensors, one per expert.
             intermediate_size: SwiGLU intermediate size I.
             swiglu_limit: Clamp limit used by the SwiGLU activation.
             memory_config: Optional output memory config.
@@ -34,7 +41,6 @@ void bind_fused_experts(nb::module_& mod) {
         nb::arg("routing_weights"),
         nb::arg("gate_up_weights"),
         nb::arg("down_weights"),
-        nb::arg("expert_ids"),
         nb::arg("intermediate_size"),
         nb::arg("swiglu_limit"),
         nb::arg("memory_config") = std::nullopt);

@@ -54,7 +54,6 @@ struct FusedExpertsDeviceOperation {
         const Tensor& routing_weights,
         const std::vector<Tensor>& gate_up_weights,
         const std::vector<Tensor>& down_weights,
-        const std::vector<uint32_t>& expert_ids,
         uint32_t intermediate_size,
         float swiglu_limit,
         const std::optional<MemoryConfig>& memory_config);
@@ -69,7 +68,6 @@ fused_experts(
     const Tensor& routing_weights,
     const std::vector<Tensor>& gate_up_weights,
     const std::vector<Tensor>& down_weights,
-    const std::vector<uint32_t>& expert_ids,
     uint32_t intermediate_size,
     float swiglu_limit,
     const std::optional<MemoryConfig>& memory_config = std::nullopt);
