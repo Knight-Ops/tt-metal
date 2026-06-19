@@ -58,6 +58,20 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t num_experts = static_cast<uint32_t>(tensor_args.gate_up_weights.size());
     const uint32_t sentinel = num_experts;  // "no expert" marker for unused output slots
 
+    // gate_up weights are [K=H, N=2I] per expert (TILE layout); each core fetches a
+    // [K, 64] (k_tiles x 2-tile) column slice for every active expert. All experts
+    // share the same layout, so one TensorAccessorArgs (from weight 0) is reused.
+    const auto& gate_up0 = tensor_args.gate_up_weights.front();
+    auto* gate_up0_buffer = gate_up0.buffer();
+    constexpr uint32_t TILE_DIM = 32;
+    const uint32_t k_tiles = static_cast<uint32_t>(gate_up0.logical_shape()[-2]) / TILE_DIM;
+    const uint32_t n_tiles = static_cast<uint32_t>(gate_up0.logical_shape()[-1]) / TILE_DIM;
+    const uint32_t weight_tile_bytes = static_cast<uint32_t>(gate_up0_buffer->page_size());
+    constexpr uint32_t kTilesPerCore = 2;
+    const uint32_t weights_cb_bytes = k_tiles * kTilesPerCore * weight_tile_bytes;
+
+    const tt::DataFormat gate_up_df = datatype_to_dataformat_converter(gate_up0.dtype());
+
     const tt::DataFormat routing_df = datatype_to_dataformat_converter(routing_weights.dtype());
     const tt::DataFormat out_df = datatype_to_dataformat_converter(output_tensor.dtype());
     const tt::DataFormat input_df = datatype_to_dataformat_converter(input_tensor.dtype());
@@ -145,6 +159,18 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         }}},
     });
 
+    // Per-core gate_up weight slice ([K, 64] = k_tiles x 2 tiles).
+    constexpr uint32_t cb_weights = CBIndex::c_3;
+    desc.cbs.push_back(CBDescriptor{
+        .total_size = weights_cb_bytes,
+        .core_ranges = all_cores,
+        .format_descriptors = {{CBFormatDescriptor{
+            .buffer_index = cb_weights,
+            .data_format = gate_up_df,
+            .page_size = weight_tile_bytes,
+        }}},
+    });
+
     // Multicast rectangle (NoC coords) covering the whole grid. Non-loopback
     // multicast excludes the sender, so num_dests = total cores - 1.
     const auto corner_a = device->worker_core_from_logical_core(CoreCoord{0, 0});
@@ -155,6 +181,20 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     const uint32_t mcast_end_y = std::max<uint32_t>(corner_a.y, corner_b.y);
     const uint32_t num_dests = GRID_X * GRID_Y - 1;
 
+    // Each core owns the output N-tile pair [2*idx, 2*idx+1], idx = y*GRID_X + x.
+    auto col_start_tile_for = [](const CoreCoord& c) -> uint32_t { return (c.y * GRID_X + c.x) * kTilesPerCore; };
+    // Base address of every expert's gate_up weight, in expert-id order.
+    std::vector<uint32_t> gate_up_addrs;
+    gate_up_addrs.reserve(num_experts);
+    for (const auto& w : tensor_args.gate_up_weights) {
+        gate_up_addrs.push_back(static_cast<uint32_t>(w.buffer()->address()));
+    }
+    auto append_addrs = [&](KernelDescriptor::CoreRuntimeArgs& args) {
+        for (uint32_t a : gate_up_addrs) {
+            args.push_back(a);
+        }
+    };
+
     // ---- Sender kernel on {0,0}. ----
     std::vector<uint32_t> sender_ct_args = {
         num_experts,
@@ -164,9 +204,14 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         routing_page_bytes,
         bcast_page_bytes,
         sem_id,
+        cb_weights,
+        k_tiles,
+        n_tiles,
+        weight_tile_bytes,
     };
     TensorAccessorArgs(*routing_buffer).append_to(sender_ct_args);
     TensorAccessorArgs(*out_buffer).append_to(sender_ct_args);
+    TensorAccessorArgs(*gate_up0_buffer).append_to(sender_ct_args);
 
     KernelDescriptor sender_desc;
     sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/compute_expert_ids.cpp";
@@ -178,9 +223,8 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         .processor = DataMovementProcessor::RISCV_0,
         .noc = NOC::NOC_0,
     };
-    sender_desc.runtime_args.emplace_back(
-        sender,
-        KernelDescriptor::CoreRuntimeArgs{
+    {
+        KernelDescriptor::CoreRuntimeArgs args{
             routing_buffer->address(),
             out_buffer->address(),
             mcast_start_x,
@@ -188,7 +232,11 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
             mcast_end_x,
             mcast_end_y,
             num_dests,
-        });
+            col_start_tile_for(sender),
+        };
+        append_addrs(args);
+        sender_desc.runtime_args.emplace_back(sender, std::move(args));
+    }
     desc.kernels.push_back(std::move(sender_desc));
 
     // ---- Input-broadcaster kernel on {1,0} (uses NoC 1). ----
@@ -197,8 +245,16 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
         input_page_size,
         input_num_pages,
         sem_input_id,
+        sem_id,
+        num_experts,
+        cb_bcast,
+        cb_weights,
+        k_tiles,
+        n_tiles,
+        weight_tile_bytes,
     };
     TensorAccessorArgs(*input_buffer).append_to(input_ct_args);
+    TensorAccessorArgs(*gate_up0_buffer).append_to(input_ct_args);
 
     KernelDescriptor input_sender_desc;
     input_sender_desc.kernel_source = std::string(kKernelDir) + "/dataflow/broadcast_input.cpp";
@@ -213,25 +269,48 @@ ProgramDescriptor FusedExpertsDeviceOperation::MultiCore::create_descriptor(
     };
     // NoC 1 multicasts traverse from high to low coordinates, so the rectangle's
     // start/end must be swapped relative to the NoC 0 sender.
-    input_sender_desc.runtime_args.emplace_back(
-        input_sender,
-        KernelDescriptor::CoreRuntimeArgs{
+    {
+        KernelDescriptor::CoreRuntimeArgs args{
             input_buffer->address(),
             mcast_end_x,
             mcast_end_y,
             mcast_start_x,
             mcast_start_y,
             num_dests,
-        });
+            col_start_tile_for(input_sender),
+        };
+        append_addrs(args);
+        input_sender_desc.runtime_args.emplace_back(input_sender, std::move(args));
+    }
     desc.kernels.push_back(std::move(input_sender_desc));
 
     // ---- Receiver kernel on the other 62 cores. ----
+    std::vector<uint32_t> receiver_ct_args = {
+        sem_id,
+        sem_input_id,
+        num_experts,
+        cb_bcast,
+        cb_weights,
+        k_tiles,
+        n_tiles,
+        weight_tile_bytes,
+    };
+    TensorAccessorArgs(*gate_up0_buffer).append_to(receiver_ct_args);
+
     KernelDescriptor receiver_desc;
     receiver_desc.kernel_source = std::string(kKernelDir) + "/dataflow/wait_expert_ids.cpp";
     receiver_desc.source_type = KernelDescriptor::SourceType::FILE_PATH;
     receiver_desc.core_ranges = receiver_cores;
-    receiver_desc.compile_time_args = {sem_id, sem_input_id};
+    receiver_desc.compile_time_args = receiver_ct_args;
     receiver_desc.config = ReaderConfigDescriptor{};
+    // Per-core: this core's column slice start, then every expert's gate_up address.
+    for (const auto& cr : receiver_cores.ranges()) {
+        for (const auto& core : cr) {
+            KernelDescriptor::CoreRuntimeArgs args{col_start_tile_for(core)};
+            append_addrs(args);
+            receiver_desc.runtime_args.emplace_back(core, std::move(args));
+        }
+    }
     desc.kernels.push_back(std::move(receiver_desc));
 
     return desc;

@@ -20,6 +20,7 @@ Decode-only: sequence length T == 1.
 import pytest
 import torch
 import ttnn
+import random
 
 
 def _hit_ids(routing: torch.Tensor, num_experts: int) -> list[int]:
@@ -29,14 +30,18 @@ def _hit_ids(routing: torch.Tensor, num_experts: int) -> list[int]:
 
 
 @pytest.mark.parametrize(
-    "hidden, intermediate, num_experts, zero_cols",
+    "hidden, intermediate, num_experts, num_nonzero",
     [
-        (128, 64, 8, (1, 2, 5)),
-        (256, 128, 16, (0, 3, 7, 11, 15)),
-        (128, 64, 8, ()),  # all experts selected
+        (128, 64, 8, 5),
+        (256, 128, 16, 11),
+        (128, 64, 8, 8),  # all experts selected
+        # DeepSeek-V4-Flash config sizes (hidden_size=4096, moe_intermediate_size=2048).
+        # The model has n_routed_experts=256; we use fewer here to keep DRAM/host memory
+        # tractable for a unit test (each [4096, 4096] gate_up weight is ~32 MB).
+        (4096, 2048, 64, 6),
     ],
 )
-def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, zero_cols):
+def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, num_nonzero):
     torch.manual_seed(0)
     limit = 7.0
     tokens = 1  # decode: sequence length T == 1
@@ -45,10 +50,13 @@ def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, zer
     x_flat = x.reshape(1, 1, tokens, hidden)
 
     # Routing weights [T, E]; nonzero columns are the "selected" experts. Use values
-    # well above bf16 rounding noise so abs() stays strictly positive.
+    # well above bf16 rounding noise so abs() stays strictly positive. `num_nonzero`
+    # evenly spaced columns stay nonzero; the rest are zeroed.
     routing = torch.rand((tokens, num_experts), dtype=torch.bfloat16).float() + 0.5
-    for c in zero_cols:
-        routing[:, c] = 0.0
+    nonzero_cols = random.sample(range(num_experts), num_nonzero)
+    for c in range(num_experts):
+        if c not in nonzero_cols:
+            routing[:, c] = 0.0
     routing_4d = routing.reshape(1, 1, tokens, num_experts)
 
     expected_ids = _hit_ids(routing, num_experts)
@@ -61,10 +69,8 @@ def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, zer
         (torch.rand((intermediate, hidden), dtype=torch.bfloat16) - 0.5).float() for _ in range(num_experts)
     ]
 
-    def to_tt(t, layout):
-        return ttnn.from_torch(
-            t, dtype=ttnn.bfloat16, device=device, layout=layout, memory_config=ttnn.DRAM_MEMORY_CONFIG
-        )
+    def to_tt(t, layout, dtype=ttnn.bfloat16):
+        return ttnn.from_torch(t, dtype=dtype, device=device, layout=layout, memory_config=ttnn.DRAM_MEMORY_CONFIG)
 
     tt_out = ttnn.experimental.deepseek.moe.fused_experts(
         to_tt(x_flat, ttnn.TILE_LAYOUT),
@@ -75,8 +81,8 @@ def test_fused_experts_expert_ids(device, hidden, intermediate, num_experts, zer
             layout=ttnn.ROW_MAJOR_LAYOUT,
             memory_config=ttnn.DRAM_MEMORY_CONFIG,
         ),
-        gate_up_weights=[to_tt(w, ttnn.TILE_LAYOUT) for w in gate_up_weights],
-        down_weights=[to_tt(w, ttnn.TILE_LAYOUT) for w in down_weights],
+        gate_up_weights=[to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b) for w in gate_up_weights],
+        down_weights=[to_tt(w, ttnn.TILE_LAYOUT, dtype=ttnn.bfloat4_b) for w in down_weights],
         intermediate_size=intermediate,
         swiglu_limit=limit,
     )
