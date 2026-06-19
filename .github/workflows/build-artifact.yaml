@@ -396,7 +396,7 @@ jobs:
         CCACHE_COMPRESS: "true"
         CCACHE_COMPRESSLEVEL: "3"
         # Log ccache operations to a file so remote storage errors are visible in CI.
-        # Errors (storage helper failures, Redis timeouts) would otherwise be silent.
+        # Errors (storage helper failures, S3 timeouts) would otherwise be silent.
         CCACHE_LOGFILE: /tmp/ccache.log
         # Strip the working directory prefix from hashed paths so cache entries
         # are reusable across machines even if the checkout path differs.
@@ -419,27 +419,27 @@ jobs:
         working-directory: /work # https://github.com/actions/runner/issues/878
 
     steps:
-      - name: Check Redis credentials
+      - name: Configure S3 ccache storage
         # Failing internal jobs draws attention immediately so we can fix them and make them fast.
         # Forks will never have secrets; don't fail the job for them, they'll just run slower
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
         run: |
-          if [ -z "${{ secrets.REDIS_PASSWORD }}" ]; then
-            echo "Redis password is missing. Did you forget 'secrets: inherit'?"
+          if [ -z "${{ secrets.GARAGE_S3_ACCESS_KEY }}" ] || [ -z "${{ secrets.GARAGE_S3_SECRET_KEY }}" ]; then
+            echo "Garage S3 credentials are missing. Did you forget 'secrets: inherit'?"
             exit 1
           fi
-          # Conditionally set this here so that it remains unset on forks,
-          # otherwise it resolves an invalid URL and the job fails
-          REDIS_USER="${{ vars.REDIS_USER }}"
-          REDIS_PASSWORD="${{ secrets.REDIS_PASSWORD }}"
-          REDIS_HOST="${{ vars.REDIS_HOST }}"
-          REDIS_PORT="${{ vars.REDIS_PORT }}"
-          # ccache 4.13 bug: read-only is std::optional<bool>; the write gate checks
-          # `if (entry.config.read_only)` which is true whenever the optional HAS a value —
-          # including when that value is false.  Omit the property entirely unless we
-          # actually want read-only mode; ccache's default when absent is writable.
-          CCACHE_REMOTE_STORAGE="redis://${REDIS_USER}:${REDIS_PASSWORD}@${REDIS_HOST}:${REDIS_PORT}"
-          if [ "${{ vars.REDIS_IS_READONLY }}" = "true" ]; then
+          # The ccache-storage-s3 helper reads credentials from the standard AWS
+          # credential chain, so export them to the job environment.
+          echo "AWS_ACCESS_KEY_ID=${{ secrets.GARAGE_S3_ACCESS_KEY }}" >> $GITHUB_ENV
+          echo "AWS_SECRET_ACCESS_KEY=${{ secrets.GARAGE_S3_SECRET_KEY }}" >> $GITHUB_ENV
+          echo "AWS_DEFAULT_REGION=us-east-1" >> $GITHUB_ENV
+          # crsh: is ccache's custom remote storage protocol. The first path is the
+          # IPC socket the helper listens on; ccache derives the helper binary name
+          # (ccache-storage-s3) from the s3:// url scheme and looks it up in libexec.
+          CCACHE_S3_BUCKET="${{ vars.CCACHE_S3_BUCKET }}"
+          CCACHE_S3_PREFIX="${{ vars.CCACHE_S3_PREFIX }}"
+          CCACHE_REMOTE_STORAGE="crsh:/tmp/ccache-s3.sock|url=s3://${CCACHE_S3_BUCKET}|region=us-east-1|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
+          if [ "${{ vars.CCACHE_S3_READONLY }}" = "true" ]; then
             CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
