@@ -497,6 +497,40 @@ jobs:
         run: |
           mkdir -p /tmp/ccache
 
+      - name: Debug ccache-storage-s3 helper
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: |
+          echo "=== ccache version and location ==="
+          which ccache
+          ccache --version
+
+          echo "=== Searching for ccache libexec dir ==="
+          ls -la "$(dirname $(which ccache))/../lib/ccache/" 2>/dev/null || echo "no ../lib/ccache/ dir"
+          ls -la "$(dirname $(which ccache))/../libexec/" 2>/dev/null || echo "no ../libexec/ dir"
+          find /usr /opt /usr/local -name "ccache-storage-s3" 2>/dev/null || echo "ccache-storage-s3 not found in /usr /opt /usr/local"
+
+          echo "=== ccache config ==="
+          ccache --show-config
+
+          echo "=== /tmp writability ==="
+          ls -la /tmp/
+
+          echo "=== Garage endpoint connectivity ==="
+          curl -sv --max-time 5 --noproxy garage.garage.svc.cluster.local http://garage.garage.svc.cluster.local:3900/ 2>&1 || true
+
+          echo "=== Attempt to start helper manually ==="
+          HELPER=$(find /usr /opt /usr/local -name "ccache-storage-s3" 2>/dev/null | head -1)
+          if [ -n "$HELPER" ]; then
+            echo "Found helper at: $HELPER"
+            "$HELPER" /tmp/ccache-s3-test.sock &
+            HELPER_PID=$!
+            sleep 2
+            ls -la /tmp/ccache-s3-test.sock 2>/dev/null && echo "Socket created OK" || echo "Socket NOT created"
+            kill $HELPER_PID 2>/dev/null || true
+          else
+            echo "ccache-storage-s3 binary NOT FOUND — this is why crsh:// fails"
+          fi
+
       - name: Prepare ccache summary
         run: |
           # Zero out the stats so we can see how we did this build
