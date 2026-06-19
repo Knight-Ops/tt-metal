@@ -54,6 +54,12 @@ QK_HEAD_DIM = Cfg.QK_NOPE_HEAD_DIM + Cfg.QK_ROPE_HEAD_DIM  # 128 + 64 = 192 (dri
 # Tuned 640-chunk SDPA config (MLA_SDPA_CONFIG[640] in mla_config.py): per-device seq 640 on 8x4.
 RING_MLA_Q_CHUNK = 32
 RING_MLA_K_CHUNK = 640
+# KV cache per-device seq length, decoupled from the Q chunk. Mirrors test_mla_chunked_prefill
+# "production-50k+5k" (iters_isl=[5120]*11): seq_len_cache = 11 * chunk_size_global = 56320 global =
+# 7040 per device on 8x4. The cache is sized for the whole 50k+5k prefill; the FIRST chunk
+# (kv_actual_isl=0) writes only its 5120-token chunk (640/device, block-cyclic slab 0) and the rest
+# stays pad.
+SEQ_CACHE_LOCAL = 7040
 
 # (id, kind, dim, per-device-input feature size on the gathered/scattered dim)
 #   rs: feat is the FULL width each device holds; output is feat // tp.
@@ -381,8 +387,17 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
     nhk = 1  # single shared latent K/V head
     d_q = d_k = KVPE_DIM  # 576: Q and K share the latent width
     d_v = KV_LORA_RANK  # 512: V is the first d_v cols of the latent KV
-    sq = SEQ_LOCAL * sp  # full ring sequence; per-device SEQ_LOCAL=640 (the 8x4 chunk/sp load)
     scale = QK_HEAD_DIM**-0.5  # mla.py: scale on the original qk_head_dim, not the latent width
+
+    # First chunk of the prefill: Q is the chunk (chunk_size_global = SEQ_LOCAL*sp, 640/device); the KV
+    # cache is sized for the whole 50k+5k prefill (SEQ_CACHE_LOCAL*sp, 7040/device) but only this
+    # chunk is written. kv_actual_isl=0 -> chunk-aligned (no rotation), logical_n = chunk window.
+    chunk_global = SEQ_LOCAL * sp
+    seq_cache = SEQ_CACHE_LOCAL * sp
+    kv_actual_isl = 0
+    logical_n = kv_actual_isl + chunk_global
+    cache_batch = 1
+    kv_cache_batch_idx = 0
 
     grid = mesh_device.compute_with_storage_grid_size()
     sdpa_compute_grid = (grid.x - 1, grid.y)  # mla.py ring_sdpa_compute_grid
@@ -411,18 +426,27 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
         exp_approx_mode=False,
     )
 
-    # --- inputs: Q sharded heads-over-TP + seq-over-SP; the single latent KV sharded seq-over-SP and
-    #     replicated over TP; gathered-KV scratch buffer replicated over the whole mesh. ---
+    # --- inputs ---
     torch.manual_seed(1234)
-    Q = _fa_rand(1, nhq, sq, d_q)
-    KV = _fa_rand(1, nhk, sq, d_k)
-    V = KV[:, :, :, :d_v]
+    Q = _fa_rand(1, nhq, chunk_global, d_q)  # the chunk's queries
+    KV_chunk = _fa_rand(1, nhk, chunk_global, d_k)  # the chunk's latent K/V (natural token order)
+    V_chunk = KV_chunk[:, :, :, :d_v]
+
+    # Place the chunk into the oversized cache block-cyclically: with kv_actual_isl=0 every chunk token
+    # lands in slab 0, and device d holds the contiguous token range [d*SEQ_LOCAL, (d+1)*SEQ_LOCAL).
+    # Sharding the cache seq contiguously over SP then hands device d exactly that range at its slab 0
+    # (cache rows 0..SEQ_LOCAL-1); the remaining SEQ_CACHE_LOCAL-SEQ_LOCAL rows per device stay pad.
+    KV_cache = torch.zeros(cache_batch, nhk, seq_cache, d_k, dtype=KV_chunk.dtype)
+    for d in range(sp):
+        KV_cache[kv_cache_batch_idx, :, d * SEQ_CACHE_LOCAL : d * SEQ_CACHE_LOCAL + SEQ_LOCAL, :] = KV_chunk[
+            0, :, d * SEQ_LOCAL : (d + 1) * SEQ_LOCAL, :
+        ]
 
     q_shard_dims = [None, None]
-    q_shard_dims[sp_axis] = 2  # seq across the ring
+    q_shard_dims[sp_axis] = 2  # chunk seq across the ring
     q_shard_dims[tp_axis] = 1  # heads across TP
     kv_shard_dims = [None, None]
-    kv_shard_dims[sp_axis] = 2  # seq across the ring; single head replicated over TP
+    kv_shard_dims[sp_axis] = 2  # cache seq across the ring; single head replicated over TP
 
     tt_Q = ttnn.from_torch(
         Q,
@@ -432,14 +456,16 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
         mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=(sp, tp), dims=q_shard_dims),
     )
     tt_KV = ttnn.from_torch(
-        KV,
+        KV_cache,
         dtype=ttnn.bfloat8_b,  # mla.py writes the bf8 latent KV to the cache
         layout=ttnn.TILE_LAYOUT,
         device=mesh_device,
         mesh_mapper=ttnn.ShardTensor2dMesh(mesh_device, mesh_shape=(sp, tp), dims=kv_shard_dims),
     )
+    # Gathered-KV scratch buffer, sized to the full cache and replicated over the whole mesh
+    # (mla.py _chunked_kv_buf = get_mla_chunked_kv_buffer(cache_batch=1, seq_len=seq_len_cache, ...)).
     persistent_kv = ttnn.from_torch(
-        torch.zeros(1, nhk, sq, d_k),
+        torch.zeros(cache_batch, nhk, seq_cache, d_k),
         dtype=ttnn.bfloat8_b,
         layout=ttnn.TILE_LAYOUT,
         device=mesh_device,
@@ -450,13 +476,16 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
         reference_output = None
         tt_out_torch = None
         for it in range(num_iters):
-            logger.info(f"ring_mla nhq={nhq} sq={sq} d_k={d_k} d_v={d_v}: iteration {it + 1}/{num_iters}")
+            logger.info(
+                f"ring_mla nhq={nhq} chunk={chunk_global} cache={seq_cache} (per-dev {SEQ_LOCAL}/{SEQ_CACHE_LOCAL}) "
+                f"kv_actual_isl={kv_actual_isl} logical_n={logical_n}: iteration {it + 1}/{num_iters}"
+            )
             tt_out, _ = ttnn.transformer.ring_mla(
                 tt_Q,
                 tt_KV,
                 persistent_output_buffer_kv=persistent_kv,
                 head_dim_v=d_v,
-                logical_n=sq,
+                logical_n=logical_n,
                 is_balanced=False,
                 program_config=program_config,
                 scale=scale,
@@ -470,14 +499,16 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
                 subdevice_id=worker_sub_device_id,
                 ccl_core_grid_offset=ccl_core_grid_offset,
                 use_column_major_ccl=True,
+                kv_cache_batch_idx=kv_cache_batch_idx,
+                kv_actual_isl=kv_actual_isl,
             )
-            # readback: concat seq over SP (dim2) and heads over TP (dim1) -> full [1, nhq, sq, d_v].
+            # readback: output is the Q chunk; concat seq over SP (dim2) and heads over TP (dim1).
             tt_out_torch = ttnn.to_torch(
                 tt_out,
                 mesh_composer=ttnn.create_mesh_composer(
                     mesh_device, ttnn.MeshComposerConfig(q_shard_dims[0], q_shard_dims[1])
                 ),
-            )[:, :, :sq, :d_v]
+            )[:, :, :chunk_global, :d_v]
 
             # Across iterations the op must be deterministic (same inputs, fixed buffer address).
             if reference_output is None:
@@ -487,8 +518,8 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
                 pytest.fail(f"ring_mla iter {it + 1}/{num_iters} differs from iter 1, max diff={max_diff}")
         ttnn.synchronize_device(mesh_device)
 
-        # PCC against a torch SDPA golden (run once; the chunked golden is heavy at large seq).
-        gt = _torch_sdpa_reference(Q, KV, V, scale=scale, is_causal=True)
+        # First chunk (kv_actual_isl=0): plain causal SDPA of the chunk against itself.
+        gt = _torch_sdpa_reference(Q, KV_chunk, V_chunk, scale=scale, is_causal=True)
         passed, msg = comp_pcc(gt, tt_out_torch, pcc_threshold)
         logger.info(f"ring_mla PCC: {msg}")
         assert passed, f"ring_mla FAILED (after {num_iters} iters): {msg}"
@@ -506,8 +537,9 @@ def _run_ring_mla(mesh_device, topology, num_iters=1, pcc_threshold=0.99):
 @pytest.mark.parametrize("num_iters", [1, 5, 10, 50], ids=lambda n: f"iters{n}")
 @pytest.mark.timeout(0)
 def test_ring_mla(mesh_device, device_params, topology, num_iters):
-    """Full chunked-prefill ring_mla op (mla.py:627) at the production per-device shape
-    (seq_local=640, 64 heads, latent width 576, head_dim_v 512). Ring runs on the SP axis (skipped
-    when sp<2). Runs the op `num_iters` times in a loop; checks iteration-to-iteration determinism
-    and a torch SDPA PCC golden."""
+    """Full chunked-prefill ring_mla op (mla.py:627) for the FIRST chunk of the production-50k+5k
+    scenario: Q chunk 640/device (chunk_size_global = 640*sp), KV cache oversized to 7040/device
+    (the whole 50k+5k prefill window), kv_actual_isl=0. Ring runs on the SP axis (skipped when sp<2).
+    Runs the op `num_iters` times in a loop; checks iteration-to-iteration determinism and a torch
+    SDPA PCC golden."""
     _run_ring_mla(mesh_device, topology, num_iters=num_iters)
