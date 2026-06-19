@@ -379,6 +379,10 @@ jobs:
       DISTRO: ${{ needs.parse-platform.outputs.distro }}
       VERSION: ${{ needs.parse-platform.outputs.version }}
       TOOLCHAIN: ${{ inputs.toolchain || needs.parse-platform.outputs.toolchain }}
+      # S3 ccache config — lift to repo vars/secrets when ready
+      CCACHE_S3_BUCKET: ccache
+      CCACHE_S3_PREFIX: tt-metal
+      CCACHE_S3_READONLY: "false"
     container:
       # Callers that pre-resolve via resolve-docker-pull-refs pass already-prefixed
       # tags with harbor-prefix=''; callers with raw GHCR tags pass harbor-prefix
@@ -436,10 +440,8 @@ jobs:
           # crsh: is ccache's custom remote storage protocol. The first path is the
           # IPC socket the helper listens on; ccache derives the helper binary name
           # (ccache-storage-s3) from the s3:// url scheme and looks it up in libexec.
-          CCACHE_S3_BUCKET="${{ vars.CCACHE_S3_BUCKET }}"
-          CCACHE_S3_PREFIX="${{ vars.CCACHE_S3_PREFIX }}"
           CCACHE_REMOTE_STORAGE="crsh:/tmp/ccache-s3.sock|url=s3://${CCACHE_S3_BUCKET}|region=us-east-1|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
-          if [ "${{ vars.CCACHE_S3_READONLY }}" = "true" ]; then
+          if [ "${CCACHE_S3_READONLY}" = "true" ]; then
             CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
