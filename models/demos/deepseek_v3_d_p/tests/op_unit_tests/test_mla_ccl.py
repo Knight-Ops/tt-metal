@@ -312,7 +312,7 @@ def _run_mla_ring_attention_ag(
 @pytest.mark.parametrize(
     "mesh_device", [(1, 4), (1, 8), (2, 4), (8, 4)], ids=["1x4", "1x8", "2x4", "8x4"], indirect=True
 )
-@pytest.mark.parametrize("num_iters", [1], ids=lambda n: f"iters{n}")
+@pytest.mark.parametrize("num_iters", [1, 5, 10, 50], ids=lambda n: f"iters{n}")
 @pytest.mark.timeout(0)
 def test_mla_ring_attention_ccl(mesh_device, device_params, topology, num_iters):
     """Ring all-gather CCL inside chunked-prefill ring_mla (mla.py:627), in isolation, at the
