@@ -447,10 +447,12 @@ jobs:
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
           echo "CCACHE_REMOTE_STORAGE: ${CCACHE_REMOTE_STORAGE}"
-          # Route S3 traffic through squid so the runner can reach the cluster-internal Garage endpoint.
-          # Without this, the Go AWS SDK sends requests directly and they may be dropped.
-          echo "HTTP_PROXY=http://proxy.restricted-proxy.svc.cluster.local:3128" >> $GITHUB_ENV
-          echo "HTTPS_PROXY=http://proxy.restricted-proxy.svc.cluster.local:3128" >> $GITHUB_ENV
+          # Garage is a cluster-internal service — bypass the restricted proxy (which only routes
+          # internet egress) so the Go binary connects directly. Same pattern as large-file-cache.
+          echo "NO_PROXY=${NO_PROXY:+${NO_PROXY},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
+          echo "no_proxy=${no_proxy:+${no_proxy},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
+          # Enable debug logging from the ccache-storage-s3 helper binary.
+          echo "CRSH_LOGFILE=/tmp/ccache-storage-s3.log" >> $GITHUB_ENV
 
       - name: Set artifact name
         id: set-artifact-name
@@ -603,9 +605,11 @@ jobs:
 
       - name: Publish ccache summary
         run: |
+          CCACHE_STATS=$(ccache -s)
+          echo "$CCACHE_STATS"
           echo '## CCache Summary' >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
-          ccache -s >> $GITHUB_STEP_SUMMARY
+          echo "$CCACHE_STATS" >> $GITHUB_STEP_SUMMARY
           echo '```' >> $GITHUB_STEP_SUMMARY
 
           # Surface remote storage stats and errors from the ccache log.
@@ -615,6 +619,18 @@ jobs:
             echo '```' >> $GITHUB_STEP_SUMMARY
             .github/scripts/ccache_log_filter.sh /tmp/ccache.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+          fi
+
+          # Publish ccache-storage-s3 helper debug log (set via CRSH_LOGFILE).
+          if [ -f /tmp/ccache-storage-s3.log ]; then
+            echo "=== ccache-storage-s3 log ==="
+            tail -100 /tmp/ccache-storage-s3.log
+            echo '## CCache Storage Helper Log' >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+            tail -200 /tmp/ccache-storage-s3.log >> $GITHUB_STEP_SUMMARY
+            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "WARNING: /tmp/ccache-storage-s3.log not found — CRSH_LOGFILE may not have been set or the helper never started"
           fi
 
       - name: ☁️ Upload packages
