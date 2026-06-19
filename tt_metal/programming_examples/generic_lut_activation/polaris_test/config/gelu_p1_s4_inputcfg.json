@@ -1,0 +1,29 @@
+{
+  "arch": "ttqs",
+  "llkVersionTag": "sep23",
+  "debug": 15,
+  "numTCores": 1,
+  "input": {
+    "syn": 0,
+    "name": "gelu-p1-s4-lut-activation",
+    "tc0": {
+      "numThreads": 4,
+      "startFunction": "main",
+      "th0Elf": "brisc.elf",
+      "th0Path": "/localdev/nkapre/tt-metal/tt_metal/programming_examples/generic_lut_activation/polaris_test/elfs",
+      "th1Elf": "ncrisc.elf",
+      "th1Path": "/localdev/nkapre/tt-metal/tt_metal/programming_examples/generic_lut_activation/polaris_test/elfs",
+      "th2Elf": "trisc0.elf",
+      "th2Path": "/localdev/nkapre/tt-metal/tt_metal/programming_examples/generic_lut_activation/polaris_test/elfs",
+      "th3Elf": "trisc1.elf",
+      "th3Path": "/localdev/nkapre/tt-metal/tt_metal/programming_examples/generic_lut_activation/polaris_test/elfs"
+    }
+  },
+  "description": {
+    "kernel": "p1_s4",
+    "activation": "gelu",
+    "degree": 1,
+    "segments": 4,
+    "source": "tt-metal generic_lut_activation"
+  }
+}

@@ -1,0 +1,15 @@
+arch:
+  0: quasar
+
+chips:
+  {}
+
+chip_unique_ids:
+  0: 1234567890
+
+boardtype:
+  0: QUASAR_SIMULATION
+
+ethernet_connections: []
+
+chips_with_mmio: [0]

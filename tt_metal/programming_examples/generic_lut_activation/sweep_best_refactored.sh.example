@@ -1,0 +1,138 @@
+#!/bin/bash
+# Example: sweep_best.sh refactored to use argparse_common.sh
+# This shows how to migrate an existing sweep script to use common argument parsing
+
+set -e
+
+# =============================================================================
+# Source common argument parsing library
+# =============================================================================
+
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+source "$SCRIPT_DIR/argparse_common.sh"
+
+# =============================================================================
+# Initialize Common Environment
+# =============================================================================
+
+init_common_env
+cd "$REPO_ROOT"
+WORK_DIR="tt_metal/programming_examples/generic_lut_activation"
+
+# =============================================================================
+# Script-Specific Variables
+# =============================================================================
+
+USE_MAX_ERROR=true  # Default to max error (use --use-mae to switch)
+
+# =============================================================================
+# Script-Specific Help
+# =============================================================================
+
+show_help() {
+    echo "Usage: $0 [OPTIONS]"
+    echo ""
+    echo "Runs the best configuration for each activation from \$TT_POLY_FIT_DIR/best.csv"
+    echo ""
+    show_common_options
+    echo ""
+    echo "Script-Specific Options:"
+    echo "  --use-mae                 Use best_mae config instead of best_max_error (default: max_error)"
+    echo ""
+    show_common_env_vars
+    echo ""
+    echo "Expected best.csv format (from polynomial fitter analysis):"
+    echo "  activation,precision,best_max_segments,best_max_degree,..."
+    echo ""
+    echo "Examples:"
+    echo "  $0                        # Run best max-error config for all activations"
+    echo "  $0 --use-mae              # Run best MAE config for all activations"
+    echo "  $0 --activation sigmoid   # Run best config for sigmoid only"
+    echo "  $0 --skip-build           # Skip build, run with existing binaries"
+    echo "  $0 --dry-run              # Check which configs would be tested"
+    echo ""
+    exit 0
+}
+
+# =============================================================================
+# Parse Arguments
+# =============================================================================
+
+# Parse common arguments first
+parse_common_args "$@"
+set -- "${PARSED_ARGS[@]}"
+
+# Show help if requested
+if [[ "$HELP_REQUESTED" == "true" ]]; then
+    show_help
+fi
+
+# Parse script-specific arguments
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        --use-mae)
+            USE_MAX_ERROR=false
+            shift
+            ;;
+        *)
+            echo "Unknown option: $1"
+            echo "Run '$0 --help' for usage information"
+            exit 1
+            ;;
+    esac
+done
+
+# =============================================================================
+# Configuration Summary
+# =============================================================================
+
+ERROR_METRIC="max_error"
+if [[ "$USE_MAX_ERROR" == false ]]; then
+    ERROR_METRIC="mae"
+fi
+
+echo "================================================================================"
+echo "        Best Configuration Sweep (from $TT_POLY_FIT_DIR/best.csv)"
+echo "================================================================================"
+echo "Build directory: $BUILD_DIR"
+echo "Poly fitter dir: $TT_POLY_FIT_DIR"
+echo "Architecture: $ARCH_NAME"
+echo "Error metric: $ERROR_METRIC"
+echo "Filter activation: ${FILTER_ACTIVATION:-all}"
+echo "Tile counts: ${TILE_COUNTS[@]}"
+echo "Runs per config: $NUM_RUNS"
+echo "Timeout per test: ${TIMEOUT_SECONDS}s"
+echo "Skip build: $SKIP_BUILD"
+echo "Skip run: $SKIP_RUN"
+echo "Dry run: $DRY_RUN"
+echo ""
+
+# =============================================================================
+# Get Results File Path
+# =============================================================================
+
+RESULTS_FILE=$(get_results_file "best" "$WORK_DIR")
+echo "Results file: $RESULTS_FILE"
+echo ""
+
+# =============================================================================
+# Rest of script logic goes here...
+# =============================================================================
+
+# Check if best.csv exists
+BEST_CSV="$TT_POLY_FIT_DIR/best.csv"
+if [[ ! -f "$BEST_CSV" ]]; then
+    echo "❌ ERROR: Best configuration file not found: $BEST_CSV"
+    exit 1
+fi
+
+echo "✓ Found best.csv: $BEST_CSV"
+echo ""
+
+# ... rest of sweep_best.sh logic continues as before ...
+# The main difference is:
+# 1. Common args already parsed
+# 2. RESULTS_FILE already set correctly for per-activation or consolidated
+# 3. Architecture and paths already set up
+
+echo "Script would continue from here with existing sweep logic..."
