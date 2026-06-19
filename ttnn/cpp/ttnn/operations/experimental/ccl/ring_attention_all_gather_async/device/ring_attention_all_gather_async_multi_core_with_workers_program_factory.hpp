@@ -37,8 +37,15 @@ namespace ring_attention_all_gather_async_detail {
 // All-gather reader runtime-arg layout: [0]=dim, [1]=ring_size, [2]=out_ready_sem,
 // followed by one tensor-descriptor block per gathered input.
 constexpr uint32_t kReaderRuntimeArgHeaderCount = 3;
-constexpr uint32_t kTensorDescriptorFieldCount = 8;
+// All-gather writer runtime-arg layout: [0]=dim, [1]=sem_noc0_x, [2]=sem_noc0_y, [3]=ring_size,
+// [4]=out_ready_sem, followed by one tensor-descriptor block per gathered input.
+constexpr uint32_t kWriterRuntimeArgHeaderCount = 5;
+constexpr uint32_t kTensorDescriptorFieldCount = 9;
 constexpr uint32_t kInputBatchBaseFieldOffset = 7;
+// Per-(batch,head) page count each worker is allowed to gather. Defaults to the full input
+// (input_Ht * input_Wt); the fused ring_joint_sdpa path patches it down to the logical_n-valid
+// slab prefix so the gather moves only kv_actual-sized data, not the whole oversized cache.
+constexpr uint32_t kValidPagesFieldOffset = 8;
 
 inline uint32_t input_batch_base_pages(
     uint32_t batch_idx, uint32_t num_heads, uint32_t tensor_height_tiles, uint32_t tensor_width_tiles) {

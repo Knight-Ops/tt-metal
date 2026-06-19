@@ -481,6 +481,10 @@ void ring_attention_all_gather_async_multi_core_with_workers_helper(
             tensor_descriptor_args.push_back(input_tile_id_start);  // 5 == input_tile_id_start
             tensor_descriptor_args.push_back(input_tile_id_end);    // 6 == input_tile_id_end
             tensor_descriptor_args.push_back(input_batch_base);     // 7 == input_batch_base (phase-1 input page offset)
+            // 8 == valid pages per (batch,head) to gather. Default: full input slab (no clamp). The fused
+            // ring_joint_sdpa path patches this down to the logical_n-valid prefix (see
+            // apply_ring_joint_scalar_runtime_args) so the gather moves only kv_actual-sized data.
+            tensor_descriptor_args.push_back(single_batch_head_num_pages);  // 8 == valid_pages_per_batch_head
         }
 
         KernelDescriptor::RTArgList reader_forward_rt_args;
