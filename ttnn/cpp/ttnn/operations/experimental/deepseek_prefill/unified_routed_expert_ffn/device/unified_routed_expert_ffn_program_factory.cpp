@@ -350,34 +350,34 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     //
     //   * UP_WRITER_MCAST (mode 1): the writer ALSO multicasts `up` down its
     //     N-column on NoC 1 (its own ready/valid sem pair). Bandwidth-optimal
-    //     (read once, shared). Used on the SHORT-SEQ path only — it runs with
-    //     the fabric DISABLED, so the worker-to-worker NoC-1 multicast is safe.
-    //     On the 2D/production path (fabric ENABLED) this scheme intermittently
-    //     HANGS the full 61-layer / 32-chip e2e: the writer's NoC-1 worker
-    //     multicast + posted atomics collide with the surrounding fabric CCL
-    //     ops (dispatch/combine) that also drive NoC 1 — confirmed (single-op
-    //     and isolated 32-chip op tests pass; only the full e2e with adjacent
-    //     fabric traffic deadlocks).
+    //     (read once, shared), BUT the worker-to-worker NoC-1 multicast +
+    //     posted atomics collide with the surrounding fabric CCL ops that also
+    //     drive NoC 1 and HANG the run (a subsequent reduce_scatter times out).
+    //     This was originally believed to be safe on the short-seq path on the
+    //     assumption that short-seq only runs with the fabric disabled — but
+    //     short-seq triggers whenever the per-expert dispatch buffer is small
+    //     (e.g. a 1k-token prompt: dispatch_group_size*seq_len_per_chip <= 1024
+    //     tokens), which happens in real fabric-ENABLED prefill-block / e2e runs
+    //     (e.g. abc_1k balanced on 8x4). So this scheme is NOT fabric-safe and
+    //     is no longer selected for any path.
     //
     //   * UP_SPLIT (mode 2): the writer reads `up` from DRAM on NoC 1 (no
     //     worker multicast, no NoC-1 atomics — identical in kind to the writer's
     //     existing `cb_out` NoC-1 DRAM writes, which are proven safe under
-    //     fabric) into the gy=0 sender's `cb_in1_up` slot; the READER then
-    //     multicasts that block on NoC 0 alongside `gate` (the long-proven NoC-0
-    //     path). A LOCAL same-core (BRISC<->NCRISC) L1 handshake orders the two
-    //     — no NoC traffic, so any bug reproduces single-chip. This keeps the
-    //     read-overlap win (`up` DRAM read hidden behind `gate`) while adding
-    //     nothing new on NoC 1 beyond a DRAM read. Used on the 2D/long-seq path.
+    //     fabric, and fully drained at kernel exit) into the gy=0 sender's
+    //     `cb_in1_up` slot; the READER then multicasts that block on NoC 0
+    //     alongside `gate` (the long-proven NoC-0 path). A LOCAL same-core
+    //     (BRISC<->NCRISC) L1 handshake orders the two — no NoC traffic, so any
+    //     bug reproduces single-chip. This keeps the read-overlap win (`up` DRAM
+    //     read hidden behind `gate`) while adding nothing new on NoC 1 beyond a
+    //     DRAM read. Used on BOTH the short-seq and 2D/long-seq paths.
     //
     // up_mode: 0 = LEGACY (reader reads + mcasts `up` on NoC 0; writer idle on
-    // up), 1 = UP_WRITER_MCAST, 2 = UP_SPLIT.
-    constexpr bool kEnable2DSplitUp = true;
-    uint32_t up_mode = 0;
-    if (short_seq) {
-        up_mode = 1;
-    } else if (kEnable2DSplitUp) {
-        up_mode = 2;
-    }
+    // up), 1 = UP_WRITER_MCAST (retired — fabric-unsafe), 2 = UP_SPLIT.
+    // UP_SPLIT for all layouts (short_seq still selects the grid above; it just
+    // no longer selects the fabric-unsafe NoC-1 multicast scheme for `up`).
+    constexpr bool kEnableSplitUp = true;
+    uint32_t up_mode = kEnableSplitUp ? 2 : 0;
     const bool writer_mcasts_up = (up_mode == 1);                  // writer reads + NoC-1 mcasts up
     const bool reader_reads_up = (up_mode == 0);                   // reader issues up DRAM read
     const bool reader_mcasts_up = (up_mode == 0 || up_mode == 2);  // reader NoC-0 mcasts up
