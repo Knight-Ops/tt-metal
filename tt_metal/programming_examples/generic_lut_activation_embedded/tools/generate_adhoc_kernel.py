@@ -416,9 +416,118 @@ def get_parity_macros(
     return macros
 
 
-def get_range_reduction_macros(metadata: Dict[str, str]) -> str:
-    """Generate range reduction macros based on CSV metadata."""
+def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
+    """Generate hardware-exponent-ALU range reduction macros (exp2 / log2 / pow).
+
+    Contract (/tmp/exponent_alu_contract.md): the fitter tags
+    range_reduction_method = exponent_alu_<kind> and emits NATURAL-basis poly
+    coefficients on the reduced domain ([0,1) for exp2, [1,2) for log2/pow).
+    The kernel owns the exman/exexp/setexp decompose, the 2^-23/2^-46 scale fold
+    (exp2), and the recombine. We pull the coefficients from the first segment
+    (these backends fit a single low-degree polynomial over the whole reduced
+    domain — no piecewise cascade).
+    """
+    kind = method[len("exponent_alu_") :]
+    metadata = lut_info.get("metadata", {})
+
+    # Coefficients of the (single) reduced-domain polynomial.
+    raw = lut_info.get("raw_coefficients")
+    if not raw:
+        raise ValueError(f"exponent_alu_{kind}: no polynomial coefficients found in CSV")
+    coeffs = raw[0]  # first/only segment carries the reduced-domain fit
+    degree = len(coeffs) - 1
+
+    # ---- GENERIC constant-pool hoisting (data-driven, all kinds, any degree) ----
+    # Collect every loop-invariant constexpr the kernel reads for this kind, ranked
+    # by reuse. Top-3 -> vConstFloatPrgm0/1/2; next HOIST_BUDGET -> pre-loop hoisted
+    # vFloat LREGs; anything beyond -> in-body literals, LOGGED (never dropped).
+    PRGM_SLOTS, HOIST_BUDGET = 3, 5
+    pool = []
+    if kind == "exp2":
+        pool = ["MULT(1/ln2)"] + [f"c{k}" for k in range(degree, -1, -1)] + ["clamp255"]
+    elif kind == "log2":
+        pool = ["LOG_HW_SCALE"] + [f"c{k}" for k in range(degree, -1, -1)]
+    elif kind == "pow":
+        pool = ["SQRT2", "round_magic"] + [f"c{k}" for k in range(degree, -1, -1)]
+    spilled = pool[PRGM_SLOTS + HOIST_BUDGET :]
+    hw_preload_macro = "#define HW_PRELOAD\n"
+    if spilled:
+        print(f"HW_PRELOAD constant-pool: {len(pool)} constants, {len(spilled)} spilled to in-body load: {spilled}")
+        hw_preload_macro += f"// HW_PRELOAD_SPILL: {len(spilled)} constants spilled to in-body load: {spilled}\n"
+    else:
+        print(f"HW_PRELOAD constant-pool: {len(pool)} constants, 0 spilled (all in prgm/hoist budget)")
+
+    if kind == "exp2":
+        # exp2 expects a degree-N fit g(f)=2^f on [0,1). Emit the full natural
+        # coeff array + degree; the kernel normalizes the exman fraction to a
+        # float f in [0,1) and runs a plain degree-N Horner (mirrors pow). The
+        # fitter also tags the log2-domain multiplier (1.0 -> 2^x, log2e -> e^x,
+        # -log2e -> exp(-x)) and an optional compose post-transform.
+        mult = metadata.get("expalu_log2_multiplier", "1.4426950408889634")
+        compose = metadata.get("expalu_compose", "").strip()
+        coeff_str = ", ".join(f"{clamp_float32(v):.10e}f" for v in coeffs)
+        compose_macro = ""
+        if compose == "sigmoid":
+            compose_macro = "#define EXP_HW_COMPOSE_SIGMOID\n"
+        elif compose == "minus_one":
+            compose_macro = "#define EXP_HW_COMPOSE_MINUS_ONE\n"
+        print(f"HW exponent-ALU exp2: degree {degree}, mult {mult}, compose {compose or 'none'}")
+        return (
+            "\n// Hardware-exponent-ALU range reduction: exp2 (exman/exexp/setexp)"
+            "\n// Natural [0,1)-basis coeffs for g(f)=2^f; kernel normalizes f then Horner.\n"
+            "#define RANGE_REDUCTION_EXP_HW\n"
+            f"#define EXP_HW_MULT {clamp_float32(float(mult)):.10e}f\n"
+            f"{compose_macro}"
+            f"{hw_preload_macro}"
+            f"constexpr uint32_t EXP_HW_DEGREE = {degree};\n"
+            f"constexpr float EXP_HW_COEFFS[] = {{{coeff_str}}};\n"
+        )
+
+    if kind == "log2":
+        # log2 expects h(m)=log2(m) on [1,2). Emit a coeff array + degree + scale.
+        scale = metadata.get("expalu_log_scale", metadata.get("log_scale", "1.0"))
+        basis = metadata.get("expalu_log2_basis", "natural")
+        coeff_str = ", ".join(f"{clamp_float32(v):.10e}f" for v in coeffs)
+        basis_macro = "#define LOG_HW_BASIS_M_MINUS_1\n" if basis == "m_minus_1" else ""
+        print(f"HW exponent-ALU log2: degree {degree}, scale {scale}, basis {basis}")
+        return (
+            "\n// Hardware-exponent-ALU range reduction: log2 (exexp -> e, exman -> m)"
+            "\n// Natural-basis coeffs for h(m)=log2(m); result = (e + h(m)) * scale.\n"
+            "#define RANGE_REDUCTION_LOG_HW\n"
+            f"{basis_macro}"
+            f"{hw_preload_macro}"
+            f"constexpr uint32_t LOG_HW_DEGREE = {degree};\n"
+            f"constexpr float LOG_HW_COEFFS[] = {{{coeff_str}}};\n"
+            f"#define LOG_HW_SCALE {scale}f\n"
+        )
+
+    if kind == "pow":
+        # pow expects s(m)=sqrt(m) on [1,2). Emit a coeff array + degree.
+        coeff_str = ", ".join(f"{clamp_float32(v):.10e}f" for v in coeffs)
+        print(f"HW exponent-ALU pow: degree {degree}")
+        return (
+            "\n// Hardware-exponent-ALU range reduction: pow/sqrt (exexp -> e, exman -> m)"
+            "\n// Natural [1,2)-basis coeffs for s(m)=sqrt(m); recombine 2^(e/2)*sqrt(2)^r.\n"
+            "#define RANGE_REDUCTION_POW_HW\n"
+            f"{hw_preload_macro}"
+            f"constexpr uint32_t POW_HW_DEGREE = {degree};\n"
+            f"constexpr float POW_HW_COEFFS[] = {{{coeff_str}}};\n"
+        )
+
+    print(f"WARNING: unknown exponent_alu kind '{kind}', skipping HW range reduction")
+    return ""
+
+
+def get_range_reduction_macros(lut_info: Dict) -> str:
+    """Generate range reduction macros based on CSV metadata.
+
+    Accepts the full lut_info (HW exponent-ALU paths need the fitted
+    coefficients, not just metadata).
+    """
+    metadata = lut_info.get("metadata", {})
     method = metadata.get("range_reduction_method", "")
+    if method.startswith("exponent_alu_"):
+        return get_hw_exponent_alu_macros(method, lut_info)
     if method == "exp":
         return "\n// Exp range reduction: input reduced to [-ln(2)/2, ln(2)/2]\n#define RANGE_REDUCTION_EXP\n"
     elif method == "trig":
@@ -549,7 +658,7 @@ def generate_polynomial_kernel(
     degree_name = POLY_DEGREE_MAP.get(degree, f"degree_{degree}")
 
     # Optional macros
-    range_reduction = get_range_reduction_macros(lut_info.get("metadata", {}))
+    range_reduction = get_range_reduction_macros(lut_info)
     adaptive_degree = get_adaptive_degree_macros(lut_info.get("segment_degrees", []), degree)
     poly_parity = get_poly_parity_macros(lut_info, degree)
     asymptotic = get_asymptotic_macros(lut_info)
@@ -613,7 +722,7 @@ def generate_rational_kernel(
     num_deg = lut_info["num_degree"]
     den_deg = lut_info["den_degree"]
 
-    range_reduction = get_range_reduction_macros(lut_info.get("metadata", {}))
+    range_reduction = get_range_reduction_macros(lut_info)
     parity = get_parity_macros(
         lut_info.get("metadata", {}),
         segments=lut_info.get("raw_segments"),

@@ -9,7 +9,8 @@
 #include "ttnn/operations/normalization/kernel_util/compute/memory.h"
 
 // Include reciprocal function for tan range reduction (tan_expand needs -1/poly)
-#if defined(RANGE_REDUCTION_TAN) && defined(TRISC_MATH)
+// and for the exp2 sigmoid compose (1/(1+exp(-x))).
+#if (defined(RANGE_REDUCTION_TAN) || defined(EXP_HW_COMPOSE_SIGMOID)) && defined(TRISC_MATH)
 #include "ckernel_sfpu_recip.h"
 #endif
 
@@ -45,8 +46,10 @@ namespace kutil = norm::kernel_util;
 
 // Range reduction: Cody-Waite method for exp/trig, mantissa/exponent extraction for log/cbrt
 // Only included when RANGE_REDUCTION_* or ASYMPTOTIC_FACTOR_* is defined
-#if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG) || defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_CBRT) \
-    || defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) || defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
+#if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG) ||                  \
+    defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_CBRT) || defined(RANGE_REDUCTION_EXP_HW) ||               \
+    defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || \
+    defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) || defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
 #include "sfpu/ckernel_sfpu_converter.h"
 #endif
 
@@ -228,6 +231,360 @@ inline vFloat cbrt_expand(vFloat poly_result, vInt q, vInt r, vInt sign_bits) {
 
     return result;
 }
+#endif
+
+// ============================================================================
+// Hardware-exponent-ALU range reduction (exp2 / log2 / pow)
+//
+// Instead of software Cody-Waite (float k-int + 2^k + Newton reciprocal), these
+// paths decompose the input with the SFPU exponent ALU (exexp / exman / setexp /
+// addexp) and evaluate a LOW-DEGREE polynomial on the reduced domain — the same
+// algorithm TTNN's native exp/log/sqrt use. The fitter owns WHAT to approximate
+// and the natural-basis coefficients; the kernel owns the intrinsic decompose +
+// scale fold + recombine (see /tmp/exponent_alu_contract.md).
+//
+// These are standalone evaluators: when one of RANGE_REDUCTION_*_HW is defined
+// the per-tile loop calls the matching exp_hw_eval / log_hw_eval / pow_hw_eval
+// directly and the piecewise segment cascade is bypassed entirely.
+// ============================================================================
+
+#if defined(RANGE_REDUCTION_EXP_HW)
+// exp(x) = 2^(x * log2e). Decompose x*log2e into integer i + fraction f via the
+// hardware exponent ALU; 2^f via the fitter's degree-N poly; recombine setexp.
+//
+// The fitter emits NATURAL [0,1)-basis coeffs (EXP_HW_COEFFS, degree N) for
+// g(f)=2^f. exman() returns the fraction scaled by 2^23, so we NORMALIZE it back
+// to a float f in [0,1) (multiply by 2^-23) and run a plain degree-N Horner over
+// the natural coeffs — exactly like pow_hw_eval normalizes its mantissa. (The old
+// per-coeff 2^-23k fold was hardcoded to degree 2 and underflowed past degree 3.)
+//
+// The fitter tags EXP_HW_MULT = log2-domain multiplier (1.0 for 2^x, log2e for
+// e^x, -log2e for exp(-x)) and an optional compose post-transform (minus_one for
+// expm1, sigmoid for 1/(1+exp(-x))). Honor whatever the codegen emits.
+#ifndef EXP_HW_MULT
+#define EXP_HW_MULT 1.4426950216293334961f  // default 1/ln2 == log2(e)
+#endif
+template <uint32_t DEG>
+inline vFloat exp_hw_eval(vFloat x) {
+    constexpr float MULT = EXP_HW_MULT;
+
+    vFloat xlog2 = x * MULT + 127.0f;
+
+    // Full-range safety clamp: keep xlog2 in [0, 255] so the implicit float->int
+    // conversion below cannot wrap (TTNN does this in its non-unsafe path).
+    vFloat thr_lo = 0.0f;
+    vFloat thr_hi = 255.0f;
+    vec_min_max(thr_lo, xlog2);  // xlog2 = max(0, xlog2)
+    vec_min_max(xlog2, thr_hi);  // xlog2 = min(xlog2, 255)
+
+    // Branch-free float->int: shift mantissa left by (exp - bias) bits.
+    vInt e = exexp(xlog2);
+    vInt m = exman(xlog2, MantissaMode::ImplicitOne);
+    m = shft(m, e, ShiftMode::Logical);
+    vFloat z = as<vFloat>(m);
+
+    vInt ep = exexp(z, ExponentMode::NoDebias);  // 2^(integer part)
+    vMag fm = exman(z);                          // fraction * 2^23
+    // Normalize the exman 2^23-scaled fraction back to a float f in [0,1).
+    vFloat f = convert<vFloat>(fm, RoundMode::Nearest) * 0x1p-23f;
+
+    // Plain degree-N Horner for 2^f over the natural [0,1) coeffs.
+    const float* c = EXP_HW_COEFFS;
+    vFloat p = c[DEG];
+#pragma GCC unroll 16
+    for (int k = (int)DEG - 1; k >= 0; k--) {
+        p = p * f + c[k];
+    }
+
+    vFloat y = setexp(p, ep);  // 2^i * 2^f == base^x
+
+    // Optional compose post-transform (fitter folds the activation around exp2).
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+    // y == exp(-x); sigmoid(x) = 1 / (1 + exp(-x)).
+    y = ckernel::sfpu::sfpu_reciprocal<false>(1.0f + y);
+#elif defined(EXP_HW_COMPOSE_MINUS_ONE)
+    // expm1(x) = exp(x) - 1.
+    y = y - 1.0f;
+#endif
+    return y;
+}
+
+#if defined(HW_PRELOAD)
+// ----------------------------------------------------------------------------
+// GENERIC constant-pool preload variant of exp_hw_eval.
+//
+// Generalizes the proven exp deg-2 prototype: the codegen turns on HW_PRELOAD
+// for EVERY exponent-ALU kind (exp2/log2/pow) at ANY degree (no per-activation
+// hand-wiring). The mechanism is purely about WHERE the loop-invariant
+// constexpr constants live so the recorded replay body re-loads none of them:
+//
+//   - vConstFloatPrgm0/1/2 : the 3 hottest constants, programmed ONCE before the
+//     tile loop (persist across every replayed body + every tile).
+//   - hoisted vFloat cv[]  : the remaining coefficients, declared as pre-loop
+//     locals by the caller (hw_reduce) so GCC keeps them in iteration-invariant
+//     LREGs — no SFPLOADI inside the recorded body.
+//
+// Per-kind ranking (deterministic, owned by the kernel since the kind dictates
+// which constant is touched every element):
+//   exp2 : prgm0 = MULT, prgm1 = c[DEG], prgm2 = c[DEG-1]; cv[] = c[DEG-2..0]
+//          (255.0 clamp also hoisted; 0.0/127.0 are const-lane/SFPMAD imm).
+// Anything past the prgm + LREG budget the compiler simply emits as in-body
+// literals; the codegen logs that count (HW_PRELOAD_SPILL) — never silent.
+//
+// COMPOSE_SIGMOID reserves vConstFloatPrgm0 for sfpu_reciprocal (it expects 2.0
+// there, set by sfpu_reciprocal_init). In that case MULT is demoted from prgm0
+// to a hoisted LREG param (mult_hoist) so the two uses of prgm0 never collide.
+//
+// The remaining coefficients (c[DEG-2..0]) are read from the constexpr global
+// EXP_HW_COEFFS: the compiler hoists what fits in the LREG budget and emits the
+// rest as in-body literals (the natural "spill" the codegen reports) — this
+// avoids forcing a fixed-size vFloat array that would overflow the register file
+// under heavy paths like sigmoid (reciprocal + clamp + mult all live at once).
+//
+// Math is byte-identical to exp_hw_eval (same SFPMAD Horner, same order).
+template <uint32_t DEG>
+inline vFloat exp_hw_eval_preloaded(
+    vFloat x,
+    vFloat thr_hi_hoist
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+    ,
+    vFloat mult_hoist
+#endif
+) {
+    // MULT lives in prgm0 normally; under sigmoid compose prgm0 is owned by the
+    // reciprocal, so MULT is read from the hoisted LREG instead.
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+    vFloat xlog2 = x * mult_hoist + 127.0f;
+#else
+    vFloat xlog2 = x * vConstFloatPrgm0 + 127.0f;
+#endif
+
+    // Full-range safety clamp [0, 255]. 0.0 uses the const-0 lane (no SFPLOADI);
+    // 255.0 comes from the hoisted, loop-invariant register thr_hi_hoist.
+    vFloat thr_lo = 0.0f;
+    vec_min_max(thr_lo, xlog2);        // xlog2 = max(0, xlog2)
+    vec_min_max(xlog2, thr_hi_hoist);  // xlog2 = min(xlog2, 255)
+
+    // Branch-free float->int: shift mantissa left by (exp - bias) bits.
+    vInt e = exexp(xlog2);
+    vInt m = exman(xlog2, MantissaMode::ImplicitOne);
+    m = shft(m, e, ShiftMode::Logical);
+    vFloat z = as<vFloat>(m);
+
+    vInt ep = exexp(z, ExponentMode::NoDebias);  // 2^(integer part)
+    vMag fm = exman(z);                          // fraction * 2^23
+    vFloat f = convert<vFloat>(fm, RoundMode::Nearest) * 0x1p-23f;
+
+    // Degree-N Horner. Top-2 coeffs come from prgm regs; the rest from the global.
+    // p = (((c[DEG])*f + c[DEG-1])*f + c[DEG-2])*f + ... + c[0]
+    const float* c = EXP_HW_COEFFS;
+    vFloat p;
+    if constexpr (DEG >= 1) {
+        p = vConstFloatPrgm1 * f + vConstFloatPrgm2;  // c[DEG]*f + c[DEG-1]
+#pragma GCC unroll 16
+        for (int k = (int)DEG - 2; k >= 0; k--) {
+            p = p * f + c[k];
+        }
+    } else {
+        p = vConstFloatPrgm1;  // degree-0: c[0]
+    }
+
+    vFloat y = setexp(p, ep);  // 2^i * 2^f == base^x
+
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+    y = ckernel::sfpu::sfpu_reciprocal<false>(1.0f + y);
+#elif defined(EXP_HW_COMPOSE_MINUS_ONE)
+    y = y - 1.0f;
+#endif
+    return y;
+}
+#endif  // HW_PRELOAD
+#endif
+
+#if defined(RANGE_REDUCTION_LOG_HW)
+// log2(x) = e + log2(m) for x = 2^e * m, m in [1,2). The fitter fits h(m)=log2(m)
+// on [1,2) and emits NATURAL [1,2]-basis coeffs (LOG_HW_C0..); the kernel
+// extracts e (integer log2, free via exexp) and m (exman/setexp), evaluates the
+// poly, adds e, and applies an optional base scale (ln2 for log, log10(2) for
+// log10) via LOG_HW_SCALE.
+#ifndef LOG_HW_SCALE
+#define LOG_HW_SCALE 1.0f
+#endif
+template <uint32_t DEG>
+inline vFloat log_hw_eval(vFloat x) {
+    // Extract biased exponent e and mantissa m in [1,2).
+    vInt biased = exexp(x, ExponentMode::NoDebias);
+    vInt e_int = biased - 127;
+    vFloat m = setexp(x, 127);
+
+    // Horner h(m)=log2(m). The fitter tags the polynomial basis: the natural
+    // [1,2] basis evaluates in m, the m_minus_1 basis (the codegen default for
+    // log2) evaluates in (m-1) so c0==0 and h(1)==0 exactly.
+#ifdef LOG_HW_BASIS_M_MINUS_1
+    vFloat u = m - 1.0f;
+#else
+    vFloat u = m;
+#endif
+    const float* c = LOG_HW_COEFFS;
+    vFloat h = c[DEG];
+#pragma GCC unroll 16
+    for (int k = (int)DEG - 1; k >= 0; k--) {
+        h = h * u + c[k];
+    }
+
+    // e + h(m); int32_to_float wants sign-magnitude for negatives.
+    v_if(e_int < 0) { e_int = setsgn(~e_int + 1, 1); }
+    v_endif;
+    vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
+    vFloat result = (e_float + h) * LOG_HW_SCALE;
+
+    // Special cases: log(0) = -inf, log(neg) = NaN.
+    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(x == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
+    v_endif;
+    return result;
+}
+
+#if defined(HW_PRELOAD)
+// GENERIC constant-pool preload variant of log_hw_eval (any degree).
+// Ranking: prgm0 = LOG_HW_SCALE, prgm1 = c[DEG], prgm2 = c[DEG-1]; cv[] = c[DEG-2..0].
+// 127 / 1.0 are SFPMAD imm / const-lane. Math byte-identical to log_hw_eval.
+template <uint32_t DEG>
+inline vFloat log_hw_eval_preloaded(vFloat x) {
+    vInt biased = exexp(x, ExponentMode::NoDebias);
+    vInt e_int = biased - 127;
+    vFloat m = setexp(x, 127);
+
+#ifdef LOG_HW_BASIS_M_MINUS_1
+    vFloat u = m - 1.0f;
+#else
+    vFloat u = m;
+#endif
+    const float* c = LOG_HW_COEFFS;
+    vFloat h;
+    if constexpr (DEG >= 1) {
+        h = vConstFloatPrgm1 * u + vConstFloatPrgm2;  // c[DEG]*u + c[DEG-1]
+#pragma GCC unroll 16
+        for (int k = (int)DEG - 2; k >= 0; k--) {
+            h = h * u + c[k];
+        }
+    } else {
+        h = vConstFloatPrgm1;  // degree-0: c[0]
+    }
+
+    v_if(e_int < 0) { e_int = setsgn(~e_int + 1, 1); }
+    v_endif;
+    vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
+    vFloat result = (e_float + h) * vConstFloatPrgm0;  // * LOG_HW_SCALE
+
+    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(x == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
+    v_endif;
+    return result;
+}
+#endif  // HW_PRELOAD
+#endif
+
+#if defined(RANGE_REDUCTION_POW_HW)
+// pow path for sqrt/rsqrt/cbrt: x = 2^e * m. sqrt(x) = 2^(e/2) * sqrt(m).
+// The fitter fits s(m)=sqrt(m) on [1,2) (NATURAL [1,2]-basis coeffs POW_HW_COEFFS);
+// the kernel splits e into even part (halved into the exponent) and parity bit r
+// (folds sqrt(2) when e is odd), evaluates the poly, recombines via setexp.
+#ifndef POW_HW_SQRT2
+#define POW_HW_SQRT2 1.4142135623730951f
+#endif
+template <uint32_t DEG>
+inline vFloat pow_hw_eval(vFloat x) {
+    // Extract biased exponent e and mantissa m in [1,2).
+    vInt biased = exexp(x, ExponentMode::NoDebias);
+    vInt e_int = biased - 127;
+    vFloat m = setexp(x, 127);
+
+    // Horner s(m)=sqrt(m) in the natural [1,2] basis.
+    const float* c = POW_HW_COEFFS;
+    vFloat s = c[DEG];
+#pragma GCC unroll 16
+    for (int k = (int)DEG - 1; k >= 0; k--) {
+        s = s * m + c[k];
+    }
+
+    // e = 2*q + r, r in {0,1}.  sqrt(x) = 2^q * sqrt(2)^r * sqrt(m).
+    // Floor-divide by 2 for both signs: q = (e - (e & 1)) / 2 only valid for
+    // e>=0; use arithmetic that matches floor(e/2).  Here r = e & 1 (two's
+    // complement low bit is the parity for both signs).
+    vInt r = e_int & 1;
+    // q = (e_int - r) >> 1  via float round (e is small, exact in float).
+    vFloat ef = int32_to_float(e_int, RoundMode::Nearest);
+    v_if(e_int < 0) {
+        vInt mag = ~e_int + 1;
+        ef = -int32_to_float(mag, RoundMode::Nearest);
+    }
+    v_endif;
+    const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
+    vFloat qf = (ef - int32_to_float(r, RoundMode::Nearest)) * 0.5f;
+    vInt q = reinterpret<vInt>(qf + magic) - reinterpret<vInt>(magic);
+
+    // Apply sqrt(2) when e is odd.
+    v_if(r == 1) { s = s * POW_HW_SQRT2; }
+    v_endif;
+
+    // Multiply by 2^q via exponent addition.
+    vInt s_exp = exexp(s, ExponentMode::NoDebias);
+    vFloat result = setexp(s, s_exp + q);
+
+    // Special cases: sqrt(0)=0, sqrt(neg)=NaN.
+    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(x == 0.0f) { result = 0.0f; }
+    v_endif;
+    return result;
+}
+
+#if defined(HW_PRELOAD)
+// GENERIC constant-pool preload variant of pow_hw_eval (any degree).
+// Ranking: prgm0 = SQRT2, prgm1 = c[DEG], prgm2 = c[DEG-1]; cv[] = c[DEG-2..0].
+// 'magic' (round helper) is hoisted into an LREG by the caller and passed by value.
+// Math byte-identical to pow_hw_eval.
+template <uint32_t DEG>
+inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist) {
+    vInt biased = exexp(x, ExponentMode::NoDebias);
+    vInt e_int = biased - 127;
+    vFloat m = setexp(x, 127);
+
+    const float* c = POW_HW_COEFFS;
+    vFloat s;
+    if constexpr (DEG >= 1) {
+        s = vConstFloatPrgm1 * m + vConstFloatPrgm2;  // c[DEG]*m + c[DEG-1]
+#pragma GCC unroll 16
+        for (int k = (int)DEG - 2; k >= 0; k--) {
+            s = s * m + c[k];
+        }
+    } else {
+        s = vConstFloatPrgm1;  // degree-0: c[0]
+    }
+
+    vInt r = e_int & 1;
+    vFloat ef = int32_to_float(e_int, RoundMode::Nearest);
+    v_if(e_int < 0) {
+        vInt mag = ~e_int + 1;
+        ef = -int32_to_float(mag, RoundMode::Nearest);
+    }
+    v_endif;
+    vFloat qf = (ef - int32_to_float(r, RoundMode::Nearest)) * 0.5f;
+    vInt q = reinterpret<vInt>(qf + magic_hoist) - reinterpret<vInt>(magic_hoist);
+
+    // Apply sqrt(2) when e is odd (preloaded in vConstFloatPrgm0).
+    v_if(r == 1) { s = s * vConstFloatPrgm0; }
+    v_endif;
+
+    vInt s_exp = exexp(s, ExponentMode::NoDebias);
+    vFloat result = setexp(s, s_exp + q);
+
+    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(x == 0.0f) { result = 0.0f; }
+    v_endif;
+    return result;
+}
+#endif  // HW_PRELOAD
 #endif
 
 // ============================================================================
@@ -1103,7 +1460,34 @@ void kernel_main() {
 
     init_sfpu(cb_in, cb_out);
 
+#if defined(HW_PRELOAD) && defined(TRISC_MATH)
+    // GENERIC constant-pool preload: program the 3 hottest loop-invariant
+    // constants for this exponent-ALU kind into the programmable const registers
+    // ONCE (they persist across every replayed body and every tile). The
+    // per-kind ranking matches the *_hw_eval_preloaded readers above.
+#if defined(RANGE_REDUCTION_EXP_HW)
+#if !defined(EXP_HW_COMPOSE_SIGMOID)
+    // Under sigmoid compose, prgm0 is reserved for sfpu_reciprocal (set to 2.0 by
+    // sfpu_reciprocal_init); MULT is hoisted into an LREG instead (see hw_reduce).
+    sfpi::vConstFloatPrgm0 = EXP_HW_MULT;  // touched every element
+#endif
+    sfpi::vConstFloatPrgm1 = EXP_HW_COEFFS[EXP_HW_DEGREE];
+    sfpi::vConstFloatPrgm2 = (EXP_HW_DEGREE >= 1) ? EXP_HW_COEFFS[EXP_HW_DEGREE - 1] : 0.0f;
+#elif defined(RANGE_REDUCTION_LOG_HW)
+    sfpi::vConstFloatPrgm0 = LOG_HW_SCALE;
+    sfpi::vConstFloatPrgm1 = LOG_HW_COEFFS[LOG_HW_DEGREE];
+    sfpi::vConstFloatPrgm2 = (LOG_HW_DEGREE >= 1) ? LOG_HW_COEFFS[LOG_HW_DEGREE - 1] : 0.0f;
+#elif defined(RANGE_REDUCTION_POW_HW)
+    sfpi::vConstFloatPrgm0 = POW_HW_SQRT2;
+    sfpi::vConstFloatPrgm1 = POW_HW_COEFFS[POW_HW_DEGREE];
+    sfpi::vConstFloatPrgm2 = (POW_HW_DEGREE >= 1) ? POW_HW_COEFFS[POW_HW_DEGREE - 1] : 0.0f;
+#endif
+#endif
+
 #if defined(RANGE_REDUCTION_TAN) && defined(TRISC_MATH)
+    ckernel::sfpu::sfpu_reciprocal_init<false>();
+#endif
+#if defined(EXP_HW_COMPOSE_SIGMOID) && defined(TRISC_MATH)
     ckernel::sfpu::sfpu_reciprocal_init<false>();
 #endif
 

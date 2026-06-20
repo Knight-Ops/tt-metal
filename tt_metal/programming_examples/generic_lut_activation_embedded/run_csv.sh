@@ -333,7 +333,102 @@ elif not is_rational and degree >= 2:
 # Check for range reduction
 rr_macro = ''
 rr_method = metadata.get('range_reduction_method', '')
-if rr_method == 'exp':
+if rr_method.startswith('exponent_alu_'):
+    # Hardware-exponent-ALU backend (exp2 / log2 / pow). The fitted poly lives
+    # in the first segment's coefficients (natural reduced-domain basis); the
+    # kernel owns the exman/exexp/setexp decompose + scale fold + recombine.
+    # Disable adaptive-degree / parity (cascade is bypassed) to keep defines clean.
+    degree_macros = ''
+    poly_parity_macro = ''
+    kind = rr_method[len('exponent_alu_'):]
+    cps = degree + 1
+    seg0 = coefficients[0:cps]
+
+    # ---- GENERIC constant-pool hoisting (data-driven, all kinds, any degree) ----
+    # Collect every loop-invariant constexpr the kernel reads for this kind, ranked
+    # by reuse (touched-every-element first). Top-3 -> vConstFloatPrgm0/1/2; the next
+    # HOIST_BUDGET -> pre-loop hoisted vFloat LREGs; anything beyond -> in-body
+    # literals, and we LOG the count (never silently dropped).
+    PRGM_SLOTS = 3
+    HOIST_BUDGET = 5  # iteration-invariant LREGs the compiler can keep across the loop
+    def _build_pool(kind, degree):
+        pool = []  # (name, reuse_rank) high rank = hotter
+        if kind == 'exp2':
+            pool.append(('MULT(1/ln2)', 100))
+            for k in range(degree, -1, -1):
+                pool.append((f'c{k}', 50 + k))     # higher coeffs slightly hotter (Horner head)
+            pool.append(('clamp255', 40))
+        elif kind == 'log2':
+            pool.append(('LOG_HW_SCALE', 100))
+            for k in range(degree, -1, -1):
+                pool.append((f'c{k}', 50 + k))
+        elif kind == 'pow':
+            pool.append(('SQRT2', 90))
+            pool.append(('round_magic', 60))
+            for k in range(degree, -1, -1):
+                pool.append((f'c{k}', 50 + k))
+        pool.sort(key=lambda t: -t[1])
+        return [n for n, _ in pool]
+    _pool = _build_pool(kind, degree)
+    _budget = PRGM_SLOTS + HOIST_BUDGET
+    _spilled = _pool[_budget:]
+    # HW_PRELOAD_DISABLE=1 lets A/B measure the non-preload baseline on identical HW.
+    hw_preload_macro = '' if os.environ.get('HW_PRELOAD_DISABLE') == '1' else '#define HW_PRELOAD\n'
+    if _spilled:
+        print(f'// HW_PRELOAD constant-pool: {len(_pool)} constants, {len(_spilled)} spilled to in-body load: {_spilled}')
+        hw_preload_macro += f'// HW_PRELOAD_SPILL: {len(_spilled)} constants spilled to in-body load: {_spilled}\n'
+    else:
+        print(f'// HW_PRELOAD constant-pool: {len(_pool)} constants, 0 spilled (all in prgm/hoist budget)')
+
+    if kind == 'exp2':
+        # Full degree-N natural [0,1) coeffs; kernel normalizes f then Horner.
+        # Honor the log2-domain multiplier + optional compose post-transform.
+        mult = metadata.get('expalu_log2_multiplier', '1.4426950408889634')
+        compose = metadata.get('expalu_compose', '').strip()
+        coeff_str = ', '.join(f'{clamp(v):.10e}f' for v in seg0)
+        compose_macro = ''
+        if compose == 'sigmoid':
+            compose_macro = '#define EXP_HW_COMPOSE_SIGMOID\n'
+        elif compose == 'minus_one':
+            compose_macro = '#define EXP_HW_COMPOSE_MINUS_ONE\n'
+        rr_macro = (
+            '\n// Hardware-exponent-ALU exp2 (exman/exexp/setexp), natural [0,1) coeffs\n'
+            '#define RANGE_REDUCTION_EXP_HW\n'
+            f'#define EXP_HW_MULT {clamp(float(mult)):.10e}f\n'
+            f'{compose_macro}'
+            f'{hw_preload_macro}'
+            f'constexpr uint32_t EXP_HW_DEGREE = {degree};\n'
+            f'constexpr float EXP_HW_COEFFS[] = {{{coeff_str}}};\n'
+        )
+        print(f'Range reduction: HW exponent-ALU exp2 (degree {degree}, mult {mult}, compose {compose or \"none\"})')
+    elif kind == 'log2':
+        scale = metadata.get('expalu_log_scale', metadata.get('log_scale', '1.0'))
+        basis = metadata.get('expalu_log2_basis', 'natural')
+        coeff_str = ', '.join(f'{clamp(v):.10e}f' for v in seg0)
+        basis_macro = '#define LOG_HW_BASIS_M_MINUS_1\n' if basis == 'm_minus_1' else ''
+        rr_macro = (
+            '\n// Hardware-exponent-ALU log2 (exexp -> e, exman -> m), natural coeffs\n'
+            '#define RANGE_REDUCTION_LOG_HW\n'
+            f'{basis_macro}'
+            f'{hw_preload_macro}'
+            f'constexpr uint32_t LOG_HW_DEGREE = {degree};\n'
+            f'constexpr float LOG_HW_COEFFS[] = {{{coeff_str}}};\n'
+            f'#define LOG_HW_SCALE {scale}f\n'
+        )
+        print(f'Range reduction: HW exponent-ALU log2 (degree {degree}, scale {scale}, basis {basis})')
+    elif kind == 'pow':
+        coeff_str = ', '.join(f'{clamp(v):.10e}f' for v in seg0)
+        rr_macro = (
+            '\n// Hardware-exponent-ALU pow/sqrt (exexp -> e, exman -> m), natural [1,2) coeffs\n'
+            '#define RANGE_REDUCTION_POW_HW\n'
+            f'{hw_preload_macro}'
+            f'constexpr uint32_t POW_HW_DEGREE = {degree};\n'
+            f'constexpr float POW_HW_COEFFS[] = {{{coeff_str}}};\n'
+        )
+        print(f'Range reduction: HW exponent-ALU pow (degree {degree})')
+    else:
+        print(f'WARNING: unknown exponent_alu kind {kind}')
+elif rr_method == 'exp':
     rr_macro = '\n#define RANGE_REDUCTION_EXP\n'
     print(f'Range reduction: exp')
 elif rr_method == 'trig':

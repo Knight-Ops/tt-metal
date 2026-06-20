@@ -28,6 +28,92 @@
 #pragma once
 
 // ============================================================================
+// Hardware-exponent-ALU standalone evaluators (exp2 / log2 / pow)
+//
+// These bypass the piecewise segment cascade entirely: the decompose + Horner +
+// recombine in exp_hw_eval / log_hw_eval / pow_hw_eval (defined in
+// piecewise_generic.cpp) IS the full approximation. We loop over all 32 dst
+// registers, preloading nothing per-iteration that GCC can already hoist (the
+// folded constants are constexpr and become SFPMAD immediates).
+// ============================================================================
+
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
+inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /*lut*/) {
+#if defined(HW_PRELOAD)
+    // GENERIC constant-pool preload path (exp2 / log2 / pow, any degree). The 3
+    // hottest constants live in vConstFloatPrgm0/1/2 (programmed ONCE in
+    // kernel_main). A few more loop-invariant scalars (clamp 255.0, the round
+    // magic, the sigmoid MULT) are hoisted into pre-loop LREGs here; the remaining
+    // coefficients are read from their constexpr global inside *_hw_eval_preloaded
+    // (compiler hoists what fits, literals the rest — the codegen-logged spill).
+#if defined(RANGE_REDUCTION_EXP_HW)
+    vFloat thr_hoist = 255.0f;
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+    vFloat mult_hoist = EXP_HW_MULT;  // prgm0 reserved for sfpu_reciprocal
+#endif
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = exp_hw_eval_preloaded<EXP_HW_DEGREE>(
+            x,
+            thr_hoist
+#if defined(EXP_HW_COMPOSE_SIGMOID)
+            ,
+            mult_hoist
+#endif
+        );
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+    return;
+#elif defined(RANGE_REDUCTION_LOG_HW)
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = log_hw_eval_preloaded<LOG_HW_DEGREE>(x);
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+    return;
+#elif defined(RANGE_REDUCTION_POW_HW)
+    vFloat magic_hoist = ckernel::sfpu::Converter::as_float(0x4B400000U);
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = pow_hw_eval_preloaded<POW_HW_DEGREE>(x, magic_hoist);
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+    return;
+#endif
+#endif  // HW_PRELOAD
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+#if defined(RANGE_REDUCTION_EXP_HW)
+        vFloat y = exp_hw_eval<EXP_HW_DEGREE>(x);
+#elif defined(RANGE_REDUCTION_LOG_HW)
+        vFloat y = log_hw_eval<LOG_HW_DEGREE>(x);
+#else
+        vFloat y = pow_hw_eval<POW_HW_DEGREE>(x);
+#endif
+        // bf16 dst: round-to-nearest before SFPSTORE truncates (matches TTNN).
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+}
+#endif
+
+// ============================================================================
 // Single-eval recursive unroller
 // ============================================================================
 
@@ -757,6 +843,12 @@ constexpr bool blend_predicted_faster() {
 
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lut) {
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+    // Hardware-exponent-ALU range reduction is a standalone evaluator — it owns
+    // the entire approximation and ignores the piecewise segment cascade.
+    piecewise_generic_lut_hw_reduce<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
+    return;
+#endif
 #if BLEND_GATE_ELIGIBLE
     if constexpr (
         NUM_SEGMENTS > 1 && POLY_DEGREE <= BLEND_DEGREE_LIMIT && blend_predicted_faster<POLY_DEGREE, NUM_SEGMENTS>()) {
