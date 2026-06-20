@@ -82,7 +82,8 @@ for (int d = 0; d < 32; d++) {            // 32 DST rows
 | **P1** unrolled | compile-time template/`constexpr` unroll | 22.4 | 3.79× | **3.79×** | 128 |
 | **P2** dual-eval | 2 DST rows/iter, shared coeff loads (ILP) | 16.9 | 1.33× | 5.03× | 128 |
 | **P3** parity | x²-Horner over odd coeffs (½ the FMAs) | 16.2 | 1.04× | 5.25× | 64 |
-| **P4** adaptive | per-segment effective degree | 15.8 | 1.03× | **5.40×** | 56 |
+| **P4** adaptive | per-segment effective degree | 15.8 | 1.03× | 5.40× | 56 |
+| **P5** coefficient-blend | cascade *selects* coeffs; one Horner after | 12.4 | 1.27× | **6.83×** | — |
 
 ### P1 — compile-time unroll (the dominant win: 3.8×)
 Replacing the runtime loops with template recursion (`if constexpr`, `__attribute__((always_inline))`)
@@ -119,6 +120,25 @@ FMAs buys little. **A real lesson in not optimizing the wrong thing.**
 Several segments need fewer terms. Using a per-segment compile-time degree
 (`BENCH_SEGMENT_DEGREES[S]`) skips FMAs on the reducible segments (effective FMA 64 → 56).
 Small here because only some segments shrink — but free, and larger when the fit varies more.
+
+### P5 — coefficient-blend cascade (1.27×, attacks the *dominant* term)
+P1-P4 all left the elephant untouched: the predicated cascade still **runs a full Horner in
+every one of the 16 `v_if`s** (`O(segments × degree)`). P5 breaks that. Each `v_if` now only
+*overwrites* the coefficient registers — cheap predicated moves — and a **single** Horner runs
+*after* the cascade on the blended (winning) coefficients:
+```cpp
+v_if (x >= lut[S]) { c1 = lut[base+1]; c3 = lut[base+3]; c5 = lut[base+5]; c7 = lut[base+7]; }
+v_endif;                                  // 16× cheap MOVES, not 16× Horner
+...
+vFloat acc = c7; acc = acc*t + c5; acc = acc*t + c3; acc = acc*t + c1;  // ONE Horner
+dst_reg[d] = x * acc;
+```
+Work goes from `16 × (Horner)` to `16 × (few moves) + 1 × (Horner)` — it collapses the
+`segments` multiplier that parity and adaptive only nibbled at. **15.8 → 12.4µs (1.27×), and
+6.83× cumulative over naive.** It stays single-eval: blending keeps `degree+1` coefficient
+registers live, so adding dual-eval here re-triggers the register-file ICE. This rung came from
+a *systematic search* (see §6.5) after the hand-built ladder plateaued — a reminder that the
+biggest win was the cost term we'd stopped looking at.
 
 ---
 
@@ -158,12 +178,15 @@ dst_reg[d] = selP * sfpu_reciprocal_iter<3>(selQ);   // ONE reciprocal
 
 | | naive | tuned | speedup |
 |---|---:|---:|---:|
-| **Polynomial** (16-seg, deg-8) | 85.1µs | 15.8µs | **5.4×** |
+| **Polynomial** (16-seg, deg-8) | 85.1µs | **12.4µs** | **6.8×** |
 | **Rational** (4-seg, n8d8) | 45.2µs | 8.8µs | **5.2×** |
 
-Two ~5× wins from the same playbook: **unroll first** (it dwarfs everything), then **fill the
-pipeline** (dual / interleaved), then **cut work** (parity, adaptive, deferred reciprocal) —
-while watching register pressure.
+The playbook: **unroll first** (it dwarfs everything), then **fill the pipeline** (dual /
+interleaved), then **cut work** (parity, adaptive, deferred reciprocal), then **attack the
+segment-cascade structure itself** (coefficient-blend, P5) — all while watching register
+pressure. The single biggest lesson: the dominant cost was the *number of segment bodies the
+predicated cascade evaluates*, not the arithmetic inside them — and we only attacked it (P5)
+after a systematic search.
 
 ---
 
@@ -182,6 +205,45 @@ moved the clock (not FMA-bound); unroll changed nothing arithmetically but gave 
 overhead-bound). You cannot tell which is which without the device timer.
 
 ---
+
+## 6.5 Beyond the ladder — a discovery search
+
+Once the hand-built ladder plateaued (P4 = 15.8µs; parity/adaptive each ~1.03×), a systematic
+multi-lens search (segment selection, polynomial-eval algorithm, SFPU ISA, reciprocal, memory/
+dispatch, numerical/precision) — every claim checked against in-tree ISA/LLK source — asked:
+*what cost term are we still not attacking?* The answer was the one the whole ladder left
+intact: the **number of segment bodies the predicated cascade evaluates**. That produced **P5
+(coefficient-blend)** above. The search's honest conclusions:
+
+- **What's dead:** every FMA-shaving idea (Estrin's scheme, immediate-coefficient Horner,
+  bf16 compute) and every reciprocal micro-optimization. The ladder already proved that lever
+  is exhausted (parity halved FMAs for 1.04×). The kernel is not arithmetic-bound.
+- **What worked:** P5 — attack the cascade *structure*, not the arithmetic.
+- **What hit the wall:** the same blend on the **rational** kernel ICEs — blending an odd
+  numerator and even denominator needs ~9 live coefficient registers at n8d8, overflowing the
+  register file (the recurring limit). Rational stays at R4.
+- **Multi-tile DST batching — tested, negative result.** The search predicted 1.3–1.8× from
+  amortizing the per-tile `acquire`/`copy`/`pack`/CB handshake (batch B tiles per acquire, DST
+  holds 8). Measured: **12.34µs vs 12.45µs — ~1%, inside noise.** At a 256-tile shape this
+  kernel is **not dispatch-bound**; the handshake is already hidden behind the eval. A textbook
+  case of a plausible optimization that the device says doesn't matter here — *measure, don't
+  assume.* (It also required deepening the shared example's circular buffers, so it was reverted.)
+- **SFPLUTFP32 — tested, inapplicable here.** The `lut2` instruction (segment-select + `A·x+B`
+  in one 2-cycle op, segment-count independent) has a 3–6× *ceiling*, but it's a **6-band,
+  degree-1, fp16** approximation on **hardware-fixed |x| magnitude bands**. On our degree-8
+  function that's err ~2000 vs the 1e-2 gate — no contest. It's a genuine fast path for
+  **LUT-moldable activations** (sigmoid/tanh-shaped, low residual degree — which is exactly how
+  production `sigmoid`/`tanh` use it), but **not** a general replacement for arbitrary
+  high-degree piecewise-polynomial eval. Right tool, wrong function.
+
+Net of the search: **one real win (P5, coefficient-blend, 1.27×)** and two honest negatives
+(rational-blend → register ICE; batching → not dispatch-bound; SFPLUT → wrong function shape).
+The FMA-shaving lever stays dead. That's the value of a disciplined search — it found the one
+lever that mattered *and* killed three plausible-but-wrong ideas before they cost real effort.
+
+The meta-lesson repeats: **measure to find the binding constraint, then attack *that*** — the
+ladder spent three rungs (parity, adaptive) on a term that wasn't binding before a search found
+the one that was.
 
 ## 7. Relationship to the production kernel
 
