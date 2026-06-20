@@ -74,17 +74,59 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // covers exactly per_core_N_gu cols per step; activated cols past
     // actual_hidden are 0 (gate/up weight OOB zero-fill propagates through
     // silu and multiply).
-    constexpr uint32_t GRID_X = 11;
-    constexpr uint32_t GRID_Y = 8;
+    constexpr uint32_t kMaxGridX = 11;
+    constexpr uint32_t MAX_GRID_Y = 8;
+    // Short-sequence regime. For a small allocated M (the per-expert token
+    // buffer is sized to the actual sequence length in the single-expert path),
+    // the 2D layout's FFN device time is a flat ~625 µs from 32 to 1024 tokens
+    // — independent of how few token rows are real. Profiling shows FPU util is
+    // 0 % the whole op (stall-bound, not compute-bound). Two costs dominate and
+    // both shrink with the right grid, all pure host config:
+    //
+    //   * Gate/up weight DRAM read — the gy=0 senders (GRID_X of them) stream
+    //     their N-column weight slice. This parallelises across N-columns, so
+    //     MORE columns read fewer tiles per core. GRID_X = 8 is the measured
+    //     sweet spot: enough read parallelism without paying the down phase's
+    //     extra per-column all-to-all broadcasts that GRID_X = 11 incurs
+    //     (32 tok: gx8 = 236 µs vs gx11 = 566 µs).
+    //   * per_core_M — the gate/up matmul, x read and down-activated broadcast
+    //     all scale with per_core_M (64 tok @ per_core_M=2 = 268 µs vs 256 tok
+    //     @ per_core_M=8 = 651 µs, same per-core N). So we MAXIMISE GRID_Y to
+    //     drive per_core_M down to 1-2 — spreading M across worker rows costs
+    //     only a cheap weight multicast (gy=0 -> the other rows) on top of the
+    //     same read, far less than the per_core_M penalty it removes.
+    //
+    // So: GRID_X = 8 (read parallelism), GRID_Y = min(8, M_tiles_full) (minimise
+    // per_core_M), single chunk (weights streamed once). At GRID_Y == 1 (M <= 1
+    // tile) the weight multicast disappears entirely.
+    //
+    // Branches purely on the ALLOCATED M (x.padded_shape) — the runtime
+    // per-expert token count is still read device-side and bounds the chunk
+    // loop exactly as before. Production (large max_tokens dispatch buffer)
+    // keeps M_tiles_full large, so it stays on the unchanged 2D path.
+    constexpr uint32_t kShortSeqMaxMTiles = 32;  // <= 1024 tokens
+    uint32_t GRID_X = kMaxGridX;
+    uint32_t GRID_Y = MAX_GRID_Y;
+    uint32_t chunk_M_tiles = op.chunk_M_tiles;
+    uint32_t in0_block_w_gu = 16;
+    const bool short_seq = M_tiles_full <= kShortSeqMaxMTiles;
+    if (short_seq) {
+        // Maximise rows to minimise per_core_M (1 for M <= 8, 2 for M <= 16, ...).
+        GRID_Y = std::min(MAX_GRID_Y, M_tiles_full);
+        if (GRID_Y < 1) {
+            GRID_Y = 1;
+        }
+        const uint32_t per_core_M_short = (M_tiles_full + GRID_Y - 1) / GRID_Y;
+        chunk_M_tiles = per_core_M_short * GRID_Y;  // single chunk (>= M_tiles_full)
+    }
     const auto grid_size = t.x.device()->compute_with_storage_grid_size();
     TT_FATAL(
-        grid_size.x >= GRID_X && grid_size.y >= GRID_Y,
+        grid_size.x >= kMaxGridX && grid_size.y >= MAX_GRID_Y,
         "unified_routed_expert_ffn: expected at least {}x{} compute grid, got {}x{}",
-        GRID_X,
-        GRID_Y,
+        kMaxGridX,
+        MAX_GRID_Y,
         grid_size.x,
         grid_size.y);
-    const uint32_t chunk_M_tiles = op.chunk_M_tiles;
     const uint32_t per_core_M = chunk_M_tiles / GRID_Y;
     TT_FATAL(
         per_core_M * GRID_Y == chunk_M_tiles,
@@ -98,15 +140,86 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // pad/slice round-trip in the composite for non-aligned M.
     const uint32_t num_chunks = (M_tiles_full + chunk_M_tiles - 1) / chunk_M_tiles;
 
+    // Per-core L1 footprint estimator for a candidate (gx, per_core_M,
+    // in0_block_w_gu). Mirrors the CreateCircularBuffer sizes below (the
+    // double-buffered input CBs, the per-core-block intermediates/partials,
+    // and the scratch). Used only to bound the short-sequence GRID_X search to
+    // configs no larger than the known-good 2D layout's footprint, so we never
+    // risk an L1 OOM.
+    const uint32_t x_ts = tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(t.x.dtype()));
+    const uint32_t w_ts = tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(t.gate_proj.dtype()));
+    const uint32_t p_ts = tt::tile_size(tt::DataFormat::Float16_b);
+    const uint32_t im_ts = tt::tile_size(tt::DataFormat::Bfp8_b);
+    const uint32_t out_ts = tt::tile_size(tt::tt_metal::datatype_to_dataformat_converter(tensor_return_value.dtype()));
+    auto est_l1_bytes = [&](uint32_t gx, uint32_t pcM, uint32_t ibw_gu) -> uint64_t {
+        const uint32_t pcN_gu = (N_gate_tiles_full + gx - 1) / gx;
+        const uint32_t pcN_d = (N_down_tiles_full + gx - 1) / gx;
+        const uint32_t ibw_d = pcN_gu;
+        uint64_t b = 0;
+        b += 2ull * pcM * ibw_gu * x_ts;     // CB_IN0_X (double-buffered)
+        b += 2ull * ibw_gu * pcN_gu * w_ts;  // CB_IN1_GATE
+        b += 2ull * ibw_gu * pcN_gu * w_ts;  // CB_IN1_UP
+        b += 2ull * ibw_d * pcN_d * w_ts;    // CB_IN1_DOWN
+        b += 1ull * pcM * pcN_gu * im_ts;    // CB_GATE_INT
+        b += 1ull * pcM * pcN_gu * im_ts;    // CB_ACTIVATED
+        b += 1ull * pcM * pcN_gu * p_ts;     // CB_PARTIALS_GU
+        b += 1ull * pcM * pcN_gu * p_ts;     // CB_PARTIALS_UP
+        b += 1ull * pcM * pcN_d * p_ts;      // CB_PARTIALS_D
+        b += 2ull * 8 * out_ts;              // CB_OUT (subblock <= 8 tiles, staged x2)
+        b += 2ull * pcM * ibw_d * im_ts;     // CB_IN0_DOWN_FULL
+        b += 8192;                           // counts + idx scratch
+        return b;
+    };
+
+    if (short_seq) {
+        // Reference footprint: the largest 2D config (GRID_X=11, the max
+        // per_core_M=8 = chunk_M_tiles 64 / GRID_Y 8, in0_block_w_gu=16) is
+        // known to fit, so any short-seq config no larger also fits.
+        constexpr uint32_t kMax2dPerCoreM = 8;
+        const uint64_t budget = est_l1_bytes(kMaxGridX, kMax2dPerCoreM, 16);
+        // gate/up K-block widths to try (descending = fewest gate handshakes),
+        // restricted to divisors of K_gate_tiles.
+        const uint32_t ibw_candidates[] = {56, 32, 28, 16, 8, 4, 2, 1};
+        uint32_t best_gx = kMaxGridX;
+        uint32_t best_ibw = 16;
+        bool found = false;
+        // Candidate GRID_X values. At small M the gate/up weight DRAM read is
+        // the dominant cost and it parallelizes across the N-column cores, so
+        // MORE columns (larger GRID_X) read fewer tiles per core and win —
+        // measured 64 tokens at gx=8 (267 µs) vs gx=4 (526 µs), despite gx=8
+        // paying more down-phase broadcasts. So prefer gx=8 first, then the
+        // full 11, then 4. Restricted to values whose per_core_N_gu
+        // (= ceil(N_gate/gx)) has a large output-subblock divisor (<= 8): for
+        // DS-V3 N_gate=64, gx in {8,11,4} -> per_core_N_gu in {8,6,16} which
+        // subblock cleanly at width {8,6,8}. Intermediate gx (5,6,7) give
+        // per_core_N_gu in {13,11,10} whose only <=8 divisor is 1, forcing
+        // 1-wide pack subblocks that erased the saving (regressed 128 tokens).
+        const uint32_t gx_candidates[] = {8, kMaxGridX, 4};
+        for (uint32_t gx : gx_candidates) {
+            if (found) {
+                break;
+            }
+            for (uint32_t ibw : ibw_candidates) {
+                if (ibw > K_gate_tiles || (K_gate_tiles % ibw) != 0) {
+                    continue;
+                }
+                if (est_l1_bytes(gx, per_core_M, ibw) <= budget) {
+                    best_gx = gx;
+                    best_ibw = ibw;
+                    found = true;
+                    break;  // largest fitting ibw for this gx
+                }
+            }
+        }
+        GRID_X = best_gx;
+        in0_block_w_gu = best_ibw;
+    }
+
     const uint32_t per_core_N_gu = (N_gate_tiles_full + GRID_X - 1) / GRID_X;
     const uint32_t per_core_N_d = (N_down_tiles_full + GRID_X - 1) / GRID_X;
     const uint32_t N_gate_tiles_padded = per_core_N_gu * GRID_X;
     const uint32_t K_down_tiles_padded = N_gate_tiles_padded;  // down K = gate N
 
-    // With 11x8 = 88 cores, per_core_N_gu (= 6) and per_core_N_d (= 21) leave
-    // ~250KB of headroom per core vs an 8x8 layout. Use it to double
-    // in0_block_w_gu, halving the gate / up K-loop iteration count.
-    const uint32_t in0_block_w_gu = 16;
     const uint32_t in0_block_w_d = per_core_N_gu;
     TT_FATAL(
         K_gate_tiles % in0_block_w_gu == 0,
@@ -230,6 +343,24 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // a turn as sender exactly once per chunk.
     const uint32_t act_ready_sem_id = tt::tt_metal::CreateSemaphore(program, core_range_set, 0);
     const uint32_t act_valid_sem_id = tt::tt_metal::CreateSemaphore(program, core_range_set, 0);
+    // Two-RISC weight read (short-seq). The writer (NCRISC, otherwise idle
+    // until the down output) reads the `up` weight on NoC 1 concurrently with
+    // the reader's NoC-0 `gate` read — a second read engine for the dominant
+    // gate/up weight stream. At GRID_Y > 1 the writer also multicasts `up` down
+    // its N-column (its own ready/valid sem pair, the reader's in1 pair drives
+    // `gate`), so the read is done once and shared — bandwidth-efficient at any
+    // GRID_Y. The NoC-1 multicast rectangle corners are swapped vs NoC 0 (NoC 1
+    // traverses in the opposite direction) — see the writer kernel. At
+    // GRID_Y == 1 there are no receivers so the writer just reads.
+    // Enabled for ALL layouts (short-seq and the 2D/long-seq path). On the 2D
+    // path each chunk re-streams the full weights and the reader is the serial
+    // bottleneck; splitting the `up` read onto the writer cuts ~13-17% off long
+    // sequences too (2k 693->612, 25k 8640->7484 us). The writer does its `up`
+    // read+mcast per chunk before draining that chunk's cb_out — the cb_out
+    // drain is small vs the read saved.
+    const bool writer_handles_up = true;
+    const uint32_t up_ready_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
+    const uint32_t up_valid_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
 
     // -------------------------- circular buffers --------------------------
     // Double-buffered DRAM-streamed inputs.
@@ -362,6 +493,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // K_down_tiles_padded — phase-4 K-loop bound. K dim of down is
         // padded to N_gate_padded so per-K-block sender = gx == kb holds.
         K_down_tiles_padded,
+        // reader_handles_up — 0 in the short-seq two-RISC layout (writer owns
+        // `up`); 1 otherwise (reader reads/mcasts both gate and up).
+        static_cast<uint32_t>(!writer_handles_up),
     };
     tt::tt_metal::TensorAccessorArgs(x_buffer).append_to(reader_ct_args);
     tt::tt_metal::TensorAccessorArgs(gate_buffer).append_to(reader_ct_args);
@@ -403,8 +537,18 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // chunk_M_tiles rows per core, of which only those < M_tiles_full
         // correspond to real output rows in the tensor.
         M_tiles_full,  // 16
+        // Two-RISC up-weight read (short-seq only). When writer_handles_up the
+        // writer reads + multicasts `up` on its own NoC concurrently with the
+        // reader's `gate`. CB / dims needed to replicate the gate read loop.
+        static_cast<uint32_t>(writer_handles_up),  // 17
+        CB_IN1_UP,                                 // 18
+        in0_block_w_gu,                            // 19
+        K_gate_tiles,                              // 20
     };
     tt::tt_metal::TensorAccessorArgs(out_buffer).append_to(writer_ct_args);
+    // up accessor follows out (always appended for a deterministic offset; the
+    // writer constructs it unconditionally, uses it only when writer_handles_up).
+    tt::tt_metal::TensorAccessorArgs(up_buffer).append_to(writer_ct_args);
 
     auto writer_kernel_id = tt::tt_metal::CreateKernel(
         program,
@@ -525,8 +669,14 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // those receiver rows.
         const bool is_in1_sender = (gy == 0);
         const auto sender_noc = device->worker_core_from_logical_core(CoreCoord{gx, 0});
-        const auto first_recv_noc = device->worker_core_from_logical_core(CoreCoord{gx, 1});
-        const auto last_recv_noc = device->worker_core_from_logical_core(CoreCoord{gx, GRID_Y - 1});
+        // When GRID_Y == 1 there are no column receivers; point the (unused)
+        // receiver coords at the sender row so worker_core_from_logical_core
+        // never indexes a non-existent gy=1 row. The reader skips the weight
+        // multicast entirely when in1_num_receivers == 0.
+        const CoreCoord first_recv_logical = (GRID_Y > 1) ? CoreCoord{gx, 1} : CoreCoord{gx, 0};
+        const CoreCoord last_recv_logical = (GRID_Y > 1) ? CoreCoord{gx, GRID_Y - 1} : CoreCoord{gx, 0};
+        const auto first_recv_noc = device->worker_core_from_logical_core(first_recv_logical);
+        const auto last_recv_noc = device->worker_core_from_logical_core(last_recv_logical);
         const uint32_t in1_num_receivers = GRID_Y - 1;
         const uint32_t in1_mcast_nx_start = first_recv_noc.x;
         const uint32_t in1_mcast_ny_start = first_recv_noc.y;
@@ -604,13 +754,28 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         tt::tt_metal::SetRuntimeArgs(program, reader_kernel_id, core, reader_args);
 
         // Writer runtime arg layout (must match unified_routed_expert_ffn_writer.cpp):
-        //   0: output_addr
-        //   1: my_mt
-        //   2: my_nt_d
+        //   0: output_addr  1: my_mt  2: my_nt_d
+        //   3..14: up-weight (two-RISC) args — up_addr, my_nt_gu, is_up_sender,
+        //          up_{ready,valid}_sem, up_num_receivers, and the up multicast
+        //          column topology (identical to the in1/gate column: sender at
+        //          gy=0, receivers gy=1..GRID_Y-1). Only used when
+        //          writer_handles_up; harmless otherwise.
         std::vector<uint32_t> writer_args = {
             out_buffer->address(),
             my_mt,
             my_nt_d,
+            up_buffer->address(),
+            my_nt_gu,
+            static_cast<uint32_t>(is_in1_sender),
+            up_ready_sem_id,
+            up_valid_sem_id,
+            in1_num_receivers,
+            in1_mcast_nx_start,
+            in1_mcast_ny_start,
+            in1_mcast_nx_end,
+            in1_mcast_ny_end,
+            in1_sender_nx,
+            in1_sender_ny,
         };
         tt::tt_metal::SetRuntimeArgs(program, writer_kernel_id, core, writer_args);
     }
@@ -653,6 +818,7 @@ void UnifiedRoutedExpertFfnProgramFactory::override_runtime_arguments(
 
         auto& writer_args = tt::tt_metal::GetRuntimeArgs(program, writer_id, core);
         writer_args[0] = out_addr;
+        writer_args[3] = up_addr;  // two-RISC up-weight read base address
     }
 }
 

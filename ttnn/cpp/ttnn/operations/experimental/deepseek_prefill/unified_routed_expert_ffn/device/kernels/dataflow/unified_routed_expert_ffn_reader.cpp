@@ -105,6 +105,10 @@ void kernel_main() {
     constexpr uint32_t cb_activated = get_compile_time_arg_val(20);
     constexpr uint32_t GRID_X_NOC = get_compile_time_arg_val(21);  // M-row mcast group size
     constexpr uint32_t K_down_tiles_padded = get_compile_time_arg_val(22);
+    // Two-RISC weight read: when 0, the writer (NCRISC) owns the `up` weight
+    // (reads + multicasts it on the other NoC) and the reader skips all `up`
+    // handling. 1 = legacy behaviour (reader reads/mcasts both gate and up).
+    constexpr uint32_t reader_handles_up = get_compile_time_arg_val(23);
 
     constexpr uint32_t g_in0_block_num_tiles = per_core_M * in0_block_w_gu;
     constexpr uint32_t g_in1_block_num_tiles = per_core_N_gu * in0_block_w_gu;
@@ -113,7 +117,7 @@ void kernel_main() {
     constexpr uint32_t num_blocks_gu = K_gate_tiles / in0_block_w_gu;
     constexpr uint32_t num_blocks_d = K_down_tiles_padded / in0_block_w_d;
 
-    constexpr uint32_t x_accessor_offset = 23;
+    constexpr uint32_t x_accessor_offset = 24;
     constexpr auto x_args = TensorAccessorArgs<x_accessor_offset>();
     const auto x_acc = TensorAccessor(x_args, x_addr, get_tile_size(cb_in0_x));
 
@@ -258,7 +262,9 @@ void kernel_main() {
         for (uint32_t kb = 0; kb < num_blocks_gu; ++kb) {
             cb_reserve_back(cb_in0_x, g_in0_block_num_tiles);
             cb_reserve_back(cb_in1_gate, g_in1_block_num_tiles);
-            cb_reserve_back(cb_in1_up, g_in1_block_num_tiles);
+            if constexpr (reader_handles_up) {
+                cb_reserve_back(cb_in1_up, g_in1_block_num_tiles);
+            }
 
             // Step 1: receivers ack BOTH senders upfront so both senders can
             // proceed in parallel. The senders are usually disjoint sets of
@@ -344,48 +350,70 @@ void kernel_main() {
                         l1_w_gate += gate_tile_bytes;
                     }
                 }
-                uint32_t l1_w_up = get_write_ptr(cb_in1_up);
-                const uint32_t up_block_start = l1_w_up;
-                for (uint32_t k = 0; k < in0_block_w_gu; ++k) {
-                    for (uint32_t n = 0; n < per_core_N_gu; ++n) {
-                        const uint32_t row = kb * in0_block_w_gu + k;
-                        const uint32_t col = my_nt_gu * per_core_N_gu + n;
-                        if (col < N_gate_tiles_full) {
-                            const uint32_t tile_idx = row * N_gate_tiles_full + col;
-                            noc_async_read_page(tile_idx, up_acc, l1_w_up, /*offset=*/0, /*noc=*/0);
-                        } else {
-                            volatile tt_l1_ptr uint64_t* p = reinterpret_cast<volatile tt_l1_ptr uint64_t*>(l1_w_up);
-                            for (uint32_t i = 0; i < up_tile_bytes / 8; ++i) {
-                                p[i] = 0;
+                // `up` weight: only read here in legacy mode. In the
+                // short-sequence two-RISC layout the writer (NCRISC) owns it.
+                uint32_t up_block_start = 0;
+                if constexpr (reader_handles_up) {
+                    uint32_t l1_w_up = get_write_ptr(cb_in1_up);
+                    up_block_start = l1_w_up;
+                    for (uint32_t k = 0; k < in0_block_w_gu; ++k) {
+                        for (uint32_t n = 0; n < per_core_N_gu; ++n) {
+                            const uint32_t row = kb * in0_block_w_gu + k;
+                            const uint32_t col = my_nt_gu * per_core_N_gu + n;
+                            if (col < N_gate_tiles_full) {
+                                const uint32_t tile_idx = row * N_gate_tiles_full + col;
+                                noc_async_read_page(tile_idx, up_acc, l1_w_up, /*offset=*/0, /*noc=*/0);
+                            } else {
+                                volatile tt_l1_ptr uint64_t* p =
+                                    reinterpret_cast<volatile tt_l1_ptr uint64_t*>(l1_w_up);
+                                for (uint32_t i = 0; i < up_tile_bytes / 8; ++i) {
+                                    p[i] = 0;
+                                }
                             }
+                            l1_w_up += up_tile_bytes;
                         }
-                        l1_w_up += up_tile_bytes;
                     }
                 }
                 noc_async_read_barrier(/*noc=*/0);
 
-                const uint64_t gate_mcast_noc = get_noc_multicast_addr(
-                    in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, gate_block_start);
-                const uint32_t gate_block_bytes = g_in1_block_num_tiles * gate_tile_bytes;
-                // linked=true on gate, linked=false on up — chains the two
-                // mcasts so they share NoC path setup, saving a few cycles
-                // of programming overhead per K-block.
-                noc_async_write_multicast(
-                    gate_block_start, gate_mcast_noc, gate_block_bytes, in1_num_receivers, /*linked=*/true);
+                // GRID_Y == 1 (short-sequence 1D layout): no column receivers,
+                // so this core is its own consumer — skip the weight multicast
+                // and the valid-sem broadcast entirely. The cb_push_back below
+                // hands the locally-read weights straight to compute.
+                if (in1_num_receivers > 0) {
+                    const uint64_t gate_mcast_noc = get_noc_multicast_addr(
+                        in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, gate_block_start);
+                    const uint32_t gate_block_bytes = g_in1_block_num_tiles * gate_tile_bytes;
+                    // In legacy mode gate links to the up mcast that follows
+                    // (shared NoC path setup). When the writer owns up, nothing
+                    // chains after gate so it is unlinked.
+                    noc_async_write_multicast(
+                        gate_block_start,
+                        gate_mcast_noc,
+                        gate_block_bytes,
+                        in1_num_receivers,
+                        /*linked=*/reader_handles_up != 0);
 
-                const uint64_t up_mcast_noc = get_noc_multicast_addr(
-                    in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, up_block_start);
-                const uint32_t up_block_bytes = g_in1_block_num_tiles * up_tile_bytes;
-                noc_async_write_multicast(
-                    up_block_start, up_mcast_noc, up_block_bytes, in1_num_receivers, /*linked=*/false);
+                    if constexpr (reader_handles_up) {
+                        const uint64_t up_mcast_noc = get_noc_multicast_addr(
+                            in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, up_block_start);
+                        const uint32_t up_block_bytes = g_in1_block_num_tiles * up_tile_bytes;
+                        noc_async_write_multicast(
+                            up_block_start, up_mcast_noc, up_block_bytes, in1_num_receivers, /*linked=*/false);
+                    }
+                }
 
                 cb_push_back(cb_in1_gate, g_in1_block_num_tiles);
-                cb_push_back(cb_in1_up, g_in1_block_num_tiles);
+                if constexpr (reader_handles_up) {
+                    cb_push_back(cb_in1_up, g_in1_block_num_tiles);
+                }
 
-                noc_async_writes_flushed();
+                if (in1_num_receivers > 0) {
+                    noc_async_writes_flushed();
 
-                *in1_valid_local = IN1_VALID;
-                noc_semaphore_set_multicast(in1_valid_sem_addr, in1_mcast_valid_noc, in1_num_receivers);
+                    *in1_valid_local = IN1_VALID;
+                    noc_semaphore_set_multicast(in1_valid_sem_addr, in1_mcast_valid_noc, in1_num_receivers);
+                }
             }
 
             // Step 3: receivers wait for both valid semaphores and push.
@@ -396,7 +424,9 @@ void kernel_main() {
             if (!is_in1_sender) {
                 noc_semaphore_wait(in1_valid_local, IN1_VALID);
                 cb_push_back(cb_in1_gate, g_in1_block_num_tiles);
-                cb_push_back(cb_in1_up, g_in1_block_num_tiles);
+                if constexpr (reader_handles_up) {
+                    cb_push_back(cb_in1_up, g_in1_block_num_tiles);
+                }
             }
         }
 
@@ -516,18 +546,23 @@ void kernel_main() {
             // in flight during step 3 activated mcast on NoC 1), then mcast.
             if (is_in1_sender) {
                 noc_async_read_barrier(/*noc=*/0);
-                const uint64_t mcast_data_noc = get_noc_multicast_addr(
-                    in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, in1_block_start);
-                const uint32_t block_bytes = d_in1_block_num_tiles * down_tile_bytes;
-                // linked=true so the in1_valid-sem multicast is ordered behind
-                // the weight data on the same reserved path (see the activated
-                // mcast above for the full rationale).
-                noc_async_write_multicast(
-                    in1_block_start, mcast_data_noc, block_bytes, in1_num_receivers, /*linked=*/true);
-                noc_async_writes_flushed();
+                // GRID_Y == 1: no column receivers — the locally-read down
+                // weight block is consumed by this core directly (pushed
+                // below); skip the multicast and valid-sem broadcast.
+                if (in1_num_receivers > 0) {
+                    const uint64_t mcast_data_noc = get_noc_multicast_addr(
+                        in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, in1_block_start);
+                    const uint32_t block_bytes = d_in1_block_num_tiles * down_tile_bytes;
+                    // linked=true so the in1_valid-sem multicast is ordered behind
+                    // the weight data on the same reserved path (see the activated
+                    // mcast above for the full rationale).
+                    noc_async_write_multicast(
+                        in1_block_start, mcast_data_noc, block_bytes, in1_num_receivers, /*linked=*/true);
+                    noc_async_writes_flushed();
 
-                *in1_valid_local = IN1_VALID;
-                noc_semaphore_set_multicast(in1_valid_sem_addr, in1_mcast_valid_noc, in1_num_receivers);
+                    *in1_valid_local = IN1_VALID;
+                    noc_semaphore_set_multicast(in1_valid_sem_addr, in1_mcast_valid_noc, in1_num_receivers);
+                }
             }
 
             // Step 5: receivers wait for both valid sems and push.
