@@ -437,11 +437,11 @@ jobs:
           echo "AWS_ACCESS_KEY_ID=${{ secrets.GARAGE_S3_ACCESS_KEY }}" >> $GITHUB_ENV
           echo "AWS_SECRET_ACCESS_KEY=${{ secrets.GARAGE_S3_SECRET_KEY }}" >> $GITHUB_ENV
           echo "AWS_DEFAULT_REGION=garage" >> $GITHUB_ENV
-          # crsh: is ccache's custom remote storage protocol. The first path is the
-          # IPC socket the helper listens on; ccache derives the helper binary name
-          # (ccache-storage-s3) from the s3:// url scheme and looks it up in libexec.
+          # The s3:// scheme makes ccache auto-spawn and manage the helper itself:
+          # it derives the binary name (ccache-storage-s3) from the scheme and looks
+          # it up in libexec, forking it on demand and respawning across build steps.
           # Garage's s3_region is configured as "garage" — must match exactly or signing fails.
-          CCACHE_REMOTE_STORAGE="crsh:/tmp/ccache-s3.sock|url=s3://${CCACHE_S3_BUCKET}|region=garage|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
+          CCACHE_REMOTE_STORAGE="s3://${CCACHE_S3_BUCKET}|region=garage|prefix=${CCACHE_S3_PREFIX}|endpoint_url=http://garage.garage.svc.cluster.local:3900"
           if [ "${CCACHE_S3_READONLY}" = "true" ]; then
             CCACHE_REMOTE_STORAGE="${CCACHE_REMOTE_STORAGE}|read-only=true"
           fi
@@ -458,41 +458,6 @@ jobs:
           # the SDK can't compute the checksum upfront and fails. "when_required" tells the
           # SDK to skip checksum computation for regular PUTs.
           echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> $GITHUB_ENV
-
-      - name: Start ccache-storage-s3 helper
-        # crsh: is a "connect-only" scheme — ccache does NOT auto-spawn the helper.
-        # We must start the daemon ourselves and wait for the socket before any build step.
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
-        run: |
-          HELPER=/usr/local/libexec/ccache-storage-s3
-          if [ ! -x "$HELPER" ]; then
-            echo "ERROR: $HELPER not found or not executable"
-            exit 1
-          fi
-
-          CRSH_IPC_ENDPOINT=/tmp/ccache-s3.sock \
-          CRSH_URL="s3://${CCACHE_S3_BUCKET}" \
-          CRSH_IDLE_TIMEOUT=3600 \
-          CRSH_NUM_ATTR=3 \
-          CRSH_ATTR_KEY_0=region \
-          CRSH_ATTR_VALUE_0=garage \
-          CRSH_ATTR_KEY_1=prefix \
-          CRSH_ATTR_VALUE_1="${CCACHE_S3_PREFIX}" \
-          CRSH_ATTR_KEY_2=endpoint_url \
-          CRSH_ATTR_VALUE_2=http://garage.garage.svc.cluster.local:3900 \
-          CRSH_LOGFILE=/tmp/ccache-storage-s3.log \
-          "$HELPER" &
-
-          echo "Waiting for /tmp/ccache-s3.sock..."
-          for i in $(seq 1 30); do
-            [ -S /tmp/ccache-s3.sock ] && { echo "Helper ready (${i}s)"; break; }
-            sleep 1
-          done
-          if [ ! -S /tmp/ccache-s3.sock ]; then
-            echo "ERROR: helper did not create socket within 30s"
-            cat /tmp/ccache-storage-s3.log 2>/dev/null || echo "(no log written)"
-            exit 1
-          fi
 
       - name: Set artifact name
         id: set-artifact-name
@@ -670,7 +635,7 @@ jobs:
             tail -200 /tmp/ccache-storage-s3.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
-            echo "WARNING: /tmp/ccache-storage-s3.log not found — CRSH_LOGFILE may not have been set or the helper never started"
+            echo "WARNING: /tmp/ccache-storage-s3.log not found — helper may not have been spawned by ccache"
           fi
 
       - name: ☁️ Upload packages
