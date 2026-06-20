@@ -454,6 +454,41 @@ jobs:
           # Enable debug logging from the ccache-storage-s3 helper binary.
           echo "CRSH_LOGFILE=/tmp/ccache-storage-s3.log" >> $GITHUB_ENV
 
+      - name: Start ccache-storage-s3 helper
+        # crsh: is a "connect-only" scheme — ccache does NOT auto-spawn the helper.
+        # We must start the daemon ourselves and wait for the socket before any build step.
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: |
+          HELPER=/usr/local/libexec/ccache-storage-s3
+          if [ ! -x "$HELPER" ]; then
+            echo "ERROR: $HELPER not found or not executable"
+            exit 1
+          fi
+
+          CRSH_IPC_ENDPOINT=/tmp/ccache-s3.sock \
+          CRSH_URL="s3://${CCACHE_S3_BUCKET}" \
+          CRSH_IDLE_TIMEOUT=3600 \
+          CRSH_NUM_ATTR=3 \
+          CRSH_ATTR_KEY_0=region \
+          CRSH_ATTR_VALUE_0=garage \
+          CRSH_ATTR_KEY_1=prefix \
+          CRSH_ATTR_VALUE_1="${CCACHE_S3_PREFIX}" \
+          CRSH_ATTR_KEY_2=endpoint_url \
+          CRSH_ATTR_VALUE_2=http://garage.garage.svc.cluster.local:3900 \
+          CRSH_LOGFILE=/tmp/ccache-storage-s3.log \
+          "$HELPER" &
+
+          echo "Waiting for /tmp/ccache-s3.sock..."
+          for i in $(seq 1 30); do
+            [ -S /tmp/ccache-s3.sock ] && { echo "Helper ready (${i}s)"; break; }
+            sleep 1
+          done
+          if [ ! -S /tmp/ccache-s3.sock ]; then
+            echo "ERROR: helper did not create socket within 30s"
+            cat /tmp/ccache-storage-s3.log 2>/dev/null || echo "(no log written)"
+            exit 1
+          fi
+
       - name: Set artifact name
         id: set-artifact-name
         run: |
@@ -496,70 +531,6 @@ jobs:
       - name: Create ccache tmpdir
         run: |
           mkdir -p /tmp/ccache
-
-      - name: Debug ccache-storage-s3 helper
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
-        run: |
-          echo "=== ccache version and location ==="
-          which ccache
-          ccache --version
-
-          echo "=== Searching for ccache libexec dir ==="
-          ls -la "$(dirname $(which ccache))/../lib/ccache/" 2>/dev/null || echo "no ../lib/ccache/ dir"
-          ls -la "$(dirname $(which ccache))/../libexec/" 2>/dev/null || echo "no ../libexec/ dir"
-          find /usr /opt /usr/local -name "ccache-storage-s3" 2>/dev/null || echo "ccache-storage-s3 not found in /usr /opt /usr/local"
-
-          echo "=== ccache config ==="
-          ccache --show-config
-
-          echo "=== /tmp writability ==="
-          ls -la /tmp/
-
-          echo "=== Garage endpoint connectivity ==="
-          curl -sv --max-time 5 --noproxy garage.garage.svc.cluster.local http://garage.garage.svc.cluster.local:3900/ 2>&1 || true
-
-          echo "=== Attempt to start helper manually ==="
-          HELPER=$(find /usr /opt /usr/local -name "ccache-storage-s3" 2>/dev/null | head -1)
-          if [ -n "$HELPER" ]; then
-            echo "Found helper at: $HELPER"
-            echo "Current env vars (S3/ccache-related):"
-            env | grep -E '^(AWS_|CCACHE_|CRSH_|NO_PROXY|no_proxy)' || echo "(none found)"
-
-            echo "--- Starting helper in foreground with stderr (timeout 5s) ---"
-            CRSH_LOGFILE=/tmp/crsh-debug.log \
-              timeout 5 "$HELPER" /tmp/ccache-s3-test.sock 2>&1 || echo "Helper exit code: $?"
-            echo "--- Helper exited ---"
-
-            if [ -f /tmp/crsh-debug.log ]; then
-              echo "=== CRSH_LOGFILE contents ==="
-              cat /tmp/crsh-debug.log
-            else
-              echo "CRSH_LOGFILE not written by helper"
-            fi
-
-            ls -la /tmp/ccache-s3-test.sock 2>/dev/null && echo "Socket created OK" || echo "Socket NOT created"
-
-            echo "--- Test with explicit S3 env vars ---"
-            CRSH_LOGFILE=/tmp/crsh-debug2.log \
-              AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
-              AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
-              AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}" \
-              timeout 5 "$HELPER" /tmp/ccache-s3-test2.sock 2>&1 || echo "Helper exit code (explicit env): $?"
-            if [ -f /tmp/crsh-debug2.log ]; then
-              echo "=== CRSH_LOGFILE2 ==="
-              cat /tmp/crsh-debug2.log
-            fi
-            ls -la /tmp/ccache-s3-test2.sock 2>/dev/null && echo "Socket2 created OK" || echo "Socket2 NOT created"
-          else
-            echo "ccache-storage-s3 binary NOT FOUND — this is why crsh:// fails"
-          fi
-
-          echo "=== Strace helper startup (first 50 syscalls) ==="
-          if command -v strace &>/dev/null && [ -n "$HELPER" ]; then
-            strace -e trace=network,file -f -c timeout 3 "$HELPER" /tmp/ccache-s3-strace.sock 2>&1 | head -80 || true
-          else
-            echo "strace not available or helper not found"
-          fi
 
       - name: Prepare ccache summary
         run: |
