@@ -481,11 +481,293 @@ inline void piecewise_generic_lut_specialized_N_dual(const std::array<float, LUT
 #endif // USE_DUAL_EVAL
 
 // ============================================================================
+// Coefficient-blend single-eval (parity only)
+// ============================================================================
+//
+// Instead of evaluating a full x²-Horner inside each segment's v_if (the
+// O(segments x degree) cascade in piecewise_generic_lut_specialized_N), the
+// blend cascade only OVERWRITES the parity coefficient registers with cheap
+// predicated moves per segment, then runs ONE x²-Horner on the blended
+// coefficients after the cascade. This collapses the dominant term:
+//   NUM_SEGMENTS x (full Horner)  ->  NUM_SEGMENTS x (few moves) + 1 x (Horner)
+//
+// BIT-EQUIVALENCE: for an input in segment s, the cascade selects exactly the
+// coefficient set of the highest boundary <= x (segment 0 is the initial set,
+// each later v_if that fires overwrites it). The final x²-Horner is evaluated
+// at a FIXED top index = parity-top of POLY_DEGREE (the max degree). Per-segment
+// adaptive degree leaves the unused high-order coefficient slots zero in the
+// LUT, and a leading `0*x2 + c` step is exact in float — so evaluating at the
+// max top with zeroed high coeffs is bit-identical to the shorter per-segment
+// x²-Horner used by the cascade path. ODD parity multiplies the final
+// accumulator by x; EVEN parity does not (matching eval_polynomial_parity).
+//
+// Single-eval only — blend + dual would keep two coefficient sets live and
+// overflow the SFPU register file.
+#if defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN)
+
+// Parity layout: ODD uses coefficient indices 1,3,5,... ; EVEN uses 0,2,4,...
+// TOP = highest in-parity index <= POLY_DEGREE; NSLOTS parity coefficients,
+// where slot j holds coefficient index (PARITY_BASE + 2*j).
+template <uint32_t POLY_DEGREE>
+struct blend_parity_traits {
+#if defined(POLY_PARITY_ODD)
+    static constexpr int PARITY_BASE = 1;
+    static constexpr int TOP = (POLY_DEGREE % 2 == 1) ? (int)POLY_DEGREE : (int)POLY_DEGREE - 1;
+#else
+    static constexpr int PARITY_BASE = 0;
+    static constexpr int TOP = (POLY_DEGREE % 2 == 0) ? (int)POLY_DEGREE : (int)POLY_DEGREE - 1;
+#endif
+    static constexpr uint32_t NSLOTS = (uint32_t)((TOP - PARITY_BASE) / 2) + 1;
+};
+
+// Recursively overwrite the NSLOTS blended parity coefficients for segment SEG
+// when x >= boundary[SEG]. Slot j <- lut[base + PARITY_BASE + 2*j].
+template <uint32_t SLOT, uint32_t NSLOTS, int PARITY_BASE, uint32_t LUT_SIZE>
+__attribute__((always_inline)) inline void blend_assign(
+    const std::array<float, LUT_SIZE>& lut, uint32_t base, vFloat* coeffs) {
+    if constexpr (SLOT < NSLOTS) {
+        coeffs[SLOT] = lut[base + PARITY_BASE + 2 * SLOT];
+        blend_assign<SLOT + 1, NSLOTS, PARITY_BASE, LUT_SIZE>(lut, base, coeffs);
+    }
+}
+
+template <uint32_t SEG, uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
+__attribute__((always_inline)) inline void blend_cascade(
+    const std::array<float, LUT_SIZE>& lut, vFloat x_clamped, vFloat* coeffs) {
+    if constexpr (SEG < NUM_SEGMENTS) {
+        using T = blend_parity_traits<POLY_DEGREE>;
+        constexpr uint32_t CPS = POLY_DEGREE + 1;
+        constexpr uint32_t CO = NUM_SEGMENTS + 1;
+        constexpr uint32_t base = CO + SEG * CPS;
+        v_if(x_clamped >= lut[SEG]) { blend_assign<0, T::NSLOTS, T::PARITY_BASE, LUT_SIZE>(lut, base, coeffs); }
+        v_endif;
+        blend_cascade<SEG + 1, POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut, x_clamped, coeffs);
+    }
+}
+
+template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
+inline void piecewise_generic_lut_specialized_N_blend(const std::array<float, LUT_SIZE>& lut) {
+    using T = blend_parity_traits<POLY_DEGREE>;
+    constexpr uint32_t CPS = POLY_DEGREE + 1;
+    constexpr uint32_t CO = NUM_SEGMENTS + 1;
+    constexpr uint32_t NSLOTS = T::NSLOTS;
+
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+
+        // Blended parity coefficients, initialized to segment 0's coefficients.
+        vFloat coeffs[NSLOTS];
+        blend_assign<0, NSLOTS, T::PARITY_BASE, LUT_SIZE>(lut, CO, coeffs);
+
+        // Cascade: overwrite coefficient registers for the matching segment.
+        blend_cascade<1, POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut, x, coeffs);
+
+        // ONE x²-Horner on the blended coefficients (fixed top = parity-top of
+        // POLY_DEGREE). Highest slot first, matching eval_polynomial_parity.
+        vFloat x2 = x * x;
+        vFloat acc = coeffs[NSLOTS - 1];
+#pragma GCC unroll 16
+        for (int k = (int)NSLOTS - 2; k >= 0; k--) {
+            acc = acc * x2 + coeffs[k];
+        }
+#if defined(POLY_PARITY_ODD)
+        acc = acc * x;  // final *x for odd parity
+#endif
+
+#ifdef HAS_CRITICAL_POINT
+        v_if(x == lut[CRITICAL_IDX]) { acc = CRITICAL_VALUE; }
+        v_endif;
+#endif
+
+        dst_reg[d] = acc;
+    }
+}
+
+#endif  // POLY_PARITY_ODD || POLY_PARITY_EVEN
+
+// ============================================================================
+// Coefficient-blend single-eval (NON-parity)
+// ============================================================================
+//
+// Same select-then-eval technique as the parity blend above, but for general
+// (non-parity) per-segment polynomials — which is what real activation fits
+// produce (only the global function is odd/even; the local segment polynomials
+// are dense). The v_if cascade overwrites ALL (POLY_DEGREE+1) coefficient
+// registers with cheap predicated moves, then ONE dense Horner runs after the
+// cascade on the blended coefficients:
+//   NUM_SEGMENTS x (full Horner)  ->  NUM_SEGMENTS x (degree+1 moves) + 1 x Horner
+//
+// BIT-EQUIVALENCE: for an input in segment s, the cascade selects exactly the
+// coefficient set of the highest boundary <= x (segment 0 is the initial set;
+// each later v_if that fires overwrites it). The final dense Horner is always
+// evaluated at the FIXED top index POLY_DEGREE. With adaptive per-segment
+// degree (HAS_SEGMENT_DEGREES), low-degree segments leave their high-order
+// coefficient slots zero in the LUT; a leading `0*x + c` Horner step is exact
+// in float, so evaluating at the max top with zeroed high coeffs is bit-
+// identical to the shorter per-segment Horner used by the cascade path. This
+// matches eval_polynomial<DEG>, which Horners coefficient index DEG..0 from
+// &lut[base] (index i at lut[base+i]).
+//
+// Single-eval only — blend + dual would keep two coefficient sets live and
+// overflow the SFPU register file. Gated to POLY_DEGREE <= 5 in the dispatcher
+// (degree >= 6 ICEs GCC reload with POLY_DEGREE+1 live coefficient registers).
+#if !defined(POLY_PARITY_ODD) && !defined(POLY_PARITY_EVEN)
+
+// Recursively overwrite the (POLY_DEGREE+1) blended coefficient registers for
+// segment SEG when x >= boundary[SEG]. Slot i <- lut[base + i].
+template <uint32_t SLOT, uint32_t NSLOTS, uint32_t LUT_SIZE>
+__attribute__((always_inline)) inline void blend_assign_dense(
+    const std::array<float, LUT_SIZE>& lut, uint32_t base, vFloat* coeffs) {
+    if constexpr (SLOT < NSLOTS) {
+        coeffs[SLOT] = lut[base + SLOT];
+        blend_assign_dense<SLOT + 1, NSLOTS, LUT_SIZE>(lut, base, coeffs);
+    }
+}
+
+template <uint32_t SEG, uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
+__attribute__((always_inline)) inline void blend_cascade_dense(
+    const std::array<float, LUT_SIZE>& lut, vFloat x_clamped, vFloat* coeffs) {
+    if constexpr (SEG < NUM_SEGMENTS) {
+        constexpr uint32_t CPS = POLY_DEGREE + 1;
+        constexpr uint32_t CO = NUM_SEGMENTS + 1;
+        constexpr uint32_t base = CO + SEG * CPS;
+        v_if(x_clamped >= lut[SEG]) { blend_assign_dense<0, POLY_DEGREE + 1, LUT_SIZE>(lut, base, coeffs); }
+        v_endif;
+        blend_cascade_dense<SEG + 1, POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut, x_clamped, coeffs);
+    }
+}
+
+template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
+inline void piecewise_generic_lut_specialized_N_blend_dense(const std::array<float, LUT_SIZE>& lut) {
+    constexpr uint32_t CPS = POLY_DEGREE + 1;
+    constexpr uint32_t CO = NUM_SEGMENTS + 1;
+    constexpr uint32_t NSLOTS = POLY_DEGREE + 1;
+
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+
+        // Blended coefficients, initialized to segment 0's coefficients.
+        vFloat coeffs[NSLOTS];
+        blend_assign_dense<0, NSLOTS, LUT_SIZE>(lut, CO, coeffs);
+
+        // Cascade: overwrite coefficient registers for the matching segment.
+        blend_cascade_dense<1, POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut, x, coeffs);
+
+        // ONE dense Horner on the blended coefficients (fixed top = POLY_DEGREE).
+        // Highest index first, matching eval_polynomial<DEG>.
+        vFloat acc = coeffs[NSLOTS - 1];
+#pragma GCC unroll 16
+        for (int k = (int)NSLOTS - 2; k >= 0; k--) {
+            acc = acc * x + coeffs[k];
+        }
+
+#ifdef HAS_CRITICAL_POINT
+        v_if(x == lut[CRITICAL_IDX]) { acc = CRITICAL_VALUE; }
+        v_endif;
+#endif
+
+        dst_reg[d] = acc;
+    }
+}
+
+#endif  // !POLY_PARITY_ODD && !POLY_PARITY_EVEN
+
+// ============================================================================
 // Dispatcher
 // ============================================================================
 
+// Blend gate (shared preconditions): multi-segment is where the cascade->blend
+// win materializes, and range-reduction / asymptotic factoring hold extra live
+// registers (vInt exponents, x_orig, etc.) that would push blend over the
+// register frontier. These hold for both parity and non-parity blends.
+#if !defined(RANGE_REDUCTION_EXP) && !defined(RANGE_REDUCTION_TRIG) && !defined(RANGE_REDUCTION_TAN) &&             \
+    !defined(RANGE_REDUCTION_LOG) && !defined(RANGE_REDUCTION_CBRT) && !defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) && \
+    !defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) && !defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR) &&                           \
+    !defined(ASYMPTOTIC_FACTOR_X)
+#define BLEND_GATE_NO_REDUCTION 1
+#else
+#define BLEND_GATE_NO_REDUCTION 0
+#endif
+
+// Per-variant blend eligibility + register-fit bound:
+//   parity:     POLY_DEGREE <= 12  (x²-Horner halves live coeffs; >=16 ICEs GCC reload)
+//   non-parity: POLY_DEGREE <= 5   (POLY_DEGREE+1 live coeff regs; degree >= 6 ICEs reload)
+#if BLEND_GATE_NO_REDUCTION && (defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN))
+#define BLEND_GATE_ELIGIBLE 1
+#define BLEND_DEGREE_LIMIT 12
+#elif BLEND_GATE_NO_REDUCTION
+#define BLEND_GATE_ELIGIBLE 1
+#define BLEND_DEGREE_LIMIT 5
+#else
+#define BLEND_GATE_ELIGIBLE 0
+#define BLEND_DEGREE_LIMIT 0
+#endif
+
+// Compile-time cascade work estimate (FMA-equivalent count for the in-v_if
+// evaluation): with adaptive degree it is the sum of per-segment effective
+// degrees; otherwise NUM_SEGMENTS * POLY_DEGREE. Both paths pay the same
+// NUM_SEGMENTS predicate cascade, so this captures the part that differs.
+template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS>
+constexpr uint32_t blend_cascade_eval_cost() {
+#ifdef HAS_SEGMENT_DEGREES
+    uint32_t s = 0;
+    for (uint32_t i = 0; i < NUM_SEGMENTS; i++) {
+        s += SEGMENT_DEGREES[i];
+    }
+    return s;
+#else
+    return NUM_SEGMENTS * POLY_DEGREE;
+#endif
+}
+
+// Auto-select predictor: should the (eligible) blend path actually be used?
+// "Best design wins" — engage blend only when it is the faster design.
+//
+//   PARITY blend is the established win: parity x²-Horner halves the live
+//   coefficient count, so the per-segment predicated moves (~NSLOTS = DEGREE/2)
+//   are cheaper than the cascade's per-segment x²-Horner. Engages whenever
+//   eligible.
+//
+//   NON-PARITY dense blend overwrites POLY_DEGREE+1 coefficient registers per
+//   segment, then runs one dense Horner. The cascade it replaces evaluates
+//   eval_polynomial<SEGMENT_DEGREES[s]> under predication for every segment, so
+//   the work it removes is blend_cascade_eval_cost() FMAs; the work it adds is
+//   NUM_SEGMENTS*(POLY_DEGREE+1) predicated coefficient moves + one trailing
+//   POLY_DEGREE Horner. Because the embedded LUT is constexpr, GCC folds every
+//   coefficient into an FMA immediate, so a cascade FMA and a blend coefficient
+//   move cost about the same — and since blend_cascade_eval_cost() <=
+//   NUM_SEGMENTS*POLY_DEGREE < NUM_SEGMENTS*(POLY_DEGREE+1), the cascade is
+//   always the faster design here. Measured on Blackhole (256 tiles, bf16):
+//   the non-parity blend is bit-identical to the cascade but never faster
+//   (tanh p5_s32 24.1 vs 16.9; sinh p4_s32 25.9 vs 22.5; sigmoid p4_s16
+//   dense ratio 0.98 14.5 vs 13.5). So this predicate is FALSE for every
+//   non-parity config and routes them to the cascade. The non-parity blend
+//   path remains available and correct for harnesses where coefficients are
+//   not constexpr-folded (e.g. a runtime LUT), where the load/move asymmetry
+//   flips the trade — there the predicate fires once the cascade work exceeds
+//   the blend's move cost.
+template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS>
+constexpr bool blend_predicted_faster() {
+#if defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN)
+    return true;
+#else
+    return blend_cascade_eval_cost<POLY_DEGREE, NUM_SEGMENTS>() > NUM_SEGMENTS * (POLY_DEGREE + 1) + POLY_DEGREE;
+#endif
+}
+
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lut) {
+#if BLEND_GATE_ELIGIBLE
+    if constexpr (
+        NUM_SEGMENTS > 1 && POLY_DEGREE <= BLEND_DEGREE_LIMIT && blend_predicted_faster<POLY_DEGREE, NUM_SEGMENTS>()) {
+#if defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN)
+        piecewise_generic_lut_specialized_N_blend<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
+#else
+        piecewise_generic_lut_specialized_N_blend_dense<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
+#endif
+        return;
+    }
+#endif
 #ifdef USE_DUAL_EVAL
     // Range reduction keeps extra vInt registers live across the polynomial evaluation,
     // pushing total SFPU register pressure beyond the hardware limit.
