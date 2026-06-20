@@ -522,13 +522,43 @@ jobs:
           HELPER=$(find /usr /opt /usr/local -name "ccache-storage-s3" 2>/dev/null | head -1)
           if [ -n "$HELPER" ]; then
             echo "Found helper at: $HELPER"
-            "$HELPER" /tmp/ccache-s3-test.sock &
-            HELPER_PID=$!
-            sleep 2
+            echo "Current env vars (S3/ccache-related):"
+            env | grep -E '^(AWS_|CCACHE_|CRSH_|NO_PROXY|no_proxy)' || echo "(none found)"
+
+            echo "--- Starting helper in foreground with stderr (timeout 5s) ---"
+            CRSH_LOGFILE=/tmp/crsh-debug.log \
+              timeout 5 "$HELPER" /tmp/ccache-s3-test.sock 2>&1 || echo "Helper exit code: $?"
+            echo "--- Helper exited ---"
+
+            if [ -f /tmp/crsh-debug.log ]; then
+              echo "=== CRSH_LOGFILE contents ==="
+              cat /tmp/crsh-debug.log
+            else
+              echo "CRSH_LOGFILE not written by helper"
+            fi
+
             ls -la /tmp/ccache-s3-test.sock 2>/dev/null && echo "Socket created OK" || echo "Socket NOT created"
-            kill $HELPER_PID 2>/dev/null || true
+
+            echo "--- Test with explicit S3 env vars ---"
+            CRSH_LOGFILE=/tmp/crsh-debug2.log \
+              AWS_ACCESS_KEY_ID="${AWS_ACCESS_KEY_ID}" \
+              AWS_SECRET_ACCESS_KEY="${AWS_SECRET_ACCESS_KEY}" \
+              AWS_DEFAULT_REGION="${AWS_DEFAULT_REGION}" \
+              timeout 5 "$HELPER" /tmp/ccache-s3-test2.sock 2>&1 || echo "Helper exit code (explicit env): $?"
+            if [ -f /tmp/crsh-debug2.log ]; then
+              echo "=== CRSH_LOGFILE2 ==="
+              cat /tmp/crsh-debug2.log
+            fi
+            ls -la /tmp/ccache-s3-test2.sock 2>/dev/null && echo "Socket2 created OK" || echo "Socket2 NOT created"
           else
             echo "ccache-storage-s3 binary NOT FOUND — this is why crsh:// fails"
+          fi
+
+          echo "=== Strace helper startup (first 50 syscalls) ==="
+          if command -v strace &>/dev/null && [ -n "$HELPER" ]; then
+            strace -e trace=network,file -f -c timeout 3 "$HELPER" /tmp/ccache-s3-strace.sock 2>&1 | head -80 || true
+          else
+            echo "strace not available or helper not found"
           fi
 
       - name: Prepare ccache summary
