@@ -24,7 +24,7 @@ OUT="$HERE/results.csv"
 source "$EX/profiler_helpers.sh"
 
 ACT="${1:-all}"
-POLY="p0_naive p1_unrolled p2_dual p3_parity p4_adaptive"
+POLY="p0_naive p1_unrolled p2_dual p3_parity p4_adaptive p5_blend"
 RAT="r0_naive r1_unrolled r2_interleaved r3_parity r4_deferred"
 case "$ACT" in
   poly) RUNGS="$POLY" ;;
