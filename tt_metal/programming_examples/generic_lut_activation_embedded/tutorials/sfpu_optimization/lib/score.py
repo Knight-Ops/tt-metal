@@ -96,7 +96,7 @@ except Exception:
     err = 9.99
 
 # Static analysis: per-element FMA count of the predicated cascade.
-parity = ("parity" in rung) or ("adaptive" in rung)
+parity = ("parity" in rung) or ("adaptive" in rung) or ("deferred" in rung)
 if is_rational:
     nseg = _int("BENCH_R_NUM_SEGMENTS")
     nd = _int("BENCH_R_NUM_DEGREE")
