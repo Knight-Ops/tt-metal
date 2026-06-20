@@ -4,6 +4,8 @@
 
 Comprehensive implementation and benchmarking of activation functions on Tenstorrent hardware using piecewise polynomial approximation methods: Piecewise Constant (PC), Piecewise Linear (PL), Piecewise Quadratic (PQ), Piecewise Quadratic Remez (PQR), and Piecewise Cubic Remez (PCR).
 
+> 📘 **New here / learning SFPU optimization?** See [`tutorials/sfpu_optimization/SFPU_OPTIMIZATION_STORY.md`](tutorials/sfpu_optimization/SFPU_OPTIMIZATION_STORY.md) — a runnable, step-by-step walkthrough of optimizing an SFPU vector kernel from a naive baseline to ~5x faster, measuring each win on silicon.
+
 ## Setup & Build (from a clean checkout)
 
 These are the exact steps required to build and run this example against current `tt-metal` HEAD. A clean checkout does **not** build out of the box — the steps below were verified on Blackhole (also applies to Wormhole).
