@@ -75,6 +75,17 @@ cd tt_metal/programming_examples/generic_lut_activation_embedded
 # Batch: loop over an "act,prec,csvname" worklist, calling the script per line.
 ```
 
+**Batch sweep over a `best*.csv` (replicable native-vs-ours table):**
+`tools/sweep_best_native_vs_embedded.sh` resolves every `(activation, precision)` row of a `best*.csv` to its best-ULP coefficient file (by header name + `source_metric` — robust to schema changes) and runs the two-way comparison for each. Use it to compare selection policies — e.g. `best.csv` (lowest ULP) vs `best95.csv` (cheapest within 95% of peak accuracy) vs `best99.csv`:
+```bash
+export TT_POLY_FIT_DIR=/localdev/<user>/tt-polynomial-fitter
+cd tt_metal/programming_examples/generic_lut_activation_embedded
+./tools/sweep_best_native_vs_embedded.sh --best-csv $TT_POLY_FIT_DIR/best95.csv --precision bf16
+./tools/sweep_best_native_vs_embedded.sh --best-csv $TT_POLY_FIT_DIR/best99.csv --precision bf16
+# subset: --activations tanh,asin,gelu ; single shape: --tiles 256
+```
+> bf16 note: `best.csv` minimizes ULP with no cost awareness, so it can pick 32-segment polynomials that win a meaningless sub-1.0 ULP over a single-segment rational. Since the segment selector is a *predicated* `v_if` cascade (every segment's polynomial runs on every lane), that costs ~segments×degree per element. For bf16 deployment prefer **`best95.csv`** — cheapest fit at ULP≈native-parity — which collapses that cost ~10-40× at no meaningful accuracy loss.
+
 **Full three-way (native vs drop-in vs embedded):** `tools/compare_three_way.sh`.
 > ⚠️ `compare_three_way.sh` assumes a drop-in header has **already been applied** for the activation (via `apply_dropin.sh`). To measure the "original" baseline it *deletes* `ckernel_sfpu_<act>.h` expecting a composite-op fallback — on a stock activation whose header is the real git-tracked one, this **deletes the real header and breaks the build**. Apply the drop-in first, or use `compare_native_vs_embedded.sh` instead.
 
