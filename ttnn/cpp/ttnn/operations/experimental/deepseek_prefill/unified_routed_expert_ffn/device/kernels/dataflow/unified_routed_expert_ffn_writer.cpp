@@ -242,13 +242,16 @@ void kernel_main() {
     // Ensure all outstanding writes complete at the destination before the
     // kernel returns (the next dispatched op may read this output).
     noc_async_write_barrier();
-    // The two-RISC `up` weight multicast issues its valid-semaphore broadcast
-    // as a POSTED atomic on NoC 1 (kUpNoc). Like the reader's valid-sem mcasts
-    // (which it flushes with noc_async_atomic_barrier), the last one can still
-    // be in flight at kernel exit; without this barrier it leaks into the next
-    // dispatched program and corrupts/hangs it (timing-dependent, surfaces deep
-    // in long multi-expert/multi-layer runs). Flush the NoC-1 atomics here.
+    // The two-RISC `up` weight multicast runs entirely on NoC 1 (kUpNoc): bulk
+    // data multicasts (posted writes) plus a valid-semaphore broadcast (posted
+    // atomic). The default-NoC write barrier above does not drain NoC 1, so
+    // explicitly drain BOTH the NoC-1 writes and atomics here — otherwise the
+    // last in-flight NoC-1 transaction can leak into the next dispatched program
+    // and corrupt/hang it (timing-dependent, only surfaces deep in long
+    // multi-expert/multi-layer runs). Mirrors the reader's end-of-kernel
+    // noc_async_atomic_barrier for its own valid-sem mcasts.
     if constexpr (writer_handles_up) {
+        noc_async_write_barrier(kUpNoc);
         noc_async_atomic_barrier(kUpNoc);
     }
 }
