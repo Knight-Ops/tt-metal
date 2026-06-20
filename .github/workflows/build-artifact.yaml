@@ -459,6 +459,18 @@ jobs:
           # SDK to skip checksum computation for regular PUTs.
           echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> $GITHUB_ENV
 
+      - name: Verify S3 connectivity (write / read-back / delete)
+        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        run: |
+          ENDPOINT="http://garage.garage.svc.cluster.local:3900"
+          TEST_KEY="${CCACHE_S3_PREFIX}/.s3-connectivity-test"
+          PAYLOAD="ccache-s3-connectivity-ok"
+          echo "${PAYLOAD}" | aws --endpoint-url "${ENDPOINT}" s3 cp - "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}"
+          RESULT=$(aws --endpoint-url "${ENDPOINT}" s3 cp "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}" -)
+          [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '${RESULT}'"; exit 1; }
+          aws --endpoint-url "${ENDPOINT}" s3 rm "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}"
+          echo "S3 connectivity verified: write/read-back/delete all OK"
+
       - name: Set artifact name
         id: set-artifact-name
         run: |
