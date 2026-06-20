@@ -24,7 +24,7 @@ OUT="$HERE/results.csv"
 source "$EX/profiler_helpers.sh"
 
 ACT="${1:-all}"
-POLY="p0_naive p1_vectorized p2_unrolled p3_dual p4_parity p5_adaptive"
+POLY="p0_naive p1_unrolled p2_dual p3_parity p4_adaptive"
 RAT="r0_naive r1_unrolled r2_interleaved r3_parity r4_deferred"
 case "$ACT" in
   poly) RUNGS="$POLY" ;;
@@ -68,7 +68,10 @@ for rung in $RUNGS; do
   read -r fma insns err <<<"$("$SYSPY" "$HERE/lib/score.py" "$rung" "$dump" "$obj")"
   status="OK"
   [[ "$best" == "999999" ]] && status="NO_TIMING"
-  (( $(echo "${err:-9.99} > 1e-2" | bc -l 2>/dev/null || echo 1) )) && status="ACCURACY_FAIL"
+  # Use python for the threshold test: err is in scientific notation (e.g. 1.3e-03),
+  # which `bc` cannot parse. Tolerance gate: max_abs_err < 1e-2.
+  fail="$("$SYSPY" -c "import sys; print(1 if float(sys.argv[1])>1e-2 else 0)" "${err:-9.99}" 2>/dev/null || echo 1)"
+  [[ "$fail" == "1" ]] && status="ACCURACY_FAIL"
   printf "%s,%s,%s,%s,%s,%s\n" "$rung" "$best" "$fma" "$insns" "$err" "$status" >> "$OUT"
   echo "  $rung: us=$best fma=$fma insns=$insns err=$err -> $status"
 done
