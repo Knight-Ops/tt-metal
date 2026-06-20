@@ -9,16 +9,21 @@
 // interleaved output tensor at this core's (mt, nt_d) tile region, looped
 // over `effective_chunks` chunks.
 //
-// Two-RISC weight read (writer_handles_up == 1): the gate/up phase is bound by
-// the gate+up weight DRAM read, which the reader (BRISC, NoC 0) would otherwise
-// issue serially. To split it, the writer (NCRISC, NoC 1) owns the `up` weight
-// entirely — it reads up from DRAM and, at GRID_Y > 1, multicasts it down its
-// N-column — running concurrently with the reader's `gate` read on the other
-// NoC. The reader skips all `up` handling in this mode (see reader_handles_up).
-// Both feed the fused gate+up compute phase. Enabled for all layouts: per chunk
-// the writer produces all `up` K-blocks, then drains that chunk's `cb_out`
-// (the drain is small vs the read saved, so even multi-chunk long sequences
-// win despite the writer serialising up-read and cb_out within a chunk).
+// Two-RISC weight read: the gate/up phase is bound by the gate+up weight DRAM
+// read, which the reader (BRISC, NoC 0) would otherwise issue serially. The
+// writer (NCRISC, NoC 1) acts as a second read engine for `up`, concurrent with
+// the reader's NoC-0 `gate` read. Two delivery modes:
+//   * writer_mcasts_up (UP_WRITER_MCAST, short-seq, fabric OFF): the writer
+//     owns `up` end-to-end — reads from DRAM and multicasts down its N-column on
+//     NoC 1. Bandwidth-optimal but the NoC-1 worker multicast is unsafe next to
+//     the e2e fabric CCL ops, so it is short-seq only.
+//   * writer_split_up (UP_SPLIT, 2D/long-seq, fabric ON): the writer only reads
+//     `up` from DRAM on NoC 1 into the gy=0 sender's cb_in1_up slot (no worker
+//     multicast, no NoC-1 atomics — same kind of NoC-1 traffic as the cb_out
+//     DRAM writes below); the reader multicasts it on NoC 0. A local same-core
+//     handshake (up_go/up_done) orders the two. Fabric-safe.
+// Both feed the fused gate+up compute phase. Per chunk the writer produces all
+// `up` K-blocks, then drains that chunk's `cb_out`.
 
 #include <cstdint>
 
@@ -41,6 +46,10 @@ void kernel_main() {
     const uint32_t up_mcast_ny_end = get_arg_val<uint32_t>(12);
     const uint32_t up_sender_nx = get_arg_val<uint32_t>(13);
     const uint32_t up_sender_ny = get_arg_val<uint32_t>(14);
+    // UP_SPLIT local same-core handshake sems (see reader). up_go: reader ->
+    // writer ("slot reserved, read it"); up_done: writer -> reader ("up landed").
+    const uint32_t up_go_sem_id = get_arg_val<uint32_t>(15);
+    const uint32_t up_done_sem_id = get_arg_val<uint32_t>(16);
 
     constexpr uint32_t cb_out = get_compile_time_arg_val(1);
     constexpr uint32_t per_core_M = get_compile_time_arg_val(2);
@@ -62,11 +71,18 @@ void kernel_main() {
     // destinations past M_tiles_full — we skip those writes here so we
     // don't OOB-write the output buffer.
     constexpr uint32_t M_tiles_full = get_compile_time_arg_val(16);
-    // Two-RISC up-weight read (short-seq only).
-    constexpr uint32_t writer_handles_up = get_compile_time_arg_val(17);
+    // Two-RISC up-weight read.
+    //   writer_mcasts_up (UP_WRITER_MCAST, short-seq): writer reads + NoC-1
+    //     multicasts `up` down its N-column.
+    //   writer_split_up (UP_SPLIT, 2D/long-seq): writer only reads `up` from
+    //     DRAM on NoC 1 into the gy=0 sender's cb_in1_up slot (no worker
+    //     multicast, no NoC-1 atomics), gated by a local handshake; the reader
+    //     multicasts it on NoC 0.
+    constexpr uint32_t writer_mcasts_up = get_compile_time_arg_val(17);
     constexpr uint32_t cb_in1_up = get_compile_time_arg_val(18);
     constexpr uint32_t in0_block_w_gu = get_compile_time_arg_val(19);
     constexpr uint32_t K_gate_tiles = get_compile_time_arg_val(20);
+    constexpr uint32_t writer_split_up = get_compile_time_arg_val(21);
 
     constexpr uint32_t d_out_subblock_num_tiles = d_out_subblock_h * d_out_subblock_w;
     constexpr uint32_t d_in1_num_subblocks_M = per_core_M / d_out_subblock_h;
@@ -74,7 +90,7 @@ void kernel_main() {
     constexpr uint32_t num_blocks_gu = K_gate_tiles / in0_block_w_gu;
     constexpr uint32_t g_in1_block_num_tiles = per_core_N_gu * in0_block_w_gu;
 
-    constexpr uint32_t out_accessor_offset = 21;
+    constexpr uint32_t out_accessor_offset = 22;
     constexpr auto out_args = TensorAccessorArgs<out_accessor_offset>();
     const auto out_acc = TensorAccessor(out_args, output_addr, get_tile_size(cb_out));
 
@@ -128,13 +144,20 @@ void kernel_main() {
         up_mcast_nx_end, up_mcast_ny_end, up_mcast_nx_start, up_mcast_ny_start, up_valid_sem_addr, kUpNoc);
     constexpr uint32_t UP_VALID = 1;
 
+    // UP_SPLIT local handshake (same-core BRISC reader <-> NCRISC writer).
+    volatile tt_l1_ptr uint32_t* up_go_local =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(up_go_sem_id));
+    volatile tt_l1_ptr uint32_t* up_done_local =
+        reinterpret_cast<volatile tt_l1_ptr uint32_t*>(get_semaphore(up_done_sem_id));
+    uint32_t up_seq = 0;
+
     for (uint32_t chunk = 0; chunk < effective_chunks; ++chunk) {
         // ---- Phase 1/2 weight feed: produce cb_in1_up (writer owns `up`) ----
         // Mirrors the reader's `gate` in1 multicast but on the writer's RISC /
         // NoC, so gate and up stream from DRAM concurrently. Runs before the
         // cb_out drain; short-seq is single-chunk so there is no overlap with a
         // later chunk's down output.
-        if constexpr (writer_handles_up) {
+        if constexpr (writer_mcasts_up) {
             // Sender (gy=0) reads its `up` N-column slice on NoC 1 and, when
             // there are column receivers, multicasts it down the column;
             // receivers (gy>0) ack the sender then wait for the block. Mirrors
@@ -202,6 +225,49 @@ void kernel_main() {
                     cb_push_back(cb_in1_up, g_in1_block_num_tiles);
                 }
             }
+        } else if constexpr (writer_split_up) {
+            // UP_SPLIT: only the gy=0 in1-sender cores read `up`. Per K-block:
+            // wait for the reader to reserve the cb_in1_up slot (up_go), read
+            // this column's `up` slice from DRAM on NoC 1 into that slot, then
+            // signal the reader (up_done) to multicast it on NoC 0. No worker
+            // multicast and no NoC-1 atomics here — only a DRAM read on NoC 1
+            // (same kind as the cb_out writes, proven safe under fabric). The
+            // reader owns cb_in1_up reserve/push; the writer only fills bytes.
+            if (is_up_sender) {
+                // The cb_in1_up CB interface (write pointer) is PER-RISC: the
+                // reader owns reserve/push, so the writer's own get_write_ptr
+                // would never advance off slot 0. Replicate the reader's slot
+                // cadence instead: cb_in1_up is double-buffered (2 slots), the
+                // reader pushes exactly one block per K-block, so at global
+                // K-block index (up_seq-1) the live slot is base + parity*slot.
+                constexpr uint32_t kUpNumSlots = 2;
+                const uint32_t up_cb_base = get_write_ptr(cb_in1_up);
+                const uint32_t up_slot_bytes = g_in1_block_num_tiles * up_tile_bytes;
+                for (uint32_t kb = 0; kb < num_blocks_gu; ++kb) {
+                    ++up_seq;
+                    noc_semaphore_wait_min(up_go_local, up_seq);
+                    uint32_t l1_w_up = up_cb_base + ((up_seq - 1) % kUpNumSlots) * up_slot_bytes;
+                    for (uint32_t k = 0; k < in0_block_w_gu; ++k) {
+                        for (uint32_t n = 0; n < per_core_N_gu; ++n) {
+                            const uint32_t row = kb * in0_block_w_gu + k;
+                            const uint32_t col = my_nt_gu * per_core_N_gu + n;
+                            if (col < N_gate_tiles_full) {
+                                const uint32_t tile_idx = row * N_gate_tiles_full + col;
+                                noc_async_read_page(tile_idx, up_acc, l1_w_up, /*offset=*/0, kUpNoc);
+                            } else {
+                                volatile tt_l1_ptr uint64_t* p =
+                                    reinterpret_cast<volatile tt_l1_ptr uint64_t*>(l1_w_up);
+                                for (uint32_t i = 0; i < up_tile_bytes / 8; ++i) {
+                                    p[i] = 0;
+                                }
+                            }
+                            l1_w_up += up_tile_bytes;
+                        }
+                    }
+                    noc_async_read_barrier(kUpNoc);
+                    *up_done_local = up_seq;
+                }
+            }
         }
 
         // ---- Drain cb_out (down matmul output) to DRAM ----
@@ -250,7 +316,12 @@ void kernel_main() {
     // and corrupt/hang it (timing-dependent, only surfaces deep in long
     // multi-expert/multi-layer runs). Mirrors the reader's end-of-kernel
     // noc_async_atomic_barrier for its own valid-sem mcasts.
-    if constexpr (writer_handles_up) {
+    // UP_WRITER_MCAST only: drain the writer's NoC-1 worker multicasts (posted
+    // writes) and valid-sem broadcasts (posted atomics). UP_SPLIT issues only
+    // NoC-1 DRAM reads (already barriered per K-block) and no NoC-1 atomics, so
+    // it needs no NoC-1 drain here — which is exactly why it is safe to run
+    // alongside the e2e fabric CCL traffic on NoC 1.
+    if constexpr (writer_mcasts_up) {
         noc_async_write_barrier(kUpNoc);
         noc_async_atomic_barrier(kUpNoc);
     }

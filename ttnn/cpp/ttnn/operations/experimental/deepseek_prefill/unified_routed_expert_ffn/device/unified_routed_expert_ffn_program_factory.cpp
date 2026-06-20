@@ -343,32 +343,52 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // a turn as sender exactly once per chunk.
     const uint32_t act_ready_sem_id = tt::tt_metal::CreateSemaphore(program, core_range_set, 0);
     const uint32_t act_valid_sem_id = tt::tt_metal::CreateSemaphore(program, core_range_set, 0);
-    // Two-RISC weight read (short-seq). The writer (NCRISC, otherwise idle
-    // until the down output) reads the `up` weight on NoC 1 concurrently with
-    // the reader's NoC-0 `gate` read — a second read engine for the dominant
-    // gate/up weight stream. At GRID_Y > 1 the writer also multicasts `up` down
-    // its N-column (its own ready/valid sem pair, the reader's in1 pair drives
-    // `gate`), so the read is done once and shared — bandwidth-efficient at any
-    // GRID_Y. The NoC-1 multicast rectangle corners are swapped vs NoC 0 (NoC 1
-    // traverses in the opposite direction) — see the writer kernel. At
-    // GRID_Y == 1 there are no receivers so the writer just reads.
-    // Gated to the SHORT-SEQ path by default. Extending it to the 2D/long-seq
-    // path gave ~13-17% on long sequences but was implicated in an intermittent
-    // hang deep in a full 61-layer / 32-chip model run: the writer's NoC-1
-    // weight multicast is a novel dataflow for this kernel and, under sustained
-    // multi-chunk + fabric load, a NoC-1 transaction appears to leak across
-    // program boundaries (NOT reproducible in the single-op test — which passes
-    // both paths — nor in a 6x loop of the multi-chip op test; it needs the full
-    // e2e scale). The writer now drains both its NoC-1 writes and atomics at
-    // exit (see writer kernel) — the candidate fix — but it could not be
-    // validated here. kEnable2DWriterUp opts the 2D/production path back into
-    // the two-RISC read for full-model (multi-chip e2e) evaluation; leave it
-    // false to keep the production 2D path on the original, long-proven
-    // reader-does-gate+up dataflow.
-    constexpr bool kEnable2DWriterUp = false;
-    const bool writer_handles_up = short_seq || kEnable2DWriterUp;
-    const uint32_t up_ready_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
-    const uint32_t up_valid_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
+    // Two-RISC weight read: use the writer (NCRISC, otherwise idle until the
+    // down output) as a SECOND read engine for the dominant gate/up weight
+    // stream — it reads `up` on NoC 1 concurrently with the reader's NoC-0
+    // `gate` read. There are two delivery schemes for the `up` block:
+    //
+    //   * UP_WRITER_MCAST (mode 1): the writer ALSO multicasts `up` down its
+    //     N-column on NoC 1 (its own ready/valid sem pair). Bandwidth-optimal
+    //     (read once, shared). Used on the SHORT-SEQ path only — it runs with
+    //     the fabric DISABLED, so the worker-to-worker NoC-1 multicast is safe.
+    //     On the 2D/production path (fabric ENABLED) this scheme intermittently
+    //     HANGS the full 61-layer / 32-chip e2e: the writer's NoC-1 worker
+    //     multicast + posted atomics collide with the surrounding fabric CCL
+    //     ops (dispatch/combine) that also drive NoC 1 — confirmed (single-op
+    //     and isolated 32-chip op tests pass; only the full e2e with adjacent
+    //     fabric traffic deadlocks).
+    //
+    //   * UP_SPLIT (mode 2): the writer reads `up` from DRAM on NoC 1 (no
+    //     worker multicast, no NoC-1 atomics — identical in kind to the writer's
+    //     existing `cb_out` NoC-1 DRAM writes, which are proven safe under
+    //     fabric) into the gy=0 sender's `cb_in1_up` slot; the READER then
+    //     multicasts that block on NoC 0 alongside `gate` (the long-proven NoC-0
+    //     path). A LOCAL same-core (BRISC<->NCRISC) L1 handshake orders the two
+    //     — no NoC traffic, so any bug reproduces single-chip. This keeps the
+    //     read-overlap win (`up` DRAM read hidden behind `gate`) while adding
+    //     nothing new on NoC 1 beyond a DRAM read. Used on the 2D/long-seq path.
+    //
+    // up_mode: 0 = LEGACY (reader reads + mcasts `up` on NoC 0; writer idle on
+    // up), 1 = UP_WRITER_MCAST, 2 = UP_SPLIT.
+    constexpr bool kEnable2DSplitUp = true;
+    uint32_t up_mode = 0;
+    if (short_seq) {
+        up_mode = 1;
+    } else if (kEnable2DSplitUp) {
+        up_mode = 2;
+    }
+    const bool writer_mcasts_up = (up_mode == 1);                  // writer reads + NoC-1 mcasts up
+    const bool reader_reads_up = (up_mode == 0);                   // reader issues up DRAM read
+    const bool reader_mcasts_up = (up_mode == 0 || up_mode == 2);  // reader NoC-0 mcasts up
+    // NoC-1 column-mcast handshake sems (UP_WRITER_MCAST only).
+    const uint32_t up_ready_sem_id = writer_mcasts_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
+    const uint32_t up_valid_sem_id = writer_mcasts_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
+    // Local same-core BRISC<->NCRISC handshake sems (UP_SPLIT only): up_go
+    // (reader -> writer: cb_in1_up slot reserved, read it) and up_done
+    // (writer -> reader: up block in L1, multicast it). Monotonic counters.
+    const uint32_t up_go_sem_id = (up_mode == 2) ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
+    const uint32_t up_done_sem_id = (up_mode == 2) ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
 
     // -------------------------- circular buffers --------------------------
     // Double-buffered DRAM-streamed inputs.
@@ -501,9 +521,13 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // K_down_tiles_padded — phase-4 K-loop bound. K dim of down is
         // padded to N_gate_padded so per-K-block sender = gx == kb holds.
         K_down_tiles_padded,
-        // reader_handles_up — 0 in the short-seq two-RISC layout (writer owns
-        // `up`); 1 otherwise (reader reads/mcasts both gate and up).
-        static_cast<uint32_t>(!writer_handles_up),
+        // reader_reads_up — 1 only in LEGACY (reader issues the up DRAM read).
+        static_cast<uint32_t>(reader_reads_up),
+        // reader_mcasts_up — 1 in LEGACY and UP_SPLIT (reader NoC-0 mcasts up,
+        // and receivers push it). In UP_SPLIT the block is sourced from the
+        // writer's NoC-1 DRAM read (via the up_done handshake) instead of a
+        // reader DRAM read.
+        static_cast<uint32_t>(reader_mcasts_up),
     };
     tt::tt_metal::TensorAccessorArgs(x_buffer).append_to(reader_ct_args);
     tt::tt_metal::TensorAccessorArgs(gate_buffer).append_to(reader_ct_args);
@@ -545,13 +569,16 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // chunk_M_tiles rows per core, of which only those < M_tiles_full
         // correspond to real output rows in the tensor.
         M_tiles_full,  // 16
-        // Two-RISC up-weight read (short-seq only). When writer_handles_up the
-        // writer reads + multicasts `up` on its own NoC concurrently with the
-        // reader's `gate`. CB / dims needed to replicate the gate read loop.
-        static_cast<uint32_t>(writer_handles_up),  // 17
-        CB_IN1_UP,                                 // 18
-        in0_block_w_gu,                            // 19
-        K_gate_tiles,                              // 20
+        // Two-RISC up-weight read. writer_mcasts_up (UP_WRITER_MCAST): the
+        // writer reads + NoC-1 multicasts `up` (short-seq). writer_split_up
+        // (UP_SPLIT): the writer only reads `up` from DRAM on NoC 1 into the
+        // gy=0 sender's cb_in1_up slot, gated by a local handshake; the reader
+        // multicasts it on NoC 0. CB / dims needed to replicate the gate read.
+        static_cast<uint32_t>(writer_mcasts_up),  // 17
+        CB_IN1_UP,                                // 18
+        in0_block_w_gu,                           // 19
+        K_gate_tiles,                             // 20
+        static_cast<uint32_t>(up_mode == 2),      // 21 writer_split_up
     };
     tt::tt_metal::TensorAccessorArgs(out_buffer).append_to(writer_ct_args);
     // up accessor follows out (always appended for a deterministic offset; the
@@ -749,6 +776,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
             in0_sender_ny,
             act_ready_sem_id,
             act_valid_sem_id,
+            // UP_SPLIT local same-core handshake sems (0 when unused).
+            up_go_sem_id,
+            up_done_sem_id,
         };
         // M-row NoC coord table: for our M-row (gy=my_mt), the NoC (x, y) of
         // each of the GRID_X cores (gx=0..GRID_X-1). Reader uses this per
@@ -784,6 +814,9 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
             in1_mcast_ny_end,
             in1_sender_nx,
             in1_sender_ny,
+            // UP_SPLIT local same-core handshake sems (0 when unused).
+            up_go_sem_id,
+            up_done_sem_id,
         };
         tt::tt_metal::SetRuntimeArgs(program, writer_kernel_id, core, writer_args);
     }
