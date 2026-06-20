@@ -106,23 +106,27 @@ ttnn::Tensor unified_routed_expert_moe(
     // emb) tensor with rows starting at 0. The FFN kernel always reads/writes
     // from row 0 of its inputs; `ttnn::insert` handles placement into the
     // shared output at expert_region_offsets[global_expert_id].
-    // Zero-initialized (not ttnn::empty): only `insert` writes each expert's
-    // valid token rows, so padding rows — tile-aligned slack within a region,
-    // regions of zero-count experts, and the tail of the buffer — would
-    // otherwise keep uninitialized DRAM garbage (incl. NaN/Inf bit patterns).
-    // The torch reference zeros these, and a NaN in padding would corrupt any
-    // downstream masked reduction/combine, so the buffer is zeroed up front.
+    // Uninitialized (ttnn::empty, not zeros/zeros_like): `insert` writes each
+    // expert's ceil_tile(count) rows; the rest of this dispatch-shaped buffer
+    // (zero-count expert regions and, dominant here, the tail of the
+    // capacity-factor-padded buffer — typically the large majority of rows) is
+    // never written. Zeroing it cost a full-buffer device fill of ~capacity_factor
+    // x the live data EVERY layer, purely to keep uninitialized padding clean.
     //
-    // zeros_like (not zeros): dispatched_buffer is a TILE device tensor in a
-    // device-fill-eligible dtype (bf8/bf16/fp32), so zeros_like takes the
-    // on-device ttnn::fill path — no host-side std::vector(volume) + H2D copy
-    // (which plain ttnn::zeros would incur for a large dispatch buffer) and no
-    // device-pointer deref here.
-    auto expert_outputs = ttnn::zeros_like(
-        dispatched_buffer,
-        /*dtype=*/std::nullopt,
-        /*layout=*/std::nullopt,
-        /*device=*/std::nullopt,
+    // That fill is not needed for correctness: every consumer of this buffer is
+    // bounded by expert_token_counts / expert_region_offsets and reads only the
+    // written rows. `combine` reads [offset, offset + ceil_tile(count)) per
+    // expert and zero-inits its own output, so the uninitialized padding (incl.
+    // NaN/Inf DRAM bit patterns) is never read — verified end-to-end by the MoE
+    // PCC test (routed_output / final_output PCC unchanged with empty). The
+    // earlier switch to zeros only silenced an over-broad NaN assert in the op
+    // test that scanned the full buffer including never-read padding; that
+    // assert is now scoped to the written rows (the op's real output contract).
+    auto expert_outputs = ttnn::empty(
+        dispatched_buffer.logical_shape(),
+        dispatched_buffer.dtype(),
+        ttnn::TILE_LAYOUT,
+        dispatched_buffer.device(),
         tt::tt_metal::MemoryConfig{tt::tt_metal::TensorMemoryLayout::INTERLEAVED, tt::tt_metal::BufferType::DRAM});
     for (uint32_t local_expert = 0; local_expert < experts_per_chip; ++local_expert) {
         auto tokens = ttnn::extract(
