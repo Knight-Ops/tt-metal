@@ -12,10 +12,10 @@ CCACHE_SHA256="${CCACHE_SHA256:-508b2a1217dc6e04a23e967c7b95a0fb45d8a7e16fde9e18
 # Remote storage helper for S3-backed ccache (crsh: custom storage protocol).
 # ccache derives the helper name (ccache-storage-s3) from the s3:// URL scheme
 # and looks for it in its libexec_dirs (baked in as /usr/local/libexec below).
-STORAGE_HELPER_VERSION="${STORAGE_HELPER_VERSION:-0.1.4}"
-# SHA256 for ccache-storage-s3-go-0.1.4-linux-amd64.tar.gz
+STORAGE_HELPER_VERSION="${STORAGE_HELPER_VERSION:-0.1.5}"
+# SHA256 for ccache-storage-s3-go-0.1.5-linux-amd64.tar.gz
 # Verified by downloading from GitHub releases and running sha256sum.
-STORAGE_HELPER_SHA256="${STORAGE_HELPER_SHA256:-e2469a2393f16c98177a5492e4c19e0b54067ce0fdcf9be15054c34f68f5d401}"
+STORAGE_HELPER_SHA256="${STORAGE_HELPER_SHA256:-fde6bb135332e093a83f97ca2504311003e8fec225d5d5b5b9d0ce7526059970}"
 
 INSTALL_DIR="${INSTALL_DIR:-/usr/local}"
 DOWNLOAD_URL="https://github.com/ccache/ccache/releases/download/v${CCACHE_VERSION}/ccache-${CCACHE_VERSION}-linux-x86_64-glibc.tar.xz"
