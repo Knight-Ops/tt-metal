@@ -453,6 +453,11 @@ jobs:
           echo "no_proxy=${no_proxy:+${no_proxy},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
           # Enable debug logging from the ccache-storage-s3 helper binary.
           echo "CRSH_LOGFILE=/tmp/ccache-storage-s3.log" >> $GITHUB_ENV
+          # AWS SDK Go v2 (≥1.32) computes CRC32 checksums on every PutObject by default.
+          # Garage uses plain HTTP and ccache's payload arrives as an unseekable stream, so
+          # the SDK can't compute the checksum upfront and fails. "when_required" tells the
+          # SDK to skip checksum computation for regular PUTs.
+          echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> $GITHUB_ENV
 
       - name: Start ccache-storage-s3 helper
         # crsh: is a "connect-only" scheme — ccache does NOT auto-spawn the helper.
