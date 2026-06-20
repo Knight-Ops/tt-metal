@@ -352,16 +352,21 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // GRID_Y. The NoC-1 multicast rectangle corners are swapped vs NoC 0 (NoC 1
     // traverses in the opposite direction) — see the writer kernel. At
     // GRID_Y == 1 there are no receivers so the writer just reads.
-    // Gated to the SHORT-SEQ path only. Extending it to the 2D/long-seq path
-    // (an earlier experiment) gave ~13-17% on long sequences but was implicated
-    // in an intermittent hang deep in a full 61-layer / 32-chip model run: the
-    // writer's NoC-1 weight multicast is a novel dataflow for this kernel and,
-    // under sustained multi-chunk + fabric load, something it does only on the
-    // 2D path leaks across program boundaries (not reproducible in the
-    // single-op test, which passes both paths). Restricting writer-up to
-    // short_seq keeps the production 2D path on the original, long-proven
-    // reader-does-gate+up dataflow while preserving the sub-1k optimization.
-    const bool writer_handles_up = short_seq;
+    // Gated to the SHORT-SEQ path by default. Extending it to the 2D/long-seq
+    // path gave ~13-17% on long sequences but was implicated in an intermittent
+    // hang deep in a full 61-layer / 32-chip model run: the writer's NoC-1
+    // weight multicast is a novel dataflow for this kernel and, under sustained
+    // multi-chunk + fabric load, a NoC-1 transaction appears to leak across
+    // program boundaries (NOT reproducible in the single-op test — which passes
+    // both paths — nor in a 6x loop of the multi-chip op test; it needs the full
+    // e2e scale). The writer now drains both its NoC-1 writes and atomics at
+    // exit (see writer kernel) — the candidate fix — but it could not be
+    // validated here. kEnable2DWriterUp opts the 2D/production path back into
+    // the two-RISC read for full-model (multi-chip e2e) evaluation; leave it
+    // false to keep the production 2D path on the original, long-proven
+    // reader-does-gate+up dataflow.
+    constexpr bool kEnable2DWriterUp = false;
+    const bool writer_handles_up = short_seq || kEnable2DWriterUp;
     const uint32_t up_ready_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
     const uint32_t up_valid_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
 
