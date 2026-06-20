@@ -352,13 +352,16 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     // GRID_Y. The NoC-1 multicast rectangle corners are swapped vs NoC 0 (NoC 1
     // traverses in the opposite direction) — see the writer kernel. At
     // GRID_Y == 1 there are no receivers so the writer just reads.
-    // Enabled for ALL layouts (short-seq and the 2D/long-seq path). On the 2D
-    // path each chunk re-streams the full weights and the reader is the serial
-    // bottleneck; splitting the `up` read onto the writer cuts ~13-17% off long
-    // sequences too (2k 693->612, 25k 8640->7484 us). The writer does its `up`
-    // read+mcast per chunk before draining that chunk's cb_out — the cb_out
-    // drain is small vs the read saved.
-    const bool writer_handles_up = true;
+    // Gated to the SHORT-SEQ path only. Extending it to the 2D/long-seq path
+    // (an earlier experiment) gave ~13-17% on long sequences but was implicated
+    // in an intermittent hang deep in a full 61-layer / 32-chip model run: the
+    // writer's NoC-1 weight multicast is a novel dataflow for this kernel and,
+    // under sustained multi-chunk + fabric load, something it does only on the
+    // 2D path leaks across program boundaries (not reproducible in the
+    // single-op test, which passes both paths). Restricting writer-up to
+    // short_seq keeps the production 2D path on the original, long-proven
+    // reader-does-gate+up dataflow while preserving the sub-1k optimization.
+    const bool writer_handles_up = short_seq;
     const uint32_t up_ready_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
     const uint32_t up_valid_sem_id = writer_handles_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
 
