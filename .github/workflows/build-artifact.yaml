@@ -462,13 +462,18 @@ jobs:
       - name: Verify S3 connectivity (write / read-back / delete)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
         run: |
-          ENDPOINT="http://garage.garage.svc.cluster.local:3900"
-          TEST_KEY="${CCACHE_S3_PREFIX}/.s3-connectivity-test"
+          BASE="http://garage.garage.svc.cluster.local:3900/${CCACHE_S3_BUCKET}/${CCACHE_S3_PREFIX}/.s3-connectivity-test"
           PAYLOAD="ccache-s3-connectivity-ok"
-          echo "${PAYLOAD}" | aws --endpoint-url "${ENDPOINT}" s3 cp - "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}"
-          RESULT=$(aws --endpoint-url "${ENDPOINT}" s3 cp "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}" -)
+          SIGV4="aws:amz:garage:s3"
+          CREDS="${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
+          # PUT
+          echo "${PAYLOAD}" | curl -fsS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
+            "${BASE}" --data-binary @- -o /dev/null
+          # GET and verify
+          RESULT=$(curl -fsS --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}")
           [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '${RESULT}'"; exit 1; }
-          aws --endpoint-url "${ENDPOINT}" s3 rm "s3://${CCACHE_S3_BUCKET}/${TEST_KEY}"
+          # DELETE
+          curl -fsS -X DELETE --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" -o /dev/null
           echo "S3 connectivity verified: write/read-back/delete all OK"
 
       - name: Set artifact name
