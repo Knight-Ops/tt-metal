@@ -5,3 +5,5 @@ bench_reference.csv
 bench_rational_reference.csv
 results.csv
 results.md
+bounds_results.csv
+bounds_phase_diagram.md

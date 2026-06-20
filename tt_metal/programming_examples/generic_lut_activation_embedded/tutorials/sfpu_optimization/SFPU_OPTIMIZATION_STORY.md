@@ -1,286 +1,163 @@
-# Optimizing an SFPU Vector Kernel From Scratch
+# SFPU Vector Kernel Optimization — an Applicability Map
 
-A hands-on, **runnable** walk through optimizing a Tensix SFPU compute kernel — taking a
-piecewise activation evaluator from a naive textbook implementation to a tuned one, one
-change at a time, **measuring the win at every step on real silicon.**
+The usual kernel-optimization writeup is a ladder: "do A, then B, then C, get N× faster."
+That hides the question an engineer actually has: **which optimization applies to *my* kernel,
+and where does it break?** Every SFPU optimization here has a **bound** — almost always the
+register file — and beyond that bound it doesn't just stop helping, it **crashes the compiler.**
 
-Every number below is produced by `./run_tutorial.sh` (Blackhole, fp32, 256-tile shape).
-Each rung is a self-contained kernel that computes the *same* function; the only thing that
-changes between rungs is the one optimization being taught. Correctness is gated at every
-step: a rung's output must match the exact reference, so each speedup is "same answer,
-fewer microseconds."
+So this artifact is a **measured phase diagram**: we sweep the parameter space (optimization ×
+polynomial degree × segment count × parity) on real Blackhole silicon and record, for every
+cell, whether it **compiles** (a register-spill ICE = the frontier), is **correct**, and how
+**fast** it is. The result is a map you can read off: *for degree D, N segments, parity p — use
+this; above here it spills; below here it's not worth it.*
 
-> Regenerate all numbers: `./run_tutorial.sh all`. The benchmark coefficients are a fixed
-> seed (`gen_bench.py`), so results are deterministic.
-
----
-
-## 1. The problem
-
-A piecewise activation evaluator does, per input element:
-1. **Select a segment** — find which interval `[bᵢ, bᵢ₊₁)` the input `x` falls in.
-2. **Evaluate a polynomial** (or rational `P(x)/Q(x)`) for that segment.
-
-On the SFPU this looks simple, but the naive form leaves most of the chip's throughput on
-the floor. We'll fix that in six steps for polynomials and five for rationals.
-
-**The benchmark** (deliberately synthetic, so every optimization is exercised):
-- *Polynomial:* 16 segments, max degree 8, **odd parity** (even coefficients are zero),
-  with **mixed per-segment degree** (some segments need fewer terms).
-- *Rational:* 4 segments, n8d8, **odd numerator / even denominator** (denominator ≈ 1, so
-  it's well-conditioned).
+> Everything is runnable and deterministic:
+> `./run_tutorial.sh all` (the per-optimization rungs) and `./bounds_sweep.sh` +
+> `python3 phase_diagram.py` (the phase diagrams). Fixed-seed benchmark (`gen_bench.py` /
+> `gen_sweep.py`).
 
 ---
 
-## 2. SFPU primer & the cost model
+## 1. The SFPU cost model (why the bounds exist)
 
-The SFPU (Special Function Processor Unit) is the Tensix compute engine for transcendental
-and elementwise math. Three facts drive every optimization here:
+Three hardware facts drive everything:
 
-- **It is 32-lane SIMD.** One `vFloat` holds 32 elements; one `vFloat` FMA does 32
-  multiply-adds. There is *no scalar mode* — the moment you write a `vFloat` Horner step,
-  you're already vectorized. (That's why this tutorial has no "add vectorization" rung — it's
-  free.)
-- **`v_if` / `v_endif` is predicated, not branching.** *All lanes execute both sides* of a
-  `v_if`; the result is masked on write. So a segment cascade `for s: v_if(x >= b[s]) {...}`
-  evaluates **every segment's polynomial for every element**, then keeps the right one. Cost
-  scales with `Σ(segments × degree)`, not `O(degree)`.
-- **The register file is small.** Push too many live `vFloat`s and the compiler's register
-  allocator spills — or, at `-O3 -flto`, *crashes* with a reload ICE. Several optimizations
-  here are bounded by register pressure, not by math.
+- **32-lane SIMD.** One `vFloat` is 32 elements; one FMA does 32 multiply-adds. There's no
+  scalar mode — a `vFloat` Horner step is already vectorized.
+- **`v_if` is predication, not branching.** *All lanes execute both sides*, masked on write. So
+  a segment cascade `for s: v_if(x>=b[s]) {…}` evaluates **every segment's polynomial for every
+  element**. Cost ∝ `Σ(segments × degree)`, independent of which segment an element lands in.
+- **The register file is small.** Hold too many live `vFloat`s and GCC's allocator spills — at
+  `-O3 -flto` it doesn't spill gracefully, it **aborts with a reload ICE**. This is *the* bound
+  on almost every optimization below.
 
-Our headline static metric is the **FMA count** — the number of fused multiply-adds the
-predicated cascade performs per element. Measured device time tracks it, but not perfectly:
-the kernel also pays for segment compares, register moves, and pipeline latency.
+Headline static metric: **live coefficient registers**. That number, not the FMA count,
+decides whether a kernel compiles.
 
----
+## 2. The optimizations (what each does)
 
-## 3. Act I — the polynomial ladder
-
-Baseline P0 is the naive textbook kernel: a runtime loop over segments, and inside each, a
-runtime Horner loop over the coefficients.
-
-```cpp
-for (int d = 0; d < 32; d++) {            // 32 DST rows
-    vFloat x = dst_reg[d];
-    vFloat result = 0.0f;
-    for (uint32_t s = 0; s < NUM_SEGMENTS; s++) {
-        v_if (x >= lut[s]) {
-            vFloat acc = lut[base + DEG];
-            for (int k = DEG - 1; k >= 0; k--) acc = acc * x + lut[base + k];  // runtime Horner
-            result = acc;
-        }
-        v_endif;
-    }
-    dst_reg[d] = result;
-}
-```
-
-| rung | optimization | µs | step | cumulative | FMA |
-|------|--------------|----:|-----:|-----------:|----:|
-| **P0** naive | runtime segment loop + runtime Horner | 85.1 | — | 1.0× | 128 |
-| **P1** unrolled | compile-time template/`constexpr` unroll | 22.4 | 3.79× | **3.79×** | 128 |
-| **P2** dual-eval | 2 DST rows/iter, shared coeff loads (ILP) | 16.9 | 1.33× | 5.03× | 128 |
-| **P3** parity | x²-Horner over odd coeffs (½ the FMAs) | 16.2 | 1.04× | 5.25× | 64 |
-| **P4** adaptive | per-segment effective degree | 15.8 | 1.03× | 5.40× | 56 |
-| **P5** coefficient-blend | cascade *selects* coeffs; one Horner after | 12.4 | 1.27× | **6.83×** | — |
-
-### P1 — compile-time unroll (the dominant win: 3.8×)
-Replacing the runtime loops with template recursion (`if constexpr`, `__attribute__((always_inline))`)
-lets the compiler emit a flat FMA chain with the coefficient indices folded to constants. The
-naive runtime loops paid for loop counters, bounds checks, and — worse — the optimizer
-generating `constprop.isra` spill code it couldn't undo. **Same FMA count (128), 3.8× faster.**
-Lesson: on the SFPU, *loop overhead and spills dominate* a naive kernel far more than the
-arithmetic does.
-
-### P2 — dual-eval (1.33×)
-Process two DST rows per iteration with two independent Horner chains that **share each
-coefficient load**:
-```cpp
-vFloat ck = c[K];      // loaded once
-a0 = a0 * x0 + ck;     // chain 0
-a1 = a1 * x1 + ck;     // chain 1
-```
-The two chains are independent, so the SFPU can keep its pipeline full (instruction-level
-parallelism) instead of stalling on each FMA's latency. Same FMAs, fewer stalls.
-
-### P3 — parity x²-Horner (½ the FMAs)
-The benchmark is odd: `P(x) = x·(c₁ + c₃x² + c₅x⁴ + c₇x⁶)`. Evaluate in the `x²` basis with
-stride-2 coefficients — **half the Horner length** (FMA 128 → 64). But notice the *time*
-barely moves (16.9 → 16.2µs): at this point the kernel is no longer FMA-bound, so halving
-FMAs buys little. **A real lesson in not optimizing the wrong thing.**
-
-> **Why P3 is single-eval, not dual+parity.** Stacking parity on top of P2's dual-eval at
-> degree 8 overflows the SFPU register file and the compiler **crashes** (`-O3 -flto` reload
-> ICE: "maximum number of generated reload insns"). This is the exact register-pressure limit
-> the production kernel guards against. Parity's win is the FMA halving, so it's applied on
-> single-eval.
-
-### P4 — adaptive per-segment degree (1.03×)
-Several segments need fewer terms. Using a per-segment compile-time degree
-(`BENCH_SEGMENT_DEGREES[S]`) skips FMAs on the reducible segments (effective FMA 64 → 56).
-Small here because only some segments shrink — but free, and larger when the fit varies more.
-
-### P5 — coefficient-blend cascade (1.27×, attacks the *dominant* term)
-P1-P4 all left the elephant untouched: the predicated cascade still **runs a full Horner in
-every one of the 16 `v_if`s** (`O(segments × degree)`). P5 breaks that. Each `v_if` now only
-*overwrites* the coefficient registers — cheap predicated moves — and a **single** Horner runs
-*after* the cascade on the blended (winning) coefficients:
-```cpp
-v_if (x >= lut[S]) { c1 = lut[base+1]; c3 = lut[base+3]; c5 = lut[base+5]; c7 = lut[base+7]; }
-v_endif;                                  // 16× cheap MOVES, not 16× Horner
-...
-vFloat acc = c7; acc = acc*t + c5; acc = acc*t + c3; acc = acc*t + c1;  // ONE Horner
-dst_reg[d] = x * acc;
-```
-Work goes from `16 × (Horner)` to `16 × (few moves) + 1 × (Horner)` — it collapses the
-`segments` multiplier that parity and adaptive only nibbled at. **15.8 → 12.4µs (1.27×), and
-6.83× cumulative over naive.** It stays single-eval: blending keeps `degree+1` coefficient
-registers live, so adding dual-eval here re-triggers the register-file ICE. This rung came from
-a *systematic search* (see §6.5) after the hand-built ladder plateaued — a reminder that the
-biggest win was the cost term we'd stopped looking at.
-
----
-
-## 4. Act II — the rational ladder
-
-Rationals add a denominator and a **reciprocal** (Newton-Raphson, ~10 SFPU ops). Baseline R0
-evaluates numerator and denominator Horners and takes a reciprocal *inside every segment's*
-`v_if`.
-
-| rung | optimization | µs | step | cumulative |
-|------|--------------|----:|-----:|-----------:|
-| **R0** naive | per-seg num/den Horner + reciprocal-in-`v_if` | 45.2 | — | 1.0× |
-| **R1** unrolled | compile-time unroll | 13.9 | 3.26× | **3.26×** |
-| **R2** interleaved | num + den Horner in lockstep (ILP) | 12.2 | 1.14× | 3.71× |
-| **R3** parity | x²-Horner: odd num, even den | 10.9 | 1.12× | 4.15× |
-| **R4** deferred reciprocal | ONE reciprocal outside the cascade | 8.8 | 1.24× | **5.16×** |
-
-- **R1 unrolled** — same dominant win as P1 (3.3×): kill loop overhead/spills.
-- **R2 interleaved** — run the numerator and denominator Horner chains in lockstep; they're
-  independent, so ILP hides latency (like dual-eval, but the two chains are num & den).
-- **R3 parity** — odd numerator `P(x)=x·Pₙ(x²)`, even denominator `Q(x²)`; halve both Horners.
-- **R4 deferred reciprocal** — the big rational-specific lesson. Because `v_if` is predicated,
-  a reciprocal *inside* the cascade computes a full Newton-Raphson reciprocal **on all lanes
-  for every segment**. Instead, select `P` and `Q` per segment, then do **one** reciprocal
-  after the cascade (1.24× — and it grows with segment count).
-
-```cpp
-// R4: defer the expensive reciprocal out of the predicated cascade
-vFloat selP = 0.0f, selQ = 1.0f;          // 1.0 default => never divide by zero
-seg<0,...>(lut, x, t, selP, selQ);        // cascade selects P, Q
-dst_reg[d] = selP * sfpu_reciprocal_iter<3>(selQ);   // ONE reciprocal
-```
-
----
-
-## 5. Results at a glance
-
-| | naive | tuned | speedup |
-|---|---:|---:|---:|
-| **Polynomial** (16-seg, deg-8) | 85.1µs | **12.4µs** | **6.8×** |
-| **Rational** (4-seg, n8d8) | 45.2µs | 8.8µs | **5.2×** |
-
-The playbook: **unroll first** (it dwarfs everything), then **fill the pipeline** (dual /
-interleaved), then **cut work** (parity, adaptive, deferred reciprocal), then **attack the
-segment-cascade structure itself** (coefficient-blend, P5) — all while watching register
-pressure. The single biggest lesson: the dominant cost was the *number of segment bodies the
-predicated cascade evaluates*, not the arithmetic inside them — and we only attacked it (P5)
-after a systematic search.
-
----
-
-## 6. When does each optimization apply?
-
-| optimization | applies when | watch out for |
+| name | idea | live-reg cost |
 |---|---|---|
-| Compile-time unroll | always (degrees/segments known at compile time) | code size; but the win is huge |
-| Dual / interleaved (ILP) | independent eval chains exist | uses more registers |
-| Parity x²-Horner | function is odd or even | only valid for true parity; **don't stack on dual at high degree** (register ICE) |
-| Adaptive degree | per-segment fits vary | needs per-segment degree metadata |
-| Deferred reciprocal | rational, multi-segment | keep a safe denominator default (1.0) |
+| **cascade** | per-segment Horner inside each `v_if` (the baseline) | ~1 (acc) |
+| **unroll** | compile-time template Horner (no loop overhead/spills) | same |
+| **dual** | 2 DST rows/iter, independent chains → ILP hides latency | ~2× data regs |
+| **parity** | odd/even function → x²-Horner, half the Horner length | **½ the coeffs** |
+| **adaptive** | per-segment compile-time degree → skip zero coeffs | same |
+| **blend** | cascade *selects* coeffs (moves); ONE Horner after → kills the `×segments` term | **degree+1 coeffs** |
+| **deferred recip** (rational) | one reciprocal after the cascade, not per-segment | — |
 
-The meta-lesson: **measure before and after every change.** Parity halved the FMAs but barely
-moved the clock (not FMA-bound); unroll changed nothing arithmetically but gave 3.8× (it was
-overhead-bound). You cannot tell which is which without the device timer.
+`blend` is the structural win — it's the only one that attacks the dominant `O(segments×degree)`
+term — but it's also the one that pays in **live coefficient registers**, so it's the one the
+register file bounds hardest.
 
----
+## 3. The phase diagram (measured, 256 tiles, fp32, Blackhole)
 
-## 6.5 Beyond the ladder — a discovery search
+Cells are device µs; **`ICE`** = the register-spill compiler crash (the frontier).
 
-Once the hand-built ladder plateaued (P4 = 15.8µs; parity/adaptive each ~1.03×), a systematic
-multi-lens search (segment selection, polynomial-eval algorithm, SFPU ISA, reciprocal, memory/
-dispatch, numerical/precision) — every claim checked against in-tree ISA/LLK source — asked:
-*what cost term are we still not attacking?* The answer was the one the whole ladder left
-intact: the **number of segment bodies the predicated cascade evaluates**. That produced **P5
-(coefficient-blend)** above. The search's honest conclusions:
+**cascade — parity off / on** (the baseline; cheap on registers, fits everywhere, but pays the full `seg×deg`):
 
-- **What's dead:** every FMA-shaving idea (Estrin's scheme, immediate-coefficient Horner,
-  bf16 compute) and every reciprocal micro-optimization. The ladder already proved that lever
-  is exhausted (parity halved FMAs for 1.04×). The kernel is not arithmetic-bound.
-- **What worked:** P5 — attack the cascade *structure*, not the arithmetic.
-- **What hit the wall:** the same blend on the **rational** kernel ICEs — blending an odd
-  numerator and even denominator needs ~9 live coefficient registers at n8d8, overflowing the
-  register file (the recurring limit). Rational stays at R4.
-- **Multi-tile DST batching — tested, negative result.** The search predicted 1.3–1.8× from
-  amortizing the per-tile `acquire`/`copy`/`pack`/CB handshake (batch B tiles per acquire, DST
-  holds 8). Measured: **12.34µs vs 12.45µs — ~1%, inside noise.** At a 256-tile shape this
-  kernel is **not dispatch-bound**; the handshake is already hidden behind the eval. A textbook
-  case of a plausible optimization that the device says doesn't matter here — *measure, don't
-  assume.* (It also required deepening the shared example's circular buffers, so it was reverted.)
-- **SFPLUTFP32 — tested, inapplicable here.** The `lut2` instruction (segment-select + `A·x+B`
-  in one 2-cycle op, segment-count independent) has a 3–6× *ceiling*, but it's a **6-band,
-  degree-1, fp16** approximation on **hardware-fixed |x| magnitude bands**. On our degree-8
-  function that's err ~2000 vs the 1e-2 gate — no contest. It's a genuine fast path for
-  **LUT-moldable activations** (sigmoid/tanh-shaped, low residual degree — which is exactly how
-  production `sigmoid`/`tanh` use it), but **not** a general replacement for arbitrary
-  high-degree piecewise-polynomial eval. Right tool, wrong function.
+| deg\seg | 4 | 16 | 64 | | 4 | 16 | 64 |
+|---|---|---|---|---|---|---|---|
+| **2** | 4.2 | 12.7 | 47.1 | | 3.5 | 8.3 | 29.5 |
+| **4** | 5.5 | 18.0 | 70.9 | | 4.1 | 11.8 | 43.6 |
+| **8** | 8.2 | 28.6 | 134.1 | | 5.3 | 17.1 | 64.9 |
+| **16** | 13.5 | 49.9 | 240.1 | | 7.9 | 27.8 | 125.0 |
 
-Net of the search: **one real win (P5, coefficient-blend, 1.27×)** and two honest negatives
-(rational-blend → register ICE; batching → not dispatch-bound; SFPLUT → wrong function shape).
-The FMA-shaving lever stays dead. That's the value of a disciplined search — it found the one
-lever that mattered *and* killed three plausible-but-wrong ideas before they cost real effort.
+**blend — parity off / on** (the structural win — and its register cliff):
 
-The meta-lesson repeats: **measure to find the binding constraint, then attack *that*** — the
-ladder spent three rungs (parity, adaptive) on a term that wasn't binding before a search found
-the one that was.
+| deg\seg | 4 | 16 | 64 | | 4 | 16 | 64 |
+|---|---|---|---|---|---|---|---|
+| **2** | 3.8 | 10.9 | 40.1 | | 3.3 | 7.2 | 25.7 |
+| **4** | 4.8 | 14.6 | 54.4 | | 3.6 | 9.2 | 33.0 |
+| **6** | **ICE** | **ICE** | **ICE** | | 4.0 | 11.2 | 40.3 |
+| **8** | **ICE** | **ICE** | **ICE** | | 4.5 | 12.9 | 47.4 |
+| **12** | **ICE** | **ICE** | **ICE** | | 5.5 | 16.6 | 61.8 |
+| **16** | **ICE** | **ICE** | **ICE** | | **ICE** | **ICE** | **ICE** |
+
+## 4. The discovered bounds
+
+**Register-ICE frontier** (the smallest degree that spills the file):
+
+| variant | parity off | parity on |
+|---|---|---|
+| cascade | fits to 16 | fits to 16 |
+| dual | fits to 16 | fits to 16 |
+| **blend** | **ICE at degree ≥ 6** (safe ≤ 4) | **ICE at degree ≥ 16** (safe ≤ 12) |
+| blend + dual | ICE at degree ≥ 6 | ICE at degree ≥ 16 |
+
+The mechanism is exactly the live-coefficient count: blend holds `degree+1` coeff registers;
+parity halves that (odd terms only), so it **doubles the degree headroom** (4 → 12). Stacking
+dual on blend doesn't change the frontier (the coeff registers dominate). *This is the bound an
+engineer hits in practice — and why P5/parity blend fit while the non-parity / rational blend
+crashed.*
+
+**Blend break-even** (blend µs vs cascade µs): blend wins for **N ≥ 4 at every fitting degree**,
+and the win **grows with both segments and degree** — from ~1.1× up to **1.55×** (parity, D12,
+N64). The bigger the cascade (`seg×deg`), the more blend's select-then-evaluate saves.
+
+### The decision rule (read straight off the map)
+```
+if function has parity (odd/even):
+    if degree ≤ 12 and segments ≥ 4:  use BLEND  (best; up to 1.55× over cascade)
+    else:                              use CASCADE+parity
+else (no parity):
+    if degree ≤ 4 and segments ≥ 4:   use BLEND
+    else:                              use CASCADE   (blend ICEs at degree ≥ 6)
+dual / blend+dual: not worth the register risk here — ILP gain < the spill risk.
+```
+
+## 5. One path through the map: the fixed-benchmark ladder
+
+Walking a single representative cell (16 seg, deg 8, odd parity) optimization-by-optimization —
+the classic "ladder" view — is just one column of the diagram:
+
+| step | µs | cumulative |
+|---|---|---|
+| naive (runtime loops) | 85.1 | 1.0× |
+| + unroll | 22.4 | 3.8× |
+| + dual | 16.9 | 5.0× |
+| + parity | 16.2 | 5.3× |
+| + adaptive | 15.8 | 5.4× |
+| **+ blend** | **12.4** | **6.8×** |
+
+Lessons the ladder alone would mislead you on, but the map makes obvious:
+- **Unroll is the giant** (3.8×): a naive SFPU kernel is overhead/spill-bound, not arithmetic-bound.
+- **Parity/adaptive barely move the clock** (~1.03× each) — the kernel isn't FMA-bound; halving
+  FMAs is the wrong lever. (Their real value, the map shows, is **register headroom for blend**.)
+- **Blend is the structural win** — and only because parity kept it under the ICE frontier.
+
+Rational is the analogous story (45.2 → 8.8µs, 5.2×): unroll → interleaved num/den → parity →
+deferred reciprocal. Rational *blend* ICEs (numerator-odd + denominator-even = 9 live coeffs).
+
+## 6. What does NOT help (measured negatives)
+
+- **FMA-shaving** (Estrin, immediate-Horner, bf16-compute): dead. The map shows the kernel is
+  cascade/register-bound, not arithmetic-bound — parity already proved halving FMAs buys ~3%.
+- **Multi-tile DST batching**: predicted 1.3–1.8×, measured **~1%** — at 256 tiles the kernel is
+  not dispatch-bound; the handshake is already hidden behind the eval.
+- **SFPLUTFP32 hardware LUT**: a 6-band, degree-1, fp16, hardware-fixed-boundary instruction —
+  err ~2000 on a degree-8 function. A genuine fast path for LUT-moldable activations
+  (sigmoid/tanh), **not** a general piecewise-poly replacement.
 
 ## 7. Relationship to the production kernel
 
-**These rungs are a teaching model, not the shipping kernel.** Each rung is a deliberately
-minimal kernel that isolates one idea on one fixed benchmark. The production evaluators —
-`kernels/compute/piecewise_generic_specialized.cpp` (polynomial) and
-`piecewise_rational_specialized.cpp` (rational) — are the *superset*: they combine **all** of
-these techniques in a single templated kernel and add machinery this tutorial omits on
-purpose (range reduction / Cody-Waite, asymptotic factoring, fp32 vs bf16 paths, the full
-dispatcher).
-
-What *is* identical is the optimization set and the key tradeoff:
-
-| technique (taught here) | in production? |
-|---|---|
-| recursive template unroll (`always_inline`) | ✅ `unroll_segment` / `unroll_segment_rational` |
-| dual-eval (poly) / interleaved num·den (rational) | ✅ |
-| parity x²-Horner | ✅ |
-| adaptive per-segment degree | ✅ `SEGMENT_DEGREES[]` |
-| deferred reciprocal (rational) | ✅ |
-| **parity not stacked on dual at high degree** (register-file limit) | ✅ the `POLY_DEGREE > 4` single-eval fallback in the production dispatcher |
-
-So this artifact faithfully shows **how the production kernel earns its speed** and reproduces
-its real register-pressure decision — but the rung files are pedagogical reimplementations,
-**not** drop-in replacements for the production kernel.
+These rungs are a **teaching model**, not the shipping kernel. Production
+(`piecewise_generic_specialized.cpp`, `piecewise_rational_specialized.cpp`) combines all the
+*winning* techniques plus range reduction, asymptotic factoring, and dtype paths — and it
+already carries the same register-frontier guard the map quantifies (e.g. parity not stacked on
+dual at high degree). The map tells you **which technique to switch on for a given fit, and where
+it will spill** — directly useful for tuning the production kernel per activation.
 
 ## 8. Reproduce
 
 ```bash
 cd $TT_METAL_HOME/tt_metal/programming_examples/generic_lut_activation_embedded/tutorials/sfpu_optimization
-./run_tutorial.sh all      # builds + profiles + correctness-checks every rung -> results.csv
+./run_tutorial.sh all          # the per-optimization rungs on the fixed benchmark
+./bounds_sweep.sh              # the full phase-diagram grid (device-serial)
+python3 phase_diagram.py       # render bounds_phase_diagram.md
 ```
+- `gen_bench.py` / `gen_sweep.py` — deterministic benchmark + per-cell kernel generation.
+- `kernels/compute/p*.cpp`, `r*.cpp` — the optimization rungs (one idea each).
+- `lib/score.py`, `lib/static_analysis.py` — correctness gate + FMA/register accounting.
 
-- `gen_bench.py` — fixed-seed benchmark coefficients + exact reference.
-- `kernels/compute/p*.cpp`, `r*.cpp` — the rungs (each differs only in the eval body).
-- `run_tutorial.sh` — swaps each rung into the adhoc kernel slot, builds, profiles under
-  Tracy (3 runs, min), checks output against the exact reference, records `results.csv`.
-- `lib/score.py`, `lib/static_analysis.py` — correctness + FMA accounting.
-
-Prerequisites are the example's standard build (see the parent `README.md` → "Setup & Build").
+Build prerequisites: the example's standard build (parent `README.md` → "Setup & Build").
