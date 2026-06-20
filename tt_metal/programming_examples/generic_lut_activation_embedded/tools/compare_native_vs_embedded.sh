@@ -120,7 +120,7 @@ run_one() {
     [[ -f "$pcsv" ]] && nat_us="$(extract_profiler_compute_time "$pcsv" "$WORK_DIR")"
   fi
 
-  printf '%-14s %-5s | NATIVE MaxULP %-12s us %-9s | OURS MaxULP %-12s us %-9s | range [%s,%s] %dt\n' \
+  printf '%-14s %-5s | NATIVE MaxULP %-12s %-9s | OURS MaxULP %-12s %-9s | range [%s,%s] %dt\n' \
     "$ACTIVATION" "$prec" "$nat_ulp" "${nat_us}us" "$ours_ulp" "$ours_prof" "${lo:-?}" "${hi:-?}" "$TILES"
 }
 
