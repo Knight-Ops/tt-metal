@@ -163,7 +163,7 @@ inline void piecewise_generic_lut_specialized_N(const std::array<float, LUT_SIZE
             const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
 
             // Convert biased exponent to float and debias: e_float = biased - 127
-            vFloat e_float = int32_to_float(cbrt_biased_e, 0) - 127.0f;
+            vFloat e_float = int32_to_float(cbrt_biased_e, RoundMode::Nearest) - 127.0f;
 
             // q_float ≈ e/3, then round to nearest integer
             vFloat q_approx = e_float * ONE_THIRD_C;
@@ -393,7 +393,7 @@ inline void piecewise_generic_lut_specialized_N_dual(const std::array<float, LUT
             vInt s1 = reinterpret<vInt>(tmp1) & 0x80000000;
             constexpr float OT = 0.3333333333333333f;
             const vFloat mag = ckernel::sfpu::Converter::as_float(0x4B400000U);
-            vFloat ef1 = int32_to_float(be1, 0) - 127.0f;
+            vFloat ef1 = int32_to_float(be1, RoundMode::Nearest) - 127.0f;
             vFloat qr1 = ef1 * OT + mag;
             vInt q1 = reinterpret<vInt>(qr1) - reinterpret<vInt>(mag);
             vFloat qb1 = qr1 - mag;
@@ -410,7 +410,7 @@ inline void piecewise_generic_lut_specialized_N_dual(const std::array<float, LUT
             vInt s2 = reinterpret<vInt>(tmp2) & 0x80000000;
             constexpr float OT = 0.3333333333333333f;
             const vFloat mag = ckernel::sfpu::Converter::as_float(0x4B400000U);
-            vFloat ef2 = int32_to_float(be2, 0) - 127.0f;
+            vFloat ef2 = int32_to_float(be2, RoundMode::Nearest) - 127.0f;
             vFloat qr2 = ef2 * OT + mag;
             vInt q2 = reinterpret<vInt>(qr2) - reinterpret<vInt>(mag);
             vFloat qb2 = qr2 - mag;
@@ -492,9 +492,19 @@ inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lu
     // Fall back to single-eval when any range reduction is active.
     #if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_LOG) || defined(RANGE_REDUCTION_CBRT)
     piecewise_generic_lut_specialized_N<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
-    #else
+#elif defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN)
+    // Parity x²-Horner threads x² through BOTH dual lanes; at higher degree the combined
+    // live-register count overflows the SFPU register file and crashes GCC's reload pass
+    // (ICE: "maximum number of generated reload insns"). Fall back to single-eval for
+    // high-degree parity; low-degree parity (<=4) still fits and keeps the dual-eval win.
+    if constexpr (POLY_DEGREE > 4) {
+        piecewise_generic_lut_specialized_N<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
+    } else {
+        piecewise_generic_lut_specialized_N_dual<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
+    }
+#else
     piecewise_generic_lut_specialized_N_dual<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
-    #endif
+#endif
 #else
     piecewise_generic_lut_specialized_N<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
 #endif

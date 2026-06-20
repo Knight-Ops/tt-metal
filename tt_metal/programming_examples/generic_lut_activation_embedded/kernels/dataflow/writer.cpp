@@ -15,9 +15,6 @@ void kernel_main() {
     constexpr auto out_args = TensorAccessorArgs<0>();
     const auto out_accessor = TensorAccessor(out_args, out_addr, tile_size_bytes);
 
-    // Debug print (enable with TT_METAL_DPRINT_CORES)
-    DPRINT << "Writer: start_tile=" << start_tile_id << " n_tiles=" << n_tiles << ENDL();
-
     for (uint32_t i = 0; i < n_tiles; i++) {
         cb_wait_front(cb_out, 1);
         uint32_t cb_addr = get_read_ptr(cb_out);

@@ -140,7 +140,7 @@ inline vFloat tan_expand(vFloat poly_result, vInt j_int) {
     v_if(j_int & 1) {
         // j is odd: result = -1/poly(a)
         // Use 3 Newton-Raphson iterations for better precision (vs 2 in sfpu_reciprocal<false>)
-        poly_result = -ckernel::sfpu::_sfpu_reciprocal_<3>(poly_result);
+        poly_result = -ckernel::sfpu::sfpu_reciprocal_iter<3>(poly_result);
     }
     v_endif;
     return poly_result;
@@ -179,7 +179,7 @@ inline vFloat log_expand(vFloat poly_result, vInt e_int) {
         e_int = setsgn(~e_int + 1, 1);
     }
     v_endif;
-    vFloat e_float = int32_to_float(e_int, 0);
+    vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
     return e_float * EXPAND_C + poly_result;
 }
 #endif
@@ -498,7 +498,7 @@ inline vFloat eval_polynomial_parity(const float* coeffs, vFloat x, vFloat x2) {
     constexpr int TOP = (DEGREE % 2 == 1) ? DEGREE : DEGREE - 1;
     constexpr int STEPS = (TOP - 1) / 2;  // number of FMA steps after init
     vFloat result = coeffs[TOP];
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= STEPS; k++)
         result = result * x2 + coeffs[TOP - 2 * k];
     return result * x;  // final *x for odd parity
@@ -511,7 +511,7 @@ inline vFloat eval_polynomial_parity(const float* coeffs, vFloat x, vFloat x2) {
     constexpr int TOP = (DEGREE % 2 == 0) ? DEGREE : DEGREE - 1;
     constexpr int STEPS = TOP / 2;  // number of FMA steps after init
     vFloat result = coeffs[TOP];
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= STEPS; k++)
         result = result * x2 + coeffs[TOP - 2 * k];
     return result;
@@ -713,7 +713,7 @@ inline void eval_polynomial_dual_parity(const float* coeffs,
     constexpr int TOP = (DEGREE % 2 == 1) ? DEGREE : DEGREE - 1;
     constexpr int STEPS = (TOP - 1) / 2;
     { vFloat c = coeffs[TOP]; result1 = c; result2 = c; }
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= STEPS; k++) {
         vFloat c = coeffs[TOP - 2 * k];
         result1 = result1 * x1_sq + c;
@@ -730,7 +730,7 @@ inline void eval_polynomial_dual_parity(const float* coeffs,
     constexpr int TOP = (DEGREE % 2 == 0) ? DEGREE : DEGREE - 1;
     constexpr int STEPS = TOP / 2;
     { vFloat c = coeffs[TOP]; result1 = c; result2 = c; }
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= STEPS; k++) {
         vFloat c = coeffs[TOP - 2 * k];
         result1 = result1 * x1_sq + c;
@@ -844,7 +844,7 @@ inline void piecewise_generic_lut(const std::array<float, LUT_SIZE>& lut) {
             const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
 
             // Convert biased exponent to float and debias: e_float = biased - 127
-            vFloat e_float = int32_to_float(cbrt_biased_e, 0) - 127.0f;
+            vFloat e_float = int32_to_float(cbrt_biased_e, RoundMode::Nearest) - 127.0f;
 
             // q_float ≈ e/3, then round to nearest integer
             vFloat q_approx = e_float * ONE_THIRD_C;
@@ -1014,7 +1014,7 @@ inline void piecewise_generic_lut_dual(const std::array<float, LUT_SIZE>& lut) {
             const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
 
             // Result 1
-            vFloat e_float1 = int32_to_float(cbrt_biased_e1, 0) - 127.0f;
+            vFloat e_float1 = int32_to_float(cbrt_biased_e1, RoundMode::Nearest) - 127.0f;
             vFloat q_approx1 = e_float1 * ONE_THIRD_C;
             vFloat q_rounded1 = q_approx1 + magic;
             vInt q1 = reinterpret<vInt>(q_rounded1) - reinterpret<vInt>(magic);
@@ -1028,7 +1028,7 @@ inline void piecewise_generic_lut_dual(const std::array<float, LUT_SIZE>& lut) {
             v_endif;
 
             // Result 2
-            vFloat e_float2 = int32_to_float(cbrt_biased_e2, 0) - 127.0f;
+            vFloat e_float2 = int32_to_float(cbrt_biased_e2, RoundMode::Nearest) - 127.0f;
             vFloat q_approx2 = e_float2 * ONE_THIRD_C;
             vFloat q_rounded2 = q_approx2 + magic;
             vInt q2 = reinterpret<vInt>(q_rounded2) - reinterpret<vInt>(magic);

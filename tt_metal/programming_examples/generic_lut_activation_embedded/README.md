@@ -4,6 +4,89 @@
 
 Comprehensive implementation and benchmarking of activation functions on Tenstorrent hardware using piecewise polynomial approximation methods: Piecewise Constant (PC), Piecewise Linear (PL), Piecewise Quadratic (PQ), Piecewise Quadratic Remez (PQR), and Piecewise Cubic Remez (PCR).
 
+## Setup & Build (from a clean checkout)
+
+These are the exact steps required to build and run this example against current `tt-metal` HEAD. A clean checkout does **not** build out of the box — the steps below were verified on Blackhole (also applies to Wormhole).
+
+### 1. Prerequisites
+- A Tenstorrent device (Wormhole B0 or Blackhole). The build auto-detects the arch from silicon — `ARCH_NAME` is informational only.
+- The **`tt-polynomial-fitter`** repo checked out (provides coefficient CSVs and `extract_accuracy.py` for ground-truth/ULP). Default location: `/localdev/<user>/tt-polynomial-fitter`. Override with `TT_POLY_FIT_DIR`.
+- **System Python with `numpy`** (for `extract_accuracy.py` and `best_all.py`). The accuracy scripts use `/usr/bin/python3` on purpose — `python_env`'s torch has broken BF16 ULP spacing.
+
+### 2. Wire the example into the build (REQUIRED — not done by default)
+Neither `generic_lut_activation` nor `generic_lut_activation_embedded` is registered in the programming-examples CMake tree, so the targets don't exist until you add them. In `tt_metal/programming_examples/CMakeLists.txt`, alongside the other `add_subdirectory(...)` lines:
+
+```cmake
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/generic_lut_activation)
+add_subdirectory(${CMAKE_CURRENT_SOURCE_DIR}/generic_lut_activation_embedded)
+```
+
+### 3. Configure & build the adhoc target
+Programming examples are off by default; the device profiler (Tracy) is required for `run_csv.sh` timing (it's on by default in `build_metal.sh`).
+
+```bash
+cd $TT_METAL_HOME
+# Enable programming examples (Tracy/ENABLE_TRACY is already ON in a default build)
+cmake -DBUILD_PROGRAMMING_EXAMPLES=ON build_Release
+# Build only the adhoc target used by run_csv.sh
+ninja -C build_Release programming_examples_generic_lut_activation_embedded_adhoc
+```
+The binary lands at `build_Release/programming_examples/programming_examples_generic_lut_activation_embedded_adhoc`.
+
+### 4. Kernel compatibility fixes for current tt-metal HEAD
+The compute/dataflow kernels were written against an older `tt-metal` + SFPI toolchain. Building against current HEAD requires these (already applied in this branch — listed so the drift is documented):
+
+| File | Old (broken) | New (current API) |
+|------|--------------|-------------------|
+| `kernels/dataflow/reader.cpp`, `writer.cpp` | `DPRINT << x << ENDL()` (now a hard `static_assert`) | removed the debug-print lines |
+| `kernels/compute/piecewise_generic.cpp`, `piecewise_rational.cpp` | bare `#pragma unroll` (`-Werror=unknown-pragmas`) | `#pragma GCC unroll 16` |
+| `kernels/compute/piecewise_generic.cpp` | `_sfpu_reciprocal_<3>(x)` | `sfpu_reciprocal_iter<3>(x)` |
+| `piecewise_generic.cpp`, `piecewise_rational.cpp`, `piecewise_generic_specialized.cpp` | `int32_to_float(x, 0)` | `int32_to_float(x, RoundMode::Nearest)` |
+| `kernels/compute/piecewise_generic_specialized.cpp` (dispatcher) | parity x²-Horner + dual-eval at high degree → GCC `-O3 -flto` register-reload **ICE** | fall back to single-eval for `POLY_PARITY_* && POLY_DEGREE > 4` |
+
+> JIT does not track ckernel-header changes — after editing shared headers, `rm -rf ~/.cache/tt-metal-cache` to force recompilation.
+
+### 5. Run a coefficient CSV on silicon
+Run from the **repo root** (the binary resolves soc descriptors relative to cwd):
+
+```bash
+export TT_POLY_FIT_DIR=/localdev/<user>/tt-polynomial-fitter
+cd tt_metal/programming_examples/generic_lut_activation_embedded
+./run_csv.sh $TT_POLY_FIT_DIR/data/coefficients/<activation>_<cfg>.csv \
+    --activation <name> --precision fp32 --tiles 256 --runs 1
+```
+`run_csv.sh` auto-detects degree/segments/range/range-reduction from the CSV, JIT-compiles the kernel, runs 5 standard shapes (or `--tiles N` for one), and reports MAE / MaxErr / MaxULP / MeanULP + Tracy timing.
+
+### 6. (Optional) Compare against TTNN native
+Both comparison tools need a TTNN Python env:
+```bash
+cd $TT_METAL_HOME
+./create_venv.sh           # builds python_env with ttnn (required for native ttnn.<op>)
+```
+
+**Recommended — safe two-way (native vs ours), no header surgery:**
+`tools/compare_native_vs_embedded.sh` runs `ttnn.<activation>` (native) and our embedded LUT kernel (`run_csv.sh`) over the **same** input range and reports MAE + MaxULP for both, plus the embedded Tracy kernel time. It never touches `tt_metal/hw/ckernels`, so it is safe on stock activations.
+```bash
+export TT_POLY_FIT_DIR=/localdev/<user>/tt-polynomial-fitter
+cd tt_metal/programming_examples/generic_lut_activation_embedded
+./tools/compare_native_vs_embedded.sh --activation tanh \
+    --csv $TT_POLY_FIT_DIR/data/coefficients/tanh_n8d8_s1_uniform_rational_ulp.csv \
+    --precision both
+# Batch: loop over an "act,prec,csvname" worklist, calling the script per line.
+```
+
+**Full three-way (native vs drop-in vs embedded):** `tools/compare_three_way.sh`.
+> ⚠️ `compare_three_way.sh` assumes a drop-in header has **already been applied** for the activation (via `apply_dropin.sh`). To measure the "original" baseline it *deletes* `ckernel_sfpu_<act>.h` expecting a composite-op fallback — on a stock activation whose header is the real git-tracked one, this **deletes the real header and breaks the build**. Apply the drop-in first, or use `compare_native_vs_embedded.sh` instead.
+
+### 7. (Optional) Regenerate best.csv coefficient index
+`best.csv` in `tt-polynomial-fitter` can be stale/inconsistent with `data/coefficients/`. Regenerate over the current coefficient set (needs `numpy`):
+
+```bash
+cd $TT_POLY_FIT_DIR
+./best_all.sh --input-dir data/coefficients --output-dir .
+```
+> Caveat: coefficient files carry embedded accuracy metadata that has been observed to be fabricated/cloned across degrees for some families (e.g. `log_*_s128`). Trust on-silicon measurement over both the file metadata and the `best.csv` claim.
+
 ## Overview
 
 This example provides five LUT-based methods for computing activation functions on Tenstorrent accelerators:

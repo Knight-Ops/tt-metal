@@ -135,7 +135,7 @@ inline vFloat log_expand(vFloat poly_result, vInt e_int) {
         e_int = setsgn(~e_int + 1, 1);
     }
     v_endif;
-    vFloat e_float = int32_to_float(e_int, 0);
+    vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
     return e_float * EXPAND_C + poly_result;
 }
 #endif
@@ -224,13 +224,13 @@ inline vFloat eval_rational_interleaved(const float* num_coeffs, const float* de
     // This keeps the interleaved loop symmetric.
     if constexpr (NUM_DEGREE > DEN_DEGREE) {
         // Numerator has extra high-degree terms
-        #pragma unroll
+#pragma GCC unroll 16
         for (int i = NUM_DEGREE - 1; i >= static_cast<int>(DEN_DEGREE); i--) {
             numer = numer * x + num_coeffs[i];
         }
     } else if constexpr (DEN_DEGREE > NUM_DEGREE) {
         // Denominator has extra high-degree terms
-        #pragma unroll
+#pragma GCC unroll 16
         for (int i = DEN_DEGREE - 1; i >= static_cast<int>(NUM_DEGREE); i--) {
             denom = denom * x + den_coeffs[i];
         }
@@ -238,7 +238,7 @@ inline vFloat eval_rational_interleaved(const float* num_coeffs, const float* de
 
     // Interleaved Horner: both chains step down in lockstep.
     // Back-to-back SFPMADs on independent chains hide pipeline latency.
-    #pragma unroll
+#pragma GCC unroll 16
     for (int i = MIN_DEG - 1; i >= 0; i--) {
         numer = numer * x + num_coeffs[i];
         denom = denom * x + den_coeffs[i];
@@ -260,16 +260,16 @@ inline void eval_rational_interleaved_numer_denom(const float* num_coeffs, const
     vFloat denom = den_coeffs[DEN_DEGREE];
 
     if constexpr (NUM_DEGREE > DEN_DEGREE) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int i = NUM_DEGREE - 1; i >= static_cast<int>(DEN_DEGREE); i--)
             numer = numer * x + num_coeffs[i];
     } else if constexpr (DEN_DEGREE > NUM_DEGREE) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int i = DEN_DEGREE - 1; i >= static_cast<int>(NUM_DEGREE); i--)
             denom = denom * x + den_coeffs[i];
     }
 
-    #pragma unroll
+#pragma GCC unroll 16
     for (int i = MIN_DEG - 1; i >= 0; i--) {
         numer = numer * x + num_coeffs[i];
         denom = denom * x + den_coeffs[i];
@@ -308,12 +308,12 @@ inline vFloat eval_rational_parity(const float* num_coeffs, const float* den_coe
 
     // Drain the chain with more steps (keeps interleaved loop symmetric)
     if constexpr (NUM_STEPS > DEN_STEPS) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int k = 0; k < NUM_STEPS - DEN_STEPS; k++) {
             numer = numer * x2 + num_coeffs[NUM_TOP - 2 * (k + 1)];
         }
     } else if constexpr (DEN_STEPS > NUM_STEPS) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int k = 0; k < DEN_STEPS - NUM_STEPS; k++) {
             denom = denom * x2 + den_coeffs[DEN_TOP - 2 * (k + 1)];
         }
@@ -325,7 +325,7 @@ inline vFloat eval_rational_parity(const float* num_coeffs, const float* den_coe
     constexpr int DEN_POS = DEN_TOP - 2 * ((DEN_STEPS > NUM_STEPS) ? (DEN_STEPS - NUM_STEPS) : 0);
 
     // Interleaved Horner in x²: back-to-back SFPMADs on independent chains
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= MIN_STEPS; k++) {
         numer = numer * x2 + num_coeffs[NUM_POS - 2 * k];
         denom = denom * x2 + den_coeffs[DEN_POS - 2 * k];
@@ -351,11 +351,11 @@ inline void eval_rational_parity_numer_denom(const float* num_coeffs, const floa
     vFloat denom = den_coeffs[DEN_TOP];
 
     if constexpr (NUM_STEPS > DEN_STEPS) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int k = 0; k < NUM_STEPS - DEN_STEPS; k++)
             numer = numer * x2 + num_coeffs[NUM_TOP - 2 * (k + 1)];
     } else if constexpr (DEN_STEPS > NUM_STEPS) {
-        #pragma unroll
+#pragma GCC unroll 16
         for (int k = 0; k < DEN_STEPS - NUM_STEPS; k++)
             denom = denom * x2 + den_coeffs[DEN_TOP - 2 * (k + 1)];
     }
@@ -364,7 +364,7 @@ inline void eval_rational_parity_numer_denom(const float* num_coeffs, const floa
     constexpr int NUM_POS = NUM_TOP - 2 * ((NUM_STEPS > DEN_STEPS) ? (NUM_STEPS - DEN_STEPS) : 0);
     constexpr int DEN_POS = DEN_TOP - 2 * ((DEN_STEPS > NUM_STEPS) ? (DEN_STEPS - NUM_STEPS) : 0);
 
-    #pragma unroll
+#pragma GCC unroll 16
     for (int k = 1; k <= MIN_STEPS; k++) {
         numer = numer * x2 + num_coeffs[NUM_POS - 2 * k];
         denom = denom * x2 + den_coeffs[DEN_POS - 2 * k];
@@ -391,11 +391,11 @@ inline vFloat eval_rational_jit(const float* num_coeffs, const float* den_coeffs
     // Only unroll for high degrees where loop overhead matters more than register pressure
 #if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG)    // With range reduction: disable unroll for degrees < 10 to avoid register spills
     #if (DEN_DEGREE >= 10)
-    #pragma unroll
-    #endif
+#pragma GCC unroll 16
+#endif
 #else
     // Without range reduction: safe to unroll at all degrees
-    #pragma unroll
+#pragma GCC unroll 16
 #endif
     for (int i = DEN_DEGREE - 1; i >= 0; i--) {
         coeff = den_coeffs[i];  // Reuse register - previous value no longer needed
@@ -412,11 +412,11 @@ inline vFloat eval_rational_jit(const float* num_coeffs, const float* den_coeffs
 
 #if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG)    // With range reduction: disable unroll for degrees < 10 to avoid register spills
     #if (NUM_DEGREE >= 10)
-    #pragma unroll
-    #endif
+#pragma GCC unroll 16
+#endif
 #else
     // Without range reduction: safe to unroll at all degrees
-    #pragma unroll
+#pragma GCC unroll 16
 #endif
     for (int i = NUM_DEGREE - 1; i >= 0; i--) {
         coeff = num_coeffs[i];  // Reuse register
