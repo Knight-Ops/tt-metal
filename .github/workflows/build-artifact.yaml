@@ -458,6 +458,9 @@ jobs:
           # the SDK can't compute the checksum upfront and fails. "when_required" tells the
           # SDK to skip checksum computation for regular PUTs.
           echo "AWS_REQUEST_CHECKSUM_CALCULATION=when_required" >> $GITHUB_ENV
+          # Explicit Garage endpoint as an AWS SDK env var fallback. The helper reads this
+          # if ccache does not forward |endpoint_url=... as CRSH_ATTR_* (defensive belt-and-suspenders).
+          echo "AWS_ENDPOINT_URL_S3=http://garage.garage.svc.cluster.local:3900" >> $GITHUB_ENV
 
       - name: Verify S3 connectivity (write / read-back / delete)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
@@ -644,11 +647,17 @@ jobs:
           fi
 
           # Publish ccache-storage-s3 helper debug log (set via CRSH_LOGFILE).
+          # Show first 30 lines (startup: version, bucket, CRSH_NUM_ATTR, Attribute: lines)
+          # and last 80 lines (recent activity / errors) so both ends are visible.
           if [ -f /tmp/ccache-storage-s3.log ]; then
-            echo "=== ccache-storage-s3 log ==="
-            tail -100 /tmp/ccache-storage-s3.log
+            echo "=== ccache-storage-s3 log (first 30 lines) ==="
+            head -30 /tmp/ccache-storage-s3.log
+            echo "=== ccache-storage-s3 log (last 80 lines) ==="
+            tail -80 /tmp/ccache-storage-s3.log
             echo '## CCache Storage Helper Log' >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
+            head -30 /tmp/ccache-storage-s3.log >> $GITHUB_STEP_SUMMARY
+            echo '--- (last 200 lines) ---' >> $GITHUB_STEP_SUMMARY
             tail -200 /tmp/ccache-storage-s3.log >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
           else
