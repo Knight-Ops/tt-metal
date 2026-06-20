@@ -183,7 +183,32 @@ overhead-bound). You cannot tell which is which without the device timer.
 
 ---
 
-## 7. Reproduce
+## 7. Relationship to the production kernel
+
+**These rungs are a teaching model, not the shipping kernel.** Each rung is a deliberately
+minimal kernel that isolates one idea on one fixed benchmark. The production evaluators —
+`kernels/compute/piecewise_generic_specialized.cpp` (polynomial) and
+`piecewise_rational_specialized.cpp` (rational) — are the *superset*: they combine **all** of
+these techniques in a single templated kernel and add machinery this tutorial omits on
+purpose (range reduction / Cody-Waite, asymptotic factoring, fp32 vs bf16 paths, the full
+dispatcher).
+
+What *is* identical is the optimization set and the key tradeoff:
+
+| technique (taught here) | in production? |
+|---|---|
+| recursive template unroll (`always_inline`) | ✅ `unroll_segment` / `unroll_segment_rational` |
+| dual-eval (poly) / interleaved num·den (rational) | ✅ |
+| parity x²-Horner | ✅ |
+| adaptive per-segment degree | ✅ `SEGMENT_DEGREES[]` |
+| deferred reciprocal (rational) | ✅ |
+| **parity not stacked on dual at high degree** (register-file limit) | ✅ the `POLY_DEGREE > 4` single-eval fallback in the production dispatcher |
+
+So this artifact faithfully shows **how the production kernel earns its speed** and reproduces
+its real register-pressure decision — but the rung files are pedagogical reimplementations,
+**not** drop-in replacements for the production kernel.
+
+## 8. Reproduce
 
 ```bash
 cd $TT_METAL_HOME/tt_metal/programming_examples/generic_lut_activation_embedded/tutorials/sfpu_optimization
