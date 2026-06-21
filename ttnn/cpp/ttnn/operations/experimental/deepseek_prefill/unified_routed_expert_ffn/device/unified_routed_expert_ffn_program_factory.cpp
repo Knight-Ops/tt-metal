@@ -329,16 +329,14 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     //     slot; the reader multicasts it on NoC 0 alongside `gate`. A local
     //     same-core L1 handshake orders the two. Used on all layouts.
     //
-    // up_mode: 0 = LEGACY (reader reads + mcasts `up`), 1 = UP_WRITER_MCAST
-    // (retired), 2 = UP_SPLIT.
+    // up_mode: 0 = LEGACY (reader reads + mcasts `up` on NoC 0), 2 = UP_SPLIT
+    // (writer reads `up` on NoC 1, reader mcasts on NoC 0). The retired
+    // UP_WRITER_MCAST scheme (writer NoC-1-multicasts `up`) is no longer
+    // selectable. kEnableSplitUp picks UP_SPLIT for all layouts.
     constexpr bool kEnableSplitUp = true;
     uint32_t up_mode = kEnableSplitUp ? 2 : 0;
-    const bool writer_mcasts_up = (up_mode == 1);                  // writer reads + NoC-1 mcasts up
     const bool reader_reads_up = (up_mode == 0);                   // reader issues up DRAM read
     const bool reader_mcasts_up = (up_mode == 0 || up_mode == 2);  // reader NoC-0 mcasts up
-    // NoC-1 column-mcast handshake sems (UP_WRITER_MCAST only).
-    const uint32_t up_ready_sem_id = writer_mcasts_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
-    const uint32_t up_valid_sem_id = writer_mcasts_up ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
     // Local same-core handshake sems (UP_SPLIT only): up_go (reader -> writer:
     // slot reserved) and up_done (writer -> reader: up in L1). Monotonic.
     const uint32_t up_go_sem_id = (up_mode == 2) ? tt::tt_metal::CreateSemaphore(program, core_range_set, 0) : 0;
@@ -520,13 +518,12 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
         // chunk_M_tiles rows per core, of which only those < M_tiles_full
         // correspond to real output rows in the tensor.
         M_tiles_full,  // 16
-        // Two-RISC up-weight read (see semaphore section); CB/dims below let the
-        // writer replicate the gate read.
-        static_cast<uint32_t>(writer_mcasts_up),  // 17
-        CB_IN1_UP,                                // 18
-        in0_block_w_gu,                           // 19
-        K_gate_tiles,                             // 20
-        static_cast<uint32_t>(up_mode == 2),      // 21 writer_split_up
+        // UP_SPLIT up-weight read: CB + dims let the writer replicate the gate
+        // read on NoC 1, and writer_split_up gates it (1 = UP_SPLIT).
+        CB_IN1_UP,                            // 17
+        in0_block_w_gu,                       // 18
+        K_gate_tiles,                         // 19
+        static_cast<uint32_t>(up_mode == 2),  // 20 writer_split_up
     };
     tt::tt_metal::TensorAccessorArgs(out_buffer).append_to(writer_ct_args);
     // up accessor follows out; used only when the writer handles `up`.
@@ -738,9 +735,8 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
 
         // Writer runtime arg layout (must match unified_routed_expert_ffn_writer.cpp):
         //   0: output_addr  1: my_mt  2: my_nt_d
-        //   3..14: up-weight (two-RISC) args — up_addr, my_nt_gu, is_up_sender,
-        //          up_{ready,valid}_sem, up_num_receivers, up mcast column
-        //          topology (same as in1/gate). 15..16: up_go/up_done sems.
+        //   3: up_addr  4: my_nt_gu  5: is_up_sender (gy==0)
+        //   6: up_go_sem_id  7: up_done_sem_id  (UP_SPLIT local same-core handshake)
         std::vector<uint32_t> writer_args = {
             out_buffer->address(),
             my_mt,
@@ -748,16 +744,6 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
             up_buffer->address(),
             my_nt_gu,
             static_cast<uint32_t>(is_in1_sender),
-            up_ready_sem_id,
-            up_valid_sem_id,
-            in1_num_receivers,
-            in1_mcast_nx_start,
-            in1_mcast_ny_start,
-            in1_mcast_nx_end,
-            in1_mcast_ny_end,
-            in1_sender_nx,
-            in1_sender_ny,
-            // UP_SPLIT local same-core handshake sems (0 when unused).
             up_go_sem_id,
             up_done_sem_id,
         };
