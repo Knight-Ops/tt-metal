@@ -95,9 +95,7 @@ UnifiedRoutedExpertFfnProgramFactory::cached_program_t UnifiedRoutedExpertFfnPro
     if (short_seq) {
         // Maximise rows to minimise per_core_M (1 for M <= 8, 2 for M <= 16, ...).
         GRID_Y = std::min(MAX_GRID_Y, M_tiles_full);
-        if (GRID_Y < 1) {
-            GRID_Y = 1;
-        }
+        GRID_Y = std::max<uint32_t>(GRID_Y, 1);
         const uint32_t per_core_M_short = (M_tiles_full + GRID_Y - 1) / GRID_Y;
         chunk_M_tiles = per_core_M_short * GRID_Y;  // single chunk (>= M_tiles_full)
     }
