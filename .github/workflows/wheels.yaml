@@ -82,15 +82,12 @@ jobs:
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
           echo "CCACHE_REMOTE_STORAGE: ${CCACHE_REMOTE_STORAGE}"
-          # Garage is a cluster-internal service that is ONLY reachable directly from inside a
-          # Docker bridge network (the same way build-artifact.yaml's container: job reaches it).
-          # The restricted Squid proxy does NOT work for garage from this job: a SigV4-signed
-          # request forward-proxied through Squid is rejected by Garage with HTTP 400, and the
-          # bare host runner has no direct route to the garage ClusterIP at all. Both the verify
-          # step and the cibuildwheel build container below therefore run inside a Docker
-          # container and connect DIRECTLY to garage, bypassing the proxy via NO_PROXY — exactly
-          # like build-artifact.yaml. We export the bypass here so it is inherited by the
-          # docker-run verify step and forwarded into the cibuildwheel container.
+          # Garage is a cluster-internal service reached directly from inside a Docker bridge
+          # network — the same way build-artifact.yaml's container: job reaches it. The
+          # cibuildwheel build below runs in a bridge-networked container, so the
+          # ccache-storage-s3 helper connects DIRECTLY to garage:3900, bypassing the Squid proxy
+          # via NO_PROXY (the AWS Go SDK honors NO_PROXY). We export the bypass here so it is
+          # forwarded into the cibuildwheel container.
           echo "NO_PROXY=${NO_PROXY:+${NO_PROXY},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
           echo "no_proxy=${no_proxy:+${no_proxy},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
           # Enable debug logging from the ccache-storage-s3 helper binary.
@@ -104,58 +101,18 @@ jobs:
           # if ccache does not forward |endpoint_url=... as CRSH_ATTR_* (defensive belt-and-suspenders).
           echo "AWS_ENDPOINT_URL_S3=http://garage.garage.svc.cluster.local:3900" >> $GITHUB_ENV
 
-      - name: Verify S3 connectivity (write / read-back / delete)
-        if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
-        # Run the probe INSIDE a Docker container on the default bridge network, NOT on the bare
-        # host. The host runner cannot reach the garage ClusterIP directly, and forward-proxying
-        # the SigV4 request through Squid returns HTTP 400. A bridge-networked container (the same
-        # context cibuildwheel uses for the build below, and the same context that makes
-        # build-artifact.yaml's container: job pass this identical probe) routes directly to
-        # garage:3900. We bypass the proxy inside the container via --env NO_PROXY so curl
-        # connects straight to garage.
-        #
-        # The PUT body MUST come from a real file (--data-binary @file), never a stdin pipe.
-        # This job's manylinux image (AlmaLinux 9.7) ships a curl whose `--data-binary @-`
-        # reading from a pipe cannot determine Content-Length, so it streams the body with
-        # Transfer-Encoding: chunked. Under --aws-sigv4 that yields a streaming/aws-chunked
-        # signed request that Garage rejects with HTTP 400 (Garage does not implement streaming
-        # SigV4). Uploading from a file gives curl a known length, so it sends one fixed-length,
-        # fully-signed body that Garage accepts — independent of the curl build. (Ubuntu's curl
-        # in build-artifact.yaml happens to buffer the pipe, which is why its look-alike probe
-        # passed; reading from a file makes the request deterministic across both images.)
-        run: |
-          docker run --rm \
-            --env AWS_ACCESS_KEY_ID \
-            --env AWS_SECRET_ACCESS_KEY \
-            --env CCACHE_S3_BUCKET \
-            --env CCACHE_S3_PREFIX \
-            --env NO_PROXY=garage.garage.svc.cluster.local \
-            --env no_proxy=garage.garage.svc.cluster.local \
-            "${{ inputs.docker-image }}" \
-            bash -euo pipefail -c '
-              curl --version | head -1
-              BASE="http://garage.garage.svc.cluster.local:3900/${CCACHE_S3_BUCKET}/${CCACHE_S3_PREFIX}/.s3-connectivity-test"
-              PAYLOAD="ccache-s3-connectivity-ok"
-              SIGV4="aws:amz:garage:s3"
-              CREDS="${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
-              TMP="$(mktemp)"
-              printf "%s" "${PAYLOAD}" > "${TMP}"
-              # PUT a fixed-length, fully-signed body from a file (no chunked streaming).
-              # On failure, surface Garage'"'"'s HTTP status + XML error body instead of failing blind.
-              if ! curl -sS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
-                     "${BASE}" --data-binary "@${TMP}" -o /dev/null -w "PUT HTTP %{http_code}\n" --fail-with-body; then
-                echo "PUT failed; Garage response body:" >&2
-                curl -sS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" --data-binary "@${TMP}" >&2 || true
-                exit 22
-              fi
-              # GET and verify
-              RESULT=$(curl -fsS --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}")
-              [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '"'"'${RESULT}'"'"'"; exit 1; }
-              # DELETE
-              curl -fsS -X DELETE --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" -o /dev/null
-              rm -f "${TMP}"
-              echo "S3 connectivity verified: write/read-back/delete all OK"
-            '
+      # NOTE: build-artifact.yaml has a curl-based "Verify S3 connectivity" probe, but we do
+      # NOT replicate it here. That probe relies on `curl --aws-sigv4` sending the
+      # X-Amz-Content-Sha256 header, which Garage requires. The Ubuntu CI image used by
+      # build-artifact.yaml ships curl 8.x (sends the header → probe passes), but THIS job's
+      # manylinux image (quay.io/pypa/manylinux_2_34_x86_64) ships curl 7.76.1, whose
+      # --aws-sigv4 does NOT emit X-Amz-Content-Sha256. Garage therefore rejects the probe PUT
+      # with HTTP 400 "Missing X-Amz-Content-Sha256 field" — a limitation of that old curl, not
+      # of ccache or of connectivity. The actual ccache remote-storage path does not use curl:
+      # ccache spawns the ccache-storage-s3 Go helper, whose AWS Go SDK always sends
+      # X-Amz-Content-Sha256 correctly. So the curl probe would only ever test a tool ccache
+      # never uses. We drop it and let ccache exercise the real (Go SDK) path during the build;
+      # CCACHE_REMOTE_ONLY=true below keeps any remaining helper hiccup non-fatal to the build.
 
       - name: ⬇️ Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
