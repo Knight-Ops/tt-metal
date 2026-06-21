@@ -208,9 +208,15 @@ inline void read_w_group(Noc noc, const WAcc& w_acc, uint32_t q_row_start, const
  *  handshake to minimize startup rendezvous. */
 template <typename KAcc>
 inline void read_k_chunk(
-    Noc noc, const KAcc& k_acc, uint32_t k_tile_start, uint32_t k_tiles_in_unit, const McastDir& k_dir) {
+    Noc noc,
+    const KAcc& k_acc,
+    uint32_t k_tile_start,
+    uint32_t k_tiles_in_unit,
+    const McastDir& k_dir,
+    uint32_t k_batch_page_offset) {
     // Reserves/pushes the full k_chunk_tiles to keep the 2-chunk ring half-aligned, but reads only the
-    // k_tiles_in_unit valid columns (pad slots stay stale; compute masks them).
+    // k_tiles_in_unit valid columns (pad slots stay stale; compute masks them). k_batch_page_offset shifts
+    // every page into the indexed cache slot; 0 when not indexed.
     read_block_or_mcast<cb_k, k_mcast_on, k_send_sem, k_recv_sem, k_valid_sem>(
         noc, k_chunk_tiles, k_chunk_tiles * k_tile_bytes, k_dir, [&](uint32_t addr) {
             uint32_t ptr = addr;
@@ -220,7 +226,7 @@ inline void read_k_chunk(
                         k_acc,
                         CoreLocalMem<uint32_t>(ptr),
                         k_tile_bytes,
-                        {.page_id = (k_tile_start + c) * head_dim_tiles + d},
+                        {.page_id = k_batch_page_offset + (k_tile_start + c) * head_dim_tiles + d},
                         {});
                     ptr += k_tile_bytes;
                 }
@@ -236,6 +242,11 @@ void kernel_main() {
     const uint32_t flat_count = get_arg_val<uint32_t>(4);
     const McastDir k_dir = read_mcast_dir(5);   // K column mcast: args [5, 13)
     const McastDir q_dir = read_mcast_dir(13);  // Q/W row mcast: args [13, 21)
+    // Indexed-cache k page offset; 0 when not indexed. Added to every k page id.
+    const uint32_t k_batch_page_offset = get_arg_val<uint32_t>(21);
+    // Valid KV length in tiles (full k_len_tiles when not set): caps the k columns read per unit. Units
+    // entirely past it read nothing (the DMA bottleneck shrinks for free).
+    const uint32_t kv_len_tiles = get_arg_val<uint32_t>(22);
 
     const auto q_acc = TensorAccessor(q_args, q_addr, q_tile_bytes);
     const auto k_acc = TensorAccessor(k_args, k_addr, k_tile_bytes);
@@ -247,6 +258,7 @@ void kernel_main() {
 
     WorkUnitSpan span;
     span.start(flat_start);
+    span.set_valid_k_len_tiles(kv_len_tiles);
 
     // Resident-heads path order: k -> q -> w. w (gates) is consumed only in the mul phase, so read it
     // LAST behind the latency-critical q/k. Streaming path reads w FIRST: compute's mul drains streamed
@@ -259,7 +271,7 @@ void kernel_main() {
         }
         // k FIRST: compute waits the whole k chunk before any row, so reading k ahead of q lets the
         // split q-row0 push unblock the first matmul (else the k wait re-serializes it).
-        read_k_chunk(noc, k_acc, span.k_tile_start(), span.k_tiles(), k_dir);
+        read_k_chunk(noc, k_acc, span.k_tile_start(), span.k_tiles(), k_dir, k_batch_page_offset);
         if (group_start && !stream_heads) {
             read_q_rows(noc, q_acc, span.q_tile_start(), q_dir);  // per-row: compute starts on row 0
         }

@@ -26,20 +26,22 @@ constexpr uint32_t frag_bytes = tt::constants::TILE_WIDTH * sizeof(uint16_t);  /
 template <typename OutAcc>
 inline void write_strip(Noc noc, const OutAcc& out_acc, uint32_t q_row, uint32_t k_tile_start, uint32_t valid_w) {
     CircularBuffer cb(cb_out_strip);
-    cb.wait_front(k_tiles_per_unit);
-    uint32_t src = cb.get_read_ptr();
-    const uint32_t row_pitch = k_tiles_per_unit * frag_bytes;  // strip row stride (full KC)
-    const uint32_t write_bytes = valid_w * frag_bytes;         // only the in-bounds columns
-    for (uint32_t rr = 0; rr < tt::constants::TILE_HEIGHT; ++rr) {
-        noc.async_write(
-            CoreLocalMem<uint32_t>(src),
-            out_acc,
-            write_bytes,
-            {},
-            {.page_id = q_row * tt::constants::TILE_HEIGHT + rr, .offset_bytes = k_tile_start * frag_bytes});
-        src += row_pitch;
+    cb.wait_front(k_tiles_per_unit);  // compute always pushes a full KC strip; pop it whether or not we write
+    if (valid_w != 0) {               // valid_w == 0 when the unit is entirely past the valid kv_len: nothing to write
+        uint32_t src = cb.get_read_ptr();
+        const uint32_t row_pitch = k_tiles_per_unit * frag_bytes;  // strip row stride (full KC)
+        const uint32_t write_bytes = valid_w * frag_bytes;         // only the in-bounds (valid) columns
+        for (uint32_t rr = 0; rr < tt::constants::TILE_HEIGHT; ++rr) {
+            noc.async_write(
+                CoreLocalMem<uint32_t>(src),
+                out_acc,
+                write_bytes,
+                {},
+                {.page_id = q_row * tt::constants::TILE_HEIGHT + rr, .offset_bytes = k_tile_start * frag_bytes});
+            src += row_pitch;
+        }
+        noc.async_write_barrier();
     }
-    noc.async_write_barrier();
     cb.pop_front(k_tiles_per_unit);
 }
 
@@ -47,6 +49,8 @@ void kernel_main() {
     const uint32_t out_addr = get_arg_val<uint32_t>(0);
     const uint32_t flat_start = get_arg_val<uint32_t>(1);
     const uint32_t flat_count = get_arg_val<uint32_t>(2);
+    // Valid KV length in tiles: caps the columns written per unit (page width stays the full T).
+    const uint32_t kv_len_tiles = get_arg_val<uint32_t>(3);
 
     constexpr auto out_args = TensorAccessorArgs<num_common_ct_args + 1>();
     const auto out_acc = TensorAccessor(out_args, out_addr, page_bytes);
@@ -55,6 +59,7 @@ void kernel_main() {
 
     WorkUnitSpan span;
     span.start(flat_start);
+    span.set_valid_k_len_tiles(kv_len_tiles);
 
     for (uint32_t i = 0; i < flat_count; ++i) {
         const uint32_t k_tile0 = span.k_tile_start();

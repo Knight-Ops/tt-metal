@@ -281,6 +281,9 @@ inline void stamp_masked_suffix(const WorkUnitSpan& span, uint32_t r, uint32_t s
 void kernel_main() {
     const uint32_t flat_start = get_arg_val<uint32_t>(0);
     const uint32_t flat_count = get_arg_val<uint32_t>(1);
+    // Valid KV length in tiles: caps each unit's valid columns (the causal mask suffix grows to cover the
+    // unwritten tail). Full k_len_tiles when not set, so the dense path is unchanged.
+    const uint32_t kv_len_tiles = get_arg_val<uint32_t>(2);
     if (flat_count == 0) {
         return;
     }
@@ -296,6 +299,7 @@ void kernel_main() {
 
     WorkUnitSpan span;
     span.start(flat_start);
+    span.set_valid_k_len_tiles(kv_len_tiles);
 
     constexpr uint32_t unit_strip = q_tiles_per_unit * k_tiles_per_unit;  // QC x KC accumulator slots
     constexpr uint32_t q_row_tiles = q_group_tiles / q_tiles_per_unit;    // heads_per_group * head_dim_tiles

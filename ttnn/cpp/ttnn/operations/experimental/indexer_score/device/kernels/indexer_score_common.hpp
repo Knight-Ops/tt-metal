@@ -63,15 +63,21 @@ inline uint32_t row_valid_prefix(uint32_t q_row_abs, uint32_t k_tile_start, uint
 // schedule), so the flat<->(group, unit) map is a plain divide/modulo.
 constexpr uint32_t units_per_group = ws::units_in_group(k_tiles_per_unit, k_len_tiles);
 
-/** (group, unit) cursor over work units, starting at a flat index. */
+/** (group, unit) cursor over work units, starting at a flat index. units_per_group (the flat<->group/unit
+ *  map and the host deal) stays keyed on the COMPILE-TIME k_len_tiles (the allocated buffer), so the grid is
+ *  fixed. valid_k_len_tiles (runtime, <= k_len_tiles, defaults to the full buffer) only narrows the valid-
+ *  column count per unit: units past it score nothing. */
 struct WorkUnitSpan {
     uint32_t group = 0;
     uint32_t unit = 0;
+    uint32_t valid_k_len_tiles = k_len_tiles;  // populated key prefix this dispatch; default = full buffer
 
     void start(uint32_t flat) {
         group = flat / units_per_group;
         unit = flat % units_per_group;
     }
+    /** Set the runtime valid KV length (in tiles). Pass kv_len/32, or k_len_tiles for the full buffer. */
+    void set_valid_k_len_tiles(uint32_t tiles) { valid_k_len_tiles = tiles; }
 
     /** Advance one unit; true when a new q-row-group begins. */
     bool advance() {
@@ -85,8 +91,9 @@ struct WorkUnitSpan {
 
     uint32_t q_tile_start() const { return group * q_tiles_per_unit; }  // first q-tile-row of this unit
     uint32_t k_tile_start() const { return unit * k_tiles_per_unit; }   // first k-tile of this unit
-    uint32_t k_tiles() const {                                          // valid k-tiles in this unit (< full on edge)
-        uint32_t left = k_len_tiles - k_tile_start();
+    uint32_t k_tiles() const {  // valid k-tiles in this unit: < full on the edge, 0 entirely past kv_len
+        const uint32_t start = k_tile_start();
+        const uint32_t left = valid_k_len_tiles > start ? valid_k_len_tiles - start : 0;
         return left < k_tiles_per_unit ? left : k_tiles_per_unit;
     }
 };

@@ -24,16 +24,46 @@ namespace ttnn::operations::experimental::indexer_score::program {
 // Runtime-arg slots, shared by create()/override_runtime_arguments() and matched positionally
 // by the kernels. Reader: q,k,w addrs; writer: out addr.
 namespace rt_arg {
+// ---- reader -------------------------------------------------------------------------------------------
+// Layout: [q_addr, k_addr, w_addr, flat_start, count] (the scalars), then the K-column and Q/W-row mcast
+// directions (one McastDir = 8 args each, see read_mcast_dir), then the indexed-cache offset and kv_len.
 constexpr uint32_t reader_q_addr = 0;
 constexpr uint32_t reader_k_addr = 1;
 constexpr uint32_t reader_w_addr = 2;
+constexpr uint32_t reader_num_scalars = 5;     // q/k/w addrs + flat_start + count
+constexpr uint32_t mcast_args_per_dir = 8;     // one McastDir: role, rect (xs,ys,xe,ye), sender (sx,sy), ndst
+constexpr uint32_t reader_num_mcast_dirs = 2;  // K column, then Q/W row
+// Indexed-cache k page offset (cache_batch_idx * Tt * Dt), 0 when not indexed. After the scalars + both
+// mcast dirs, so it never perturbs the fixed read_mcast_dir() offsets.
+constexpr uint32_t reader_k_batch_offset = reader_num_scalars + reader_num_mcast_dirs * mcast_args_per_dir;  // 21
+// Runtime KV length in tiles (kv_len/32, or full Tt when not set). Last reader arg.
+constexpr uint32_t reader_kv_len_tiles = reader_k_batch_offset + 1;  // 22
+// ---- compute / writer ---------------------------------------------------------------------------------
+constexpr uint32_t compute_kv_len_tiles = 2;  // after {flat_start, count}
 constexpr uint32_t writer_out_addr = 0;
+constexpr uint32_t writer_kv_len_tiles = 3;  // after {out_addr, flat_start, count}
 }  // namespace rt_arg
 
 // Patch one runtime-arg slot on a program-cache hit, asserting the slot exists.
 inline void patch_arg(tt::tt_metal::RuntimeArgsData& args, uint32_t index, uint32_t value, const char* name) {
     TT_FATAL(index < args.size(), "indexer_score override: {} index {} >= args size {}", name, index, args.size());
     args[index] = value;
+}
+
+// The two non-hashed runtime args derived from k's (hashed) shape + the optionals. Single source for both
+// create() (bakes them at miss) and override_runtime_arguments() (re-patches them on a hit) -- a divergence
+// would silently mis-patch the slot/kv_len on a cache hit.
+struct PersistentCacheArgs {
+    uint32_t k_batch_page_offset;  // cache_batch_idx * Tt * Dt; 0 when not indexed
+    uint32_t kv_len_tiles;         // valid key prefix in tiles; full Tt when kv_len unset
+};
+inline PersistentCacheArgs persistent_cache_args(const operation_attributes_t& attrs, const Tensor& k) {
+    const auto& shape = k.logical_shape();
+    const uint32_t Tt = shape[2] / tt::constants::TILE_WIDTH;
+    const uint32_t Dt = shape[3] / tt::constants::TILE_WIDTH;
+    return {
+        .k_batch_page_offset = attrs.cache_batch_idx.value_or(0) * Tt * Dt,
+        .kv_len_tiles = attrs.kv_len.value_or(shape[2]) / tt::constants::TILE_WIDTH};
 }
 
 // Dense deal landed exactly on the grid (q/w mcast along rows, k down columns) and each direction's
@@ -315,8 +345,12 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
 
     // Per-core multicast runtime args: K column then Q/W row, each an 8-tuple (push_mcast_dir below); the two
     // together are what the non-grid-aligned fallback zero-fills.
-    constexpr uint32_t mcast_args_per_dir = 8;
-    constexpr uint32_t reader_mcast_args = 2 * mcast_args_per_dir;
+    constexpr uint32_t reader_mcast_args = rt_arg::reader_num_mcast_dirs * rt_arg::mcast_args_per_dir;
+
+    // Indexed-cache k page offset and valid kv_len, baked here for the cache-miss build and re-applied each
+    // dispatch in override_runtime_arguments (both are excluded from the hash). The grid/work-split above
+    // stay keyed on the hashed Tt; kv_len_tiles only narrows the per-unit columns the kernels touch.
+    const auto [k_batch_page_offset, kv_len_tiles] = persistent_cache_args(args, k);
 
     uint32_t flat = 0;
     for (uint32_t i = 0; i < num_cores; ++i) {
@@ -371,9 +405,13 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
                 reader_rt.push_back(0);
             }
         }
+        // reader_k_batch_offset (21) then reader_kv_len_tiles (22): last, after the mcast args in both branches.
+        reader_rt.push_back(k_batch_page_offset);
+        reader_rt.push_back(kv_len_tiles);
         tt::tt_metal::SetRuntimeArgs(program, reader_id, cores[i], reader_rt);
-        tt::tt_metal::SetRuntimeArgs(program, compute_id, cores[i], {flat, count});
-        tt::tt_metal::SetRuntimeArgs(program, writer_id, cores[i], {out.buffer()->address(), flat, count});
+        tt::tt_metal::SetRuntimeArgs(program, compute_id, cores[i], {flat, count, kv_len_tiles});
+        tt::tt_metal::SetRuntimeArgs(
+            program, writer_id, cores[i], {out.buffer()->address(), flat, count, kv_len_tiles});
         flat += count;
     }
 
@@ -387,16 +425,27 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
 }
 
 void IndexerScoreProgramFactory::override_runtime_arguments(
-    cached_program_t& cached, const operation_attributes_t&, const tensor_args_t& tensors, tensor_return_value_t& out) {
+    cached_program_t& cached,
+    const operation_attributes_t& args,
+    const tensor_args_t& tensors,
+    tensor_return_value_t& out) {
     auto& shared = cached.shared_variables;
     auto& reader_args = tt::tt_metal::GetRuntimeArgs(cached.program, shared.reader_kernel);
+    auto& compute_args = tt::tt_metal::GetRuntimeArgs(cached.program, shared.compute_kernel);
     auto& writer_args = tt::tt_metal::GetRuntimeArgs(cached.program, shared.writer_kernel);
+    // cache_batch_idx and kv_len are excluded from the hash, so a hit may carry new values against the same
+    // cached program -- re-apply both every dispatch (the analog of buffer-address patching).
+    const auto [k_batch_page_offset, kv_len_tiles] = persistent_cache_args(args, tensors.k);
     for (const auto& core : shared.worker_cores) {
         auto& reader_rt = reader_args[core.x][core.y];
         patch_arg(reader_rt, rt_arg::reader_q_addr, tensors.q.buffer()->address(), "reader.q_addr");
         patch_arg(reader_rt, rt_arg::reader_k_addr, tensors.k.buffer()->address(), "reader.k_addr");
         patch_arg(reader_rt, rt_arg::reader_w_addr, tensors.weights.buffer()->address(), "reader.w_addr");
+        patch_arg(reader_rt, rt_arg::reader_k_batch_offset, k_batch_page_offset, "reader.k_batch_offset");
+        patch_arg(reader_rt, rt_arg::reader_kv_len_tiles, kv_len_tiles, "reader.kv_len_tiles");
+        patch_arg(compute_args[core.x][core.y], rt_arg::compute_kv_len_tiles, kv_len_tiles, "compute.kv_len_tiles");
         patch_arg(writer_args[core.x][core.y], rt_arg::writer_out_addr, out.buffer()->address(), "writer.out_addr");
+        patch_arg(writer_args[core.x][core.y], rt_arg::writer_kv_len_tiles, kv_len_tiles, "writer.kv_len_tiles");
     }
 }
 
