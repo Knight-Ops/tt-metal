@@ -406,26 +406,41 @@ if rr_method.startswith('exponent_alu_'):
         basis = metadata.get('expalu_log2_basis', 'natural')
         coeff_str = ', '.join(f'{clamp(v):.10e}f' for v in seg0)
         basis_macro = '#define LOG_HW_BASIS_M_MINUS_1\n' if basis == 'm_minus_1' else ''
+        # log1p decomposes (x + 1) before log2 -> expalu_input_offset = 1.0.
+        offset = float(metadata.get('expalu_input_offset', '0.0') or '0.0')
+        offset_macro = f'#define LOG_HW_INPUT_OFFSET {clamp(offset):.10e}f\n' if offset != 0.0 else ''
         rr_macro = (
             '\n// Hardware-exponent-ALU log2 (exexp -> e, exman -> m), natural coeffs\n'
             '#define RANGE_REDUCTION_LOG_HW\n'
             f'{basis_macro}'
+            f'{offset_macro}'
             f'{hw_preload_macro}'
             f'constexpr uint32_t LOG_HW_DEGREE = {degree};\n'
             f'constexpr float LOG_HW_COEFFS[] = {{{coeff_str}}};\n'
             f'#define LOG_HW_SCALE {scale}f\n'
         )
-        print(f'Range reduction: HW exponent-ALU log2 (degree {degree}, scale {scale}, basis {basis})')
+        print(f'Range reduction: HW exponent-ALU log2 (degree {degree}, scale {scale}, basis {basis}, offset {offset})')
     elif kind == 'pow':
         coeff_str = ', '.join(f'{clamp(v):.10e}f' for v in seg0)
+        # root order N, optional final reciprocal (rsqrt), per-r scale constants.
+        root_n = int(float(metadata.get('expalu_root_n', '2') or '2'))
+        recip = str(metadata.get('expalu_reciprocal', 'False')).strip().lower() in ('true', '1')
+        recip_macro = '#define POW_HW_RECIPROCAL\n' if recip else ''
+        scale_macros = f'#define POW_HW_ROOT_N {root_n}\n'
+        for r in range(root_n):
+            key = f'expalu_pow_scale_c{r}'
+            if key in metadata:
+                scale_macros += f'#define POW_HW_SCALE_C{r} {clamp(float(metadata[key])):.10e}f\n'
         rr_macro = (
-            '\n// Hardware-exponent-ALU pow/sqrt (exexp -> e, exman -> m), natural [1,2) coeffs\n'
+            '\n// Hardware-exponent-ALU pow/root_N (exexp -> e, exman -> m), natural [1,2) coeffs\n'
             '#define RANGE_REDUCTION_POW_HW\n'
+            f'{scale_macros}'
+            f'{recip_macro}'
             f'{hw_preload_macro}'
             f'constexpr uint32_t POW_HW_DEGREE = {degree};\n'
             f'constexpr float POW_HW_COEFFS[] = {{{coeff_str}}};\n'
         )
-        print(f'Range reduction: HW exponent-ALU pow (degree {degree})')
+        print(f'Range reduction: HW exponent-ALU pow (degree {degree}, root_n {root_n}, reciprocal {recip})')
     else:
         print(f'WARNING: unknown exponent_alu kind {kind}')
 elif rr_method == 'exp':

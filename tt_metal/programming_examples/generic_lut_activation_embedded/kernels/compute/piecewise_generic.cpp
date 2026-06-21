@@ -8,9 +8,11 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "ttnn/operations/normalization/kernel_util/compute/memory.h"
 
-// Include reciprocal function for tan range reduction (tan_expand needs -1/poly)
-// and for the exp2 sigmoid compose (1/(1+exp(-x))).
-#if (defined(RANGE_REDUCTION_TAN) || defined(EXP_HW_COMPOSE_SIGMOID)) && defined(TRISC_MATH)
+// Include reciprocal function for tan range reduction (tan_expand needs -1/poly),
+// the exp2 sigmoid compose (1/(1+exp(-x))), and the pow path's final 1/result
+// (rsqrt = 1/sqrt(x), tagged expalu_reciprocal -> POW_HW_RECIPROCAL).
+#if (defined(RANGE_REDUCTION_TAN) || defined(EXP_HW_COMPOSE_SIGMOID) || defined(POW_HW_RECIPROCAL)) && \
+    defined(TRISC_MATH)
 #include "ckernel_sfpu_recip.h"
 #endif
 
@@ -410,12 +412,21 @@ inline vFloat exp_hw_eval_preloaded(
 #ifndef LOG_HW_SCALE
 #define LOG_HW_SCALE 1.0f
 #endif
+// log1p(x) = log(x + 1): the fitter tags expalu_input_offset = 1.0 so the log2
+// decompose operates on (x + offset). Default 0.0 keeps plain log/log2/log10.
+#ifndef LOG_HW_INPUT_OFFSET
+#define LOG_HW_INPUT_OFFSET 0.0f
+#endif
 template <uint32_t DEG>
 inline vFloat log_hw_eval(vFloat x) {
-    // Extract biased exponent e and mantissa m in [1,2).
-    vInt biased = exexp(x, ExponentMode::NoDebias);
+    vFloat x_in = x;  // original (used for special-case tests)
+    constexpr float OFFSET = LOG_HW_INPUT_OFFSET;
+    vFloat xd = (OFFSET != 0.0f) ? (x + OFFSET) : x;
+
+    // Extract biased exponent e and mantissa m in [1,2) of the decompose input.
+    vInt biased = exexp(xd, ExponentMode::NoDebias);
     vInt e_int = biased - 127;
-    vFloat m = setexp(x, 127);
+    vFloat m = setexp(xd, 127);
 
     // Horner h(m)=log2(m). The fitter tags the polynomial basis: the natural
     // [1,2] basis evaluates in m, the m_minus_1 basis (the codegen default for
@@ -438,10 +449,12 @@ inline vFloat log_hw_eval(vFloat x) {
     vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
     vFloat result = (e_float + h) * LOG_HW_SCALE;
 
-    // Special cases: log(0) = -inf, log(neg) = NaN.
-    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
-    v_elseif(x == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
+    // Special cases on the DECOMPOSE input (x + offset): log(0) = -inf, log(neg) = NaN.
+    // For log1p this is the (x + 1) singularity at x = -1.
+    v_if(xd < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(xd == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
     v_endif;
+    (void)x_in;
     return result;
 }
 
@@ -451,9 +464,12 @@ inline vFloat log_hw_eval(vFloat x) {
 // 127 / 1.0 are SFPMAD imm / const-lane. Math byte-identical to log_hw_eval.
 template <uint32_t DEG>
 inline vFloat log_hw_eval_preloaded(vFloat x) {
-    vInt biased = exexp(x, ExponentMode::NoDebias);
+    constexpr float OFFSET = LOG_HW_INPUT_OFFSET;
+    vFloat xd = (OFFSET != 0.0f) ? (x + OFFSET) : x;
+
+    vInt biased = exexp(xd, ExponentMode::NoDebias);
     vInt e_int = biased - 127;
-    vFloat m = setexp(x, 127);
+    vFloat m = setexp(xd, 127);
 
 #ifdef LOG_HW_BASIS_M_MINUS_1
     vFloat u = m - 1.0f;
@@ -477,8 +493,8 @@ inline vFloat log_hw_eval_preloaded(vFloat x) {
     vFloat e_float = int32_to_float(e_int, RoundMode::Nearest);
     vFloat result = (e_float + h) * vConstFloatPrgm0;  // * LOG_HW_SCALE
 
-    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
-    v_elseif(x == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
+    v_if(xd < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+    v_elseif(xd == 0.0f) { result = -std::numeric_limits<float>::infinity(); }
     v_endif;
     return result;
 }
@@ -486,21 +502,49 @@ inline vFloat log_hw_eval_preloaded(vFloat x) {
 #endif
 
 #if defined(RANGE_REDUCTION_POW_HW)
-// pow path for sqrt/rsqrt/cbrt: x = 2^e * m. sqrt(x) = 2^(e/2) * sqrt(m).
-// The fitter fits s(m)=sqrt(m) on [1,2) (NATURAL [1,2]-basis coeffs POW_HW_COEFFS);
-// the kernel splits e into even part (halved into the exponent) and parity bit r
-// (folds sqrt(2) when e is odd), evaluates the poly, recombines via setexp.
-#ifndef POW_HW_SQRT2
-#define POW_HW_SQRT2 1.4142135623730951f
+// pow path for sqrt/rsqrt/cbrt. For root order N (POW_HW_ROOT_N) and x = 2^e * m
+// with m in [1,2): root_N(x) = 2^(e/N) * root_N(2^r) * root_N(m), where
+// e = N*q + r, r in {0..N-1}. The fitter fits p(m)=root_N(m) on [1,2)
+// (NATURAL [1,2]-basis coeffs POW_HW_COEFFS); the kernel splits e into q (folded
+// into the exponent via setexp) and parity remainder r (selects the scale
+// constant POW_HW_SCALE_C{r} = root_N(2^r)), evaluates the poly, recombines.
+//
+// Odd roots (cbrt, N=3) are odd functions: cbrt(-x) = -cbrt(x). The kernel
+// strips the sign (works on |x|) and restores it on the result. Even roots
+// (sqrt, N=2) of negatives are NaN.
+//
+// expalu_reciprocal (POW_HW_RECIPROCAL) folds the final 1/result for rsqrt
+// (= 1/sqrt(x)): one Newton-Raphson reciprocal applied AFTER recombine.
+//
+// Backward-compatible defaults: N=2, scales = {1, sqrt(2)}.
+#ifndef POW_HW_ROOT_N
+#define POW_HW_ROOT_N 2
+#endif
+#ifndef POW_HW_SCALE_C0
+#define POW_HW_SCALE_C0 1.0f
+#endif
+#ifndef POW_HW_SCALE_C1
+#define POW_HW_SCALE_C1 1.4142135623730951f  // sqrt(2)
+#endif
+// C2 only consulted when ROOT_N >= 3 (cbrt). Default cbrt(4) is harmless otherwise.
+#ifndef POW_HW_SCALE_C2
+#define POW_HW_SCALE_C2 1.5874010519681994f  // cbrt(4)
 #endif
 template <uint32_t DEG>
 inline vFloat pow_hw_eval(vFloat x) {
-    // Extract biased exponent e and mantissa m in [1,2).
-    vInt biased = exexp(x, ExponentMode::NoDebias);
-    vInt e_int = biased - 127;
-    vFloat m = setexp(x, 127);
+    constexpr int ROOT_N = POW_HW_ROOT_N;
+    constexpr bool ODD_ROOT = (ROOT_N % 2 == 1);
 
-    // Horner s(m)=sqrt(m) in the natural [1,2] basis.
+    // Odd roots act on |x|; sign restored at the end. Even roots: neg -> NaN.
+    vInt sign_bits = reinterpret<vInt>(x) & (vInt)0x80000000;
+    vFloat ax = ODD_ROOT ? setsgn(x, 0) : x;
+
+    // Extract biased exponent e and mantissa m in [1,2).
+    vInt biased = exexp(ax, ExponentMode::NoDebias);
+    vInt e_int = biased - 127;
+    vFloat m = setexp(ax, 127);
+
+    // Horner p(m)=root_N(m) in the natural [1,2] basis.
     const float* c = POW_HW_COEFFS;
     vFloat s = c[DEG];
 #pragma GCC unroll 16
@@ -508,34 +552,85 @@ inline vFloat pow_hw_eval(vFloat x) {
         s = s * m + c[k];
     }
 
-    // e = 2*q + r, r in {0,1}.  sqrt(x) = 2^q * sqrt(2)^r * sqrt(m).
-    // Floor-divide by 2 for both signs: q = (e - (e & 1)) / 2 only valid for
-    // e>=0; use arithmetic that matches floor(e/2).  Here r = e & 1 (two's
-    // complement low bit is the parity for both signs).
-    vInt r = e_int & 1;
-    // q = (e_int - r) >> 1  via float round (e is small, exact in float).
+    // e = N*q + r, r in {0..N-1}. Compute q = floor(e/N) and r via float arith
+    // (e is small, exact in float), matching the cbrt software path's structure.
+    const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
     vFloat ef = int32_to_float(e_int, RoundMode::Nearest);
     v_if(e_int < 0) {
         vInt mag = ~e_int + 1;
         ef = -int32_to_float(mag, RoundMode::Nearest);
     }
     v_endif;
-    const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
-    vFloat qf = (ef - int32_to_float(r, RoundMode::Nearest)) * 0.5f;
-    vInt q = reinterpret<vInt>(qf + magic) - reinterpret<vInt>(magic);
 
-    // Apply sqrt(2) when e is odd.
-    v_if(r == 1) { s = s * POW_HW_SQRT2; }
+    vInt q;
+    vInt r;
+    if constexpr (ROOT_N == 2) {
+        r = e_int & 1;  // two's-complement low bit is parity for both signs
+        vFloat qf = (ef - int32_to_float(r, RoundMode::Nearest)) * 0.5f;
+        q = reinterpret<vInt>(qf + magic) - reinterpret<vInt>(magic);
+    } else {
+        // General floor-divide by N via round-to-nearest of e/N then correct r.
+        constexpr float INV_N = 1.0f / (float)ROOT_N;
+        vFloat q_approx = ef * INV_N;
+        vFloat q_rounded = q_approx + magic;
+        q = reinterpret<vInt>(q_rounded) - reinterpret<vInt>(magic);
+        vFloat q_back = q_rounded - magic;
+        // r = e - N*q (in float, exact), then to int via magic.
+        vFloat nq = q_back;
+#pragma GCC unroll 8
+        for (int i = 1; i < ROOT_N; i++) {
+            nq = nq + q_back;
+        }  // nq = N*q_back
+        vFloat r_float = ef - nq;
+        r = reinterpret<vInt>(r_float + magic) - reinterpret<vInt>(magic);
+        // Normalize r into [0, N-1], adjusting q accordingly.
+        v_if(r < 0) {
+            q = q - 1;
+            r = r + ROOT_N;
+        }
+        v_endif;
+        v_if(r >= ROOT_N) {
+            q = q + 1;
+            r = r - ROOT_N;
+        }
+        v_endif;
+    }
+
+    // Apply scale root_N(2^r) for the parity remainder r.
+    v_if(r == 1) { s = s * POW_HW_SCALE_C1; }
     v_endif;
+    if constexpr (ROOT_N >= 3) {
+        v_if(r == 2) { s = s * POW_HW_SCALE_C2; }
+        v_endif;
+    }
 
     // Multiply by 2^q via exponent addition.
     vInt s_exp = exexp(s, ExponentMode::NoDebias);
     vFloat result = setexp(s, s_exp + q);
 
-    // Special cases: sqrt(0)=0, sqrt(neg)=NaN.
-    v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
-    v_elseif(x == 0.0f) { result = 0.0f; }
-    v_endif;
+#if defined(POW_HW_RECIPROCAL)
+    // rsqrt etc.: final 1/result. Newton-Raphson reciprocal (3 iters, no init dep).
+    result = ckernel::sfpu::sfpu_reciprocal_iter<3>(result);
+#endif
+
+    if constexpr (ODD_ROOT) {
+        // Restore original sign (root is an odd function): cbrt(-x) = -cbrt(x).
+        result = reinterpret<vFloat>(reinterpret<vInt>(result) | sign_bits);
+        // x == 0 -> 0 (sign already carried; |0| poly path is finite).
+        v_if(ax == 0.0f) { result = reinterpret<vFloat>(sign_bits); }
+        v_endif;
+    } else {
+        // Special cases: even root of negative is NaN; root(0)=0.
+        v_if(x < 0.0f) { result = std::numeric_limits<float>::quiet_NaN(); }
+        v_elseif(x == 0.0f) {
+#if defined(POW_HW_RECIPROCAL)
+            result = std::numeric_limits<float>::infinity();  // rsqrt(0) = +inf
+#else
+            result = 0.0f;  // sqrt(0) = 0
+#endif
+        }
+        v_endif;
+    }
     return result;
 }
 
@@ -546,6 +641,15 @@ inline vFloat pow_hw_eval(vFloat x) {
 // Math byte-identical to pow_hw_eval.
 template <uint32_t DEG>
 inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist) {
+    // The preload optimization (prgm0 = sqrt(2)) only applies to plain sqrt
+    // (ROOT_N == 2, no reciprocal). For odd roots (cbrt) and the reciprocal
+    // fold (rsqrt) the scale/sign/recip logic doesn't fit the 3-prgm budget, so
+    // fall back to the fully-general evaluator — those kernels are correctness-
+    // first and still avoid the segment cascade.
+#if (POW_HW_ROOT_N != 2) || defined(POW_HW_RECIPROCAL)
+    (void)magic_hoist;
+    return pow_hw_eval<DEG>(x);
+#else
     vInt biased = exexp(x, ExponentMode::NoDebias);
     vInt e_int = biased - 127;
     vFloat m = setexp(x, 127);
@@ -583,6 +687,7 @@ inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist) {
     v_elseif(x == 0.0f) { result = 0.0f; }
     v_endif;
     return result;
+#endif
 }
 #endif  // HW_PRELOAD
 #endif
@@ -1478,9 +1583,14 @@ void kernel_main() {
     sfpi::vConstFloatPrgm1 = LOG_HW_COEFFS[LOG_HW_DEGREE];
     sfpi::vConstFloatPrgm2 = (LOG_HW_DEGREE >= 1) ? LOG_HW_COEFFS[LOG_HW_DEGREE - 1] : 0.0f;
 #elif defined(RANGE_REDUCTION_POW_HW)
-    sfpi::vConstFloatPrgm0 = POW_HW_SQRT2;
+    // Only plain sqrt (ROOT_N==2, no reciprocal) uses the preload fast path;
+    // cbrt/rsqrt fall back to the general evaluator (see pow_hw_eval_preloaded),
+    // which reads no prgm registers, so we must not clobber them there.
+#if (POW_HW_ROOT_N == 2) && !defined(POW_HW_RECIPROCAL)
+    sfpi::vConstFloatPrgm0 = POW_HW_SCALE_C1;  // sqrt(2)
     sfpi::vConstFloatPrgm1 = POW_HW_COEFFS[POW_HW_DEGREE];
     sfpi::vConstFloatPrgm2 = (POW_HW_DEGREE >= 1) ? POW_HW_COEFFS[POW_HW_DEGREE - 1] : 0.0f;
+#endif
 #endif
 #endif
 

@@ -489,12 +489,16 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
         basis = metadata.get("expalu_log2_basis", "natural")
         coeff_str = ", ".join(f"{clamp_float32(v):.10e}f" for v in coeffs)
         basis_macro = "#define LOG_HW_BASIS_M_MINUS_1\n" if basis == "m_minus_1" else ""
-        print(f"HW exponent-ALU log2: degree {degree}, scale {scale}, basis {basis}")
+        # log1p decomposes (x + 1) before log2 -> expalu_input_offset = 1.0.
+        offset = float(metadata.get("expalu_input_offset", "0.0") or "0.0")
+        offset_macro = f"#define LOG_HW_INPUT_OFFSET {clamp_float32(offset):.10e}f\n" if offset != 0.0 else ""
+        print(f"HW exponent-ALU log2: degree {degree}, scale {scale}, basis {basis}, input_offset {offset}")
         return (
             "\n// Hardware-exponent-ALU range reduction: log2 (exexp -> e, exman -> m)"
-            "\n// Natural-basis coeffs for h(m)=log2(m); result = (e + h(m)) * scale.\n"
+            "\n// Natural-basis coeffs for h(m)=log2(m); result = (e + h(m + offset)) * scale.\n"
             "#define RANGE_REDUCTION_LOG_HW\n"
             f"{basis_macro}"
+            f"{offset_macro}"
             f"{hw_preload_macro}"
             f"constexpr uint32_t LOG_HW_DEGREE = {degree};\n"
             f"constexpr float LOG_HW_COEFFS[] = {{{coeff_str}}};\n"
@@ -502,13 +506,26 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
         )
 
     if kind == "pow":
-        # pow expects s(m)=sqrt(m) on [1,2). Emit a coeff array + degree.
+        # pow expects p(m)=root_N(m) on [1,2). The fitter tags:
+        #   expalu_root_n      - root order N (2=sqrt, 3=cbrt)
+        #   expalu_reciprocal  - True -> final 1/result (rsqrt)
+        #   expalu_pow_scale_c{r} - root_N(2^r) scale constants, r in {0..N-1}
         coeff_str = ", ".join(f"{clamp_float32(v):.10e}f" for v in coeffs)
-        print(f"HW exponent-ALU pow: degree {degree}")
+        root_n = int(float(metadata.get("expalu_root_n", "2") or "2"))
+        recip = str(metadata.get("expalu_reciprocal", "False")).strip().lower() in ("true", "1")
+        recip_macro = "#define POW_HW_RECIPROCAL\n" if recip else ""
+        scale_macros = f"#define POW_HW_ROOT_N {root_n}\n"
+        for r in range(root_n):
+            key = f"expalu_pow_scale_c{r}"
+            if key in metadata:
+                scale_macros += f"#define POW_HW_SCALE_C{r} {clamp_float32(float(metadata[key])):.10e}f\n"
+        print(f"HW exponent-ALU pow: degree {degree}, root_n {root_n}, reciprocal {recip}")
         return (
-            "\n// Hardware-exponent-ALU range reduction: pow/sqrt (exexp -> e, exman -> m)"
-            "\n// Natural [1,2)-basis coeffs for s(m)=sqrt(m); recombine 2^(e/2)*sqrt(2)^r.\n"
+            "\n// Hardware-exponent-ALU range reduction: pow/root_N (exexp -> e, exman -> m)"
+            "\n// Natural [1,2)-basis coeffs for root_N(m); recombine 2^(e/N)*root_N(2^r)*p(m).\n"
             "#define RANGE_REDUCTION_POW_HW\n"
+            f"{scale_macros}"
+            f"{recip_macro}"
             f"{hw_preload_macro}"
             f"constexpr uint32_t POW_HW_DEGREE = {degree};\n"
             f"constexpr float POW_HW_COEFFS[] = {{{coeff_str}}};\n"
