@@ -91,6 +91,55 @@ def detect_segment_degree(coefficients: List[float], max_degree: int) -> int:
     return 0
 
 
+def detect_affine_collapse(lut_info: Dict) -> Dict:
+    """Detect when the WHOLE fit collapses to a single affine map y = c0 + c1*x.
+
+    Generic (not hardcoded per-activation): a 1-segment polynomial whose effective
+    degree is <= 1 with NO range reduction is exactly c0 + c1*x over the domain.
+    Two sub-cases:
+      - identity:  c0 == 0 and c1 == 1  -> y = x  (emit a PURE COPY, skip the SFPU
+        eval entirely: copy_tile already places x in dst, pack stores it).
+      - affine:    otherwise            -> y = c0 + c1*x (one SFPMAD per element).
+
+    Any activation whose fit reduces to these shapes qualifies (abs does NOT — it
+    is a 2-segment sign split, handled elsewhere). Returns {} when not applicable.
+    """
+    metadata = lut_info.get("metadata", {})
+    method = str(metadata.get("range_reduction_method", "none") or "none").strip()
+    if method not in ("", "none"):
+        return {}  # range reduction means the poly is on a reduced domain, not affine in x
+    if lut_info.get("num_segments", 0) != 1:
+        return {}
+    raw = lut_info.get("raw_coefficients") or []
+    if len(raw) != 1:
+        return {}
+    coeffs = raw[0]
+    # Effective degree must be <= 1 (all higher-order coeffs exactly zero).
+    if any(c != 0.0 for c in coeffs[2:]):
+        return {}
+    c0 = float(coeffs[0]) if len(coeffs) >= 1 else 0.0
+    c1 = float(coeffs[1]) if len(coeffs) >= 2 else 0.0
+    is_identity = c0 == 0.0 and c1 == 1.0
+    return {"c0": c0, "c1": c1, "identity": is_identity}
+
+
+def get_affine_collapse_macros(lut_info: Dict) -> str:
+    """Emit AFFINE_COLLAPSE / AFFINE_IDENTITY macros when the fit is affine in x."""
+    info = detect_affine_collapse(lut_info)
+    if not info:
+        return ""
+    if info["identity"]:
+        print("AFFINE COLLAPSE: fit is identity (c0=0, c1=1) -> pure-copy bypass (no SFPU eval)")
+        return "\n// Affine collapse: fit is y = x. Emit a pure tile copy (no SFPU eval).\n#define AFFINE_COLLAPSE\n#define AFFINE_IDENTITY\n"
+    print(f"AFFINE COLLAPSE: fit is y = {info['c0']:.6g} + {info['c1']:.6g}*x -> single SFPMAD bypass")
+    return (
+        "\n// Affine collapse: fit is y = c0 + c1*x over the whole domain. One SFPMAD.\n"
+        "#define AFFINE_COLLAPSE\n"
+        f"#define AFFINE_C0 {clamp_float32(info['c0']):.10e}f\n"
+        f"#define AFFINE_C1 {clamp_float32(info['c1']):.10e}f\n"
+    )
+
+
 def format_lut_array(values: List[float], indent: int = 4) -> str:
     """Format a list of floats as a C++ array literal."""
     lines = []
@@ -679,6 +728,7 @@ def generate_polynomial_kernel(
     adaptive_degree = get_adaptive_degree_macros(lut_info.get("segment_degrees", []), degree)
     poly_parity = get_poly_parity_macros(lut_info, degree)
     asymptotic = get_asymptotic_macros(lut_info)
+    affine = get_affine_collapse_macros(lut_info)
 
     # Degree 0 (constant) is special case - uses different base kernel
     if degree == 0:
@@ -720,7 +770,7 @@ constexpr std::array<float, LUT_SIZE_FP32> LUT_DATA_FP32 = {{{{
     constexpr auto& LUT_DATA = LUT_DATA_FP32;
     constexpr uint32_t LUT_SIZE = LUT_SIZE_FP32;
 #endif
-{adaptive_degree}{poly_parity}{range_reduction}{asymptotic}
+{adaptive_degree}{poly_parity}{range_reduction}{asymptotic}{affine}
 #include "{base_kernel}"
 """
 

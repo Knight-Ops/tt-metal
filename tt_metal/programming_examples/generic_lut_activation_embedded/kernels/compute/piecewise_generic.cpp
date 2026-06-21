@@ -48,10 +48,11 @@ namespace kutil = norm::kernel_util;
 
 // Range reduction: Cody-Waite method for exp/trig, mantissa/exponent extraction for log/cbrt
 // Only included when RANGE_REDUCTION_* or ASYMPTOTIC_FACTOR_* is defined
-#if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG) ||                  \
-    defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_CBRT) || defined(RANGE_REDUCTION_EXP_HW) ||               \
-    defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || \
-    defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) || defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
+#if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG) ||              \
+    defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_CBRT) || defined(RANGE_REDUCTION_EXP_HW) ||           \
+    defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || defined(RANGE_REDUCTION_NEWTON_ROOT) || \
+    defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) ||                          \
+    defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
 #include "sfpu/ckernel_sfpu_converter.h"
 #endif
 
@@ -353,10 +354,17 @@ inline vFloat exp_hw_eval(vFloat x) {
 // under heavy paths like sigmoid (reciprocal + clamp + mult all live at once).
 //
 // Math is byte-identical to exp_hw_eval (same SFPMAD Horner, same order).
+// cvspill points at a caller-hoisted, loop-invariant vFloat array holding the
+// coefficients BELOW the two prgm-resident ones: cvspill[0]=c[DEG-2],
+// cvspill[1]=c[DEG-3], ... cvspill[DEG-2]=c[0]. Materializing them as pre-loop
+// LREGs (not reading EXP_HW_COEFFS[k] inside the body) is FIX A: it drives the
+// in-body SFPLOADI count for the Horner chain to ZERO (top-2 in prgm, rest in
+// LREGs) instead of 2-per-spilled-coeff. nullptr -> fall back to the global.
 template <uint32_t DEG>
 inline vFloat exp_hw_eval_preloaded(
     vFloat x,
-    vFloat thr_hi_hoist
+    vFloat thr_hi_hoist,
+    const vFloat* cvspill
 #if defined(EXP_HW_COMPOSE_SIGMOID)
     ,
     vFloat mult_hoist
@@ -386,15 +394,16 @@ inline vFloat exp_hw_eval_preloaded(
     vMag fm = exman(z);                          // fraction * 2^23
     vFloat f = convert<vFloat>(fm, RoundMode::Nearest) * 0x1p-23f;
 
-    // Degree-N Horner. Top-2 coeffs come from prgm regs; the rest from the global.
+    // Degree-N Horner. Top-2 coeffs come from prgm regs; the rest from the
+    // caller-hoisted LREG array cvspill (FIX A: no in-body SFPLOADI for them).
     // p = (((c[DEG])*f + c[DEG-1])*f + c[DEG-2])*f + ... + c[0]
-    const float* c = EXP_HW_COEFFS;
     vFloat p;
     if constexpr (DEG >= 1) {
         p = vConstFloatPrgm1 * f + vConstFloatPrgm2;  // c[DEG]*f + c[DEG-1]
 #pragma GCC unroll 16
         for (int k = (int)DEG - 2; k >= 0; k--) {
-            p = p * f + c[k];
+            // cvspill index walks c[DEG-2], c[DEG-3], ... c[0] as k descends.
+            p = p * f + cvspill[(int)DEG - 2 - k];
         }
     } else {
         p = vConstFloatPrgm1;  // degree-0: c[0]
@@ -477,8 +486,9 @@ inline vFloat log_hw_eval(vFloat x) {
 // GENERIC constant-pool preload variant of log_hw_eval (any degree).
 // Ranking: prgm0 = LOG_HW_SCALE, prgm1 = c[DEG], prgm2 = c[DEG-1]; cv[] = c[DEG-2..0].
 // 127 / 1.0 are SFPMAD imm / const-lane. Math byte-identical to log_hw_eval.
+// cvspill: caller-hoisted LREG array of the below-prgm coeffs (c[DEG-2..0]).
 template <uint32_t DEG>
-inline vFloat log_hw_eval_preloaded(vFloat x) {
+inline vFloat log_hw_eval_preloaded(vFloat x, const vFloat* cvspill) {
     constexpr float OFFSET = LOG_HW_INPUT_OFFSET;
     vFloat xd = (OFFSET != 0.0f) ? (x + OFFSET) : x;
 
@@ -491,13 +501,12 @@ inline vFloat log_hw_eval_preloaded(vFloat x) {
 #else
     vFloat u = m;
 #endif
-    const float* c = LOG_HW_COEFFS;
     vFloat h;
     if constexpr (DEG >= 1) {
         h = vConstFloatPrgm1 * u + vConstFloatPrgm2;  // c[DEG]*u + c[DEG-1]
 #pragma GCC unroll 16
         for (int k = (int)DEG - 2; k >= 0; k--) {
-            h = h * u + c[k];
+            h = h * u + cvspill[(int)DEG - 2 - k];  // c[DEG-2], c[DEG-3], ... c[0]
         }
     } else {
         h = vConstFloatPrgm1;  // degree-0: c[0]
@@ -514,6 +523,156 @@ inline vFloat log_hw_eval_preloaded(vFloat x) {
     return result;
 }
 #endif  // HW_PRELOAD
+#endif
+
+#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+// ============================================================================
+// Newton-Raphson magic-seed square root (mirrors TTNN's native ckernel sqrt).
+//
+// This is the INTEGER-ROOT fast path. Instead of decomposing x = 2^e * m and
+// rebuilding the exponent (the pow_hw path, ~39 SFPU instrs), we operate
+// directly on the raw IEEE bits:
+//
+//   i  = bits(x) >> 1                                  (one shift)
+//   y0 = bits( MAGIC - i )                             (one integer subtract)
+//
+// The magic-constant subtraction produces a seed y0 ~= 1/sqrt(x)-ish whose
+// EXPONENT is already halved AND whose parity (the sqrt(2) odd-exponent scale)
+// is already folded into the seed -- so there is NO exexp/setexp/cast/parity
+// cascade at all. Two Newton-Raphson refinement steps recover full fp32
+// precision. The 3 loop-invariant constants (MAGIC seed, two Newton coeffs)
+// live in the programmable const registers (preloaded once), so the recorded
+// per-element body reloads NONE of them.
+//
+// Algorithm: SQRT_23-bits from Kokosinski et al. (2024), the exact algorithm
+// the native blackhole ckernel_sfpu_sqrt.h uses. The fitter owns the seed
+// magic and Newton coefficients (metadata: newton_root_magic / newton_root_c1
+// / newton_root_c2), so this generalizes to any even-root / accuracy target it
+// chooses to tune -- it is not hand-wired for sqrt.
+#ifndef NEWTON_ROOT_MAGIC
+#define NEWTON_ROOT_MAGIC 0x5f1110a0
+#endif
+#ifndef NEWTON_ROOT_C1
+#define NEWTON_ROOT_C1 2.2825186f
+#endif
+#ifndef NEWTON_ROOT_C2
+#define NEWTON_ROOT_C2 2.2533049f
+#endif
+// Root order N (2 = sqrt/rsqrt, 3 = cbrt) and the rsqrt/inverse flavour are
+// metadata-driven (newton_root_n / newton_root_reciprocal). Defaults keep the
+// path byte-identical to native sqrt when no extra tags are emitted.
+#ifndef NEWTON_ROOT_N
+#define NEWTON_ROOT_N 2
+#endif
+#ifndef NEWTON_ROOT_ITERS
+#define NEWTON_ROOT_ITERS 3
+#endif
+
+#if (NEWTON_ROOT_N == 2) && !defined(NEWTON_ROOT_RECIPROCAL)
+// --- sqrt: magic seed + SQRT_23-bit double-Newton (native parity) ------------
+inline vFloat newton_root_sqrt(vFloat x) {
+    vInt i = reinterpret<vInt>(reinterpret<vUInt>(x) >> 1);
+    vFloat y = reinterpret<vFloat>(vConstIntPrgm0 - i);  // MAGIC seed (preloaded)
+
+    // SQRT_23-bits: two Newton-Raphson steps. prgm1/prgm2 preloaded.
+    vFloat xy = x * y;
+    vFloat negative_y = -y;
+    vFloat c = negative_y * xy;
+    y = y * (vConstFloatPrgm1 + c * (vConstFloatPrgm2 + c));
+    xy = x * y;
+    negative_y = -y;
+    vFloat one_minus_xyy = vConst1 + (negative_y * xy);
+    vFloat half_xy = addexp(xy, -1);  // 0.5*xy via exponent decrement (no 0.5 immediate)
+    vFloat infinity = sFloat16b(std::numeric_limits<float>::infinity());
+    // Skip the final correction at x==inf (avoids inf-inf = NaN; y already inf).
+    v_if(reinterpret<vInt>(x) < reinterpret<vInt>(infinity)) { y = one_minus_xyy * half_xy + xy; }
+    v_endif;
+    // sqrt of a negative is NaN.
+    v_if(x < 0.0f) { y = std::numeric_limits<float>::quiet_NaN(); }
+    v_endif;
+    return y;
+}
+#endif  // sqrt variant
+
+#if (NEWTON_ROOT_N == 2) && defined(NEWTON_ROOT_RECIPROCAL)
+// --- rsqrt: classic inverse-sqrt magic seed + Newton (y = y*(1.5 - 0.5*x*y*y))-
+// The seed IS 1/sqrt(x) directly, so NO final reciprocal op is needed. Each
+// Newton step is one mul + two mads. 2 steps -> <=1 bf16 ULP, 3 -> exact.
+inline vFloat newton_root_rsqrt(vFloat x) {
+    vInt i = reinterpret<vInt>(reinterpret<vUInt>(x) >> 1);
+    vFloat y = reinterpret<vFloat>(vConstIntPrgm0 - i);  // inverse-sqrt MAGIC seed
+    vFloat half_x = addexp(x, -1);                       // 0.5*x (exponent decrement)
+#pragma GCC unroll 4
+    for (int s = 0; s < NEWTON_ROOT_ITERS; s++) {
+        y = y * (vConstFloatPrgm1 - half_x * (y * y));  // prgm1 = 1.5
+    }
+    v_if(x < 0.0f) { y = std::numeric_limits<float>::quiet_NaN(); }
+    v_endif;
+    v_if(x == 0.0f) { y = std::numeric_limits<float>::infinity(); }
+    v_endif;
+    return y;
+}
+#endif  // rsqrt variant
+
+#if (NEWTON_ROOT_N == 3)
+// --- cbrt: minimal exponent seed + DIVISION-FREE cubic Householder ---------
+// Odd function: work on |x|, restore sign. The SFPU has no 32-bit float->int (so
+// the classic bits/3+magic seed isn't expressible) AND its reciprocal LLK is
+// register-heavy (inlining it per-element overflows the SFPU register file ->
+// trisc "maximum reload insns" ICE). So we iterate the INVERSE cube root
+// w -> |x|^(-1/3) with a DIVISION-FREE cubic Householder step:
+//     c = 1 - |x|*w^3 ;  w <- w * (1 + c/3 + 2c^2/9)
+// then cbrt(|x|) = |x| * w^2. Seed w0 = 2^(-round(e/3)) * (-0.27*m + 1.25), a
+// linear m^(-1/3) approx. The exponent-parity is NOT folded in (keeps the body
+// register-light); 3 cubic steps recover <=1 bf16 ULP (validated).
+inline vFloat newton_root_cbrt(vFloat x) {
+    vInt sign_bits = reinterpret<vInt>(x) & (vInt)0x80000000;
+    vFloat ax = setsgn(x, 0);  // work on |x|; cbrt is odd, sign restored at end
+
+    vInt e_int = exexp(ax, ExponentMode::NoDebias) - 127;
+    vFloat m = setexp(ax, 127);
+
+    // q = round(e/3) via the 0x4B400000 float magic (e small -> exact in float).
+    // Round-to-nearest (NOT floor+parity): keeps the body register-light enough
+    // to avoid the trisc "maximum reload insns" ICE. The missing exponent parity
+    // is absorbed by one extra cubic Householder step.
+    const vFloat magic = ckernel::sfpu::Converter::as_float(0x4B400000U);
+    vFloat ef = int32_to_float(e_int, RoundMode::Nearest);
+    v_if(e_int < 0) { ef = -int32_to_float(~e_int + 1, RoundMode::Nearest); }
+    v_endif;
+    vInt q = reinterpret<vInt>(ef * (1.0f / 3.0f) + magic) - reinterpret<vInt>(magic);
+
+    // w0 = 2^(-q) * (-0.27*m + 1.25): linear m^(-1/3) seed, exponent shifted -q.
+    vFloat wm = -0.27f * m + 1.25f;
+    vFloat w = setexp(wm, exexp(wm, ExponentMode::NoDebias) - q);
+
+    // Division-free cubic Householder on the inverse cube root.
+    const vFloat a13 = 1.0f / 3.0f;
+    const vFloat a29 = 2.0f / 9.0f;
+    for (int s = 0; s < NEWTON_ROOT_ITERS; s++) {
+        vFloat c = 1.0f - ax * (w * w * w);
+        w = w * (1.0f + c * a13 + (c * c) * a29);
+    }
+    vFloat y = ax * w * w;  // cbrt(|x|) = |x| * w^2
+    // restore sign (cbrt is odd); cbrt(0)=0 handled explicitly.
+    y = reinterpret<vFloat>(reinterpret<vInt>(y) | sign_bits);
+    v_if(x == 0.0f) { y = 0.0f; }
+    v_endif;
+    return y;
+}
+#endif  // cbrt variant
+
+template <uint32_t DEG>
+inline vFloat newton_root_eval(vFloat x) {
+    (void)DEG;  // degree is irrelevant for the Newton path (kept for caller symmetry)
+#if (NEWTON_ROOT_N == 3)
+    return newton_root_cbrt(x);
+#elif defined(NEWTON_ROOT_RECIPROCAL)
+    return newton_root_rsqrt(x);
+#else
+    return newton_root_sqrt(x);
+#endif
+}
 #endif
 
 #if defined(RANGE_REDUCTION_POW_HW)
@@ -654,8 +813,9 @@ inline vFloat pow_hw_eval(vFloat x) {
 // Ranking: prgm0 = SQRT2, prgm1 = c[DEG], prgm2 = c[DEG-1]; cv[] = c[DEG-2..0].
 // 'magic' (round helper) is hoisted into an LREG by the caller and passed by value.
 // Math byte-identical to pow_hw_eval.
+// cvspill: caller-hoisted LREG array of the below-prgm coeffs (c[DEG-2..0]).
 template <uint32_t DEG>
-inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist) {
+inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist, const vFloat* cvspill) {
     // The preload optimization (prgm0 = sqrt(2)) only applies to plain sqrt
     // (ROOT_N == 2, no reciprocal). For odd roots (cbrt) and the reciprocal
     // fold (rsqrt) the scale/sign/recip logic doesn't fit the 3-prgm budget, so
@@ -663,19 +823,19 @@ inline vFloat pow_hw_eval_preloaded(vFloat x, vFloat magic_hoist) {
     // first and still avoid the segment cascade.
 #if (POW_HW_ROOT_N != 2) || defined(POW_HW_RECIPROCAL)
     (void)magic_hoist;
+    (void)cvspill;
     return pow_hw_eval<DEG>(x);
 #else
     vInt biased = exexp(x, ExponentMode::NoDebias);
     vInt e_int = biased - 127;
     vFloat m = setexp(x, 127);
 
-    const float* c = POW_HW_COEFFS;
     vFloat s;
     if constexpr (DEG >= 1) {
         s = vConstFloatPrgm1 * m + vConstFloatPrgm2;  // c[DEG]*m + c[DEG-1]
 #pragma GCC unroll 16
         for (int k = (int)DEG - 2; k >= 0; k--) {
-            s = s * m + c[k];
+            s = s * m + cvspill[(int)DEG - 2 - k];  // c[DEG-2], c[DEG-3], ... c[0]
         }
     } else {
         s = vConstFloatPrgm1;  // degree-0: c[0]
@@ -1541,6 +1701,25 @@ inline void piecewise_generic_lut_dual(const std::array<float, LUT_SIZE>& lut) {
 // These use manual unrolling to work around Wormhole SFPU compiler bug
 #include "piecewise_generic_specialized.cpp"
 
+#if defined(AFFINE_COLLAPSE) && !defined(AFFINE_IDENTITY)
+// Affine collapse: the whole fit is y = c0 + c1*x. One SFPMAD per element,
+// bypassing the entire segment cascade / LUT machinery. c0/c1 are SFPMAD
+// immediates (single hoistable load each), so the per-element body is one MAD.
+inline void affine_collapse_eval() {
+    constexpr float C0 = AFFINE_C0;
+    constexpr float C1 = AFFINE_C1;
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = C1 * x + C0;
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+}
+#endif
+
 } // namespace sfpi
 #endif
 
@@ -1609,6 +1788,22 @@ void kernel_main() {
 #endif
 #endif
 
+#if defined(RANGE_REDUCTION_NEWTON_ROOT) && defined(TRISC_MATH)
+    // Newton-Raphson magic-seed root: preload the seed magic + Newton coeffs into
+    // the programmable const registers ONCE so the recorded per-element body
+    // reloads none of them (mirrors native sqrt_init).
+    //   sqrt : prgm0=magic, prgm1=C1, prgm2=C2 (SQRT_23-bit double-Newton).
+    //   rsqrt: prgm0=inverse-sqrt magic, prgm1=C1 (=1.5 step constant).
+    //   cbrt : prgm0=cube magic; reciprocal-of-y^2 needs sfpu_reciprocal_init.
+#if (NEWTON_ROOT_N != 3)
+    // sqrt/rsqrt: magic seed + Newton coeffs in prgm regs. cbrt is division-free
+    // (no reciprocal LLK) and reads its magic/constants as in-body literals.
+    sfpi::vConstIntPrgm0 = NEWTON_ROOT_MAGIC;
+    sfpi::vConstFloatPrgm1 = NEWTON_ROOT_C1;  // sqrt: C1; rsqrt: 1.5 step constant
+    sfpi::vConstFloatPrgm2 = NEWTON_ROOT_C2;  // sqrt: C2; rsqrt: unused
+#endif
+#endif
+
 #if defined(RANGE_REDUCTION_TAN) && defined(TRISC_MATH)
     ckernel::sfpu::sfpu_reciprocal_init<false>();
 #endif
@@ -1624,8 +1819,18 @@ void kernel_main() {
         // All degree parameters are constexpr — use them directly as template args.
         // No dispatch table needed; works for ANY poly_degree automatically.
         #ifdef TRISC_MATH
+#if defined(AFFINE_IDENTITY)
+        // Identity collapse (y = x): copy_tile already placed x in dst; the SFPU
+        // eval is a pure no-op, so skip it entirely (no Horner, no LUT, no cascade).
+        (void)p_lut;
+#elif defined(AFFINE_COLLAPSE)
+        // Affine collapse (y = c0 + c1*x): one SFPMAD per element, no cascade.
+        (void)p_lut;
+        sfpi::affine_collapse_eval();
+#else
         sfpi::piecewise_generic_lut_dispatch<poly_degree, num_segments, lut_size>(*p_lut);
-        #endif
+#endif
+#endif
 
         tile_regs_commit();
         tile_regs_wait();

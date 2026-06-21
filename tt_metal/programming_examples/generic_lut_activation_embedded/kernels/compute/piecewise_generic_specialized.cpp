@@ -37,9 +37,30 @@
 // folded constants are constexpr and become SFPMAD immediates).
 // ============================================================================
 
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
+    defined(RANGE_REDUCTION_NEWTON_ROOT)
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /*lut*/) {
+#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+    // Newton-Raphson magic-seed root: constants preloaded in kernel_main, no
+    // per-loop hoist needed. sqrt/rsqrt mirror native (~15-18 SFPU instrs); cbrt
+    // is division-free (inverse-cube-root multiply-only Newton). All fit the
+    // register budget unrolled, but cbrt's larger body unrolls more modestly.
+#if (NEWTON_ROOT_N == 3)
+#pragma GCC unroll 2
+#else
+#pragma GCC unroll 8
+#endif
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = newton_root_eval<POLY_DEGREE>(x);
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+    return;
+#else  // !RANGE_REDUCTION_NEWTON_ROOT
 #if defined(HW_PRELOAD)
     // GENERIC constant-pool preload path (exp2 / log2 / pow, any degree). The 3
     // hottest constants live in vConstFloatPrgm0/1/2 (programmed ONCE in
@@ -52,12 +73,23 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
 #if defined(EXP_HW_COMPOSE_SIGMOID)
     vFloat mult_hoist = EXP_HW_MULT;  // prgm0 reserved for sfpu_reciprocal
 #endif
+    // FIX A: hoist the below-prgm coeffs (c[DEG-2..0]) into pre-loop LREGs ONCE so
+    // the per-element Horner reloads none of them (drives in-body SFPLOADI -> 0).
+    // [EXP_HW_DEGREE>=2 ? EXP_HW_DEGREE-1 : 1] keeps the array non-zero-sized.
+    vFloat exp_cvspill[(EXP_HW_DEGREE >= 2) ? (EXP_HW_DEGREE - 1) : 1];
+    if constexpr (EXP_HW_DEGREE >= 2) {
+#pragma GCC unroll 16
+        for (int k = 0; k < (int)EXP_HW_DEGREE - 1; k++) {
+            exp_cvspill[k] = EXP_HW_COEFFS[(int)EXP_HW_DEGREE - 2 - k];  // c[DEG-2]..c[0]
+        }
+    }
 #pragma GCC unroll 8
     for (int d = 0; d < 32; d++) {
         vFloat x = dst_reg[d];
         vFloat y = exp_hw_eval_preloaded<EXP_HW_DEGREE>(
             x,
-            thr_hoist
+            thr_hoist,
+            exp_cvspill
 #if defined(EXP_HW_COMPOSE_SIGMOID)
             ,
             mult_hoist
@@ -70,10 +102,18 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
     }
     return;
 #elif defined(RANGE_REDUCTION_LOG_HW)
+    // FIX A: hoist below-prgm coeffs c[DEG-2..0] into pre-loop LREGs (see exp).
+    vFloat log_cvspill[(LOG_HW_DEGREE >= 2) ? (LOG_HW_DEGREE - 1) : 1];
+    if constexpr (LOG_HW_DEGREE >= 2) {
+#pragma GCC unroll 16
+        for (int k = 0; k < (int)LOG_HW_DEGREE - 1; k++) {
+            log_cvspill[k] = LOG_HW_COEFFS[(int)LOG_HW_DEGREE - 2 - k];
+        }
+    }
 #pragma GCC unroll 8
     for (int d = 0; d < 32; d++) {
         vFloat x = dst_reg[d];
-        vFloat y = log_hw_eval_preloaded<LOG_HW_DEGREE>(x);
+        vFloat y = log_hw_eval_preloaded<LOG_HW_DEGREE>(x, log_cvspill);
 #ifdef USE_BF16
         y = convert<vFloat16b>(y, RoundMode::Nearest);
 #endif
@@ -82,10 +122,18 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
     return;
 #elif defined(RANGE_REDUCTION_POW_HW)
     vFloat magic_hoist = ckernel::sfpu::Converter::as_float(0x4B400000U);
+    // FIX A: hoist below-prgm coeffs c[DEG-2..0] into pre-loop LREGs (see exp).
+    vFloat pow_cvspill[(POW_HW_DEGREE >= 2) ? (POW_HW_DEGREE - 1) : 1];
+    if constexpr (POW_HW_DEGREE >= 2) {
+#pragma GCC unroll 16
+        for (int k = 0; k < (int)POW_HW_DEGREE - 1; k++) {
+            pow_cvspill[k] = POW_HW_COEFFS[(int)POW_HW_DEGREE - 2 - k];
+        }
+    }
 #pragma GCC unroll 8
     for (int d = 0; d < 32; d++) {
         vFloat x = dst_reg[d];
-        vFloat y = pow_hw_eval_preloaded<POW_HW_DEGREE>(x, magic_hoist);
+        vFloat y = pow_hw_eval_preloaded<POW_HW_DEGREE>(x, magic_hoist, pow_cvspill);
 #ifdef USE_BF16
         y = convert<vFloat16b>(y, RoundMode::Nearest);
 #endif
@@ -110,6 +158,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
 #endif
         dst_reg[d] = y;
     }
+#endif  // !RANGE_REDUCTION_NEWTON_ROOT
 }
 #endif
 
@@ -843,7 +892,8 @@ constexpr bool blend_predicted_faster() {
 
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lut) {
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
+    defined(RANGE_REDUCTION_NEWTON_ROOT)
     // Hardware-exponent-ALU range reduction is a standalone evaluator — it owns
     // the entire approximation and ignores the piecewise segment cascade.
     piecewise_generic_lut_hw_reduce<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
