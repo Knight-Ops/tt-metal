@@ -298,7 +298,16 @@ inline vFloat exp_hw_eval(vFloat x) {
         p = p * f + c[k];
     }
 
-    vFloat y = setexp(p, ep);  // 2^i * 2^f == base^x
+    // Recombine 2^i * 2^f. `ep` is the biased exponent of the integer part
+    // (== i + 127). setexp only REPLACES p's exponent field, keeping its
+    // mantissa — which is correct only when p in [1,2) (exponent field 127).
+    // The fitter's natural [0,1) fit makes g(0)=c[0] dip just below 1.0 for some
+    // degrees (e.g. odd-degree exp2: c0=0.99992), putting p in [0.5,1) at f~=0
+    // (exponent field 126). Replacing that with ep then over-scales by 2x. Add
+    // p's own exponent deviation from the bias so the integer part composes with
+    // p's actual magnitude (mirrors pow_hw_eval's setexp(s, s_exp + q)).
+    vInt pe = exexp(p, ExponentMode::NoDebias);
+    vFloat y = setexp(p, ep + pe - 127);  // 2^i * 2^f == base^x
 
     // Optional compose post-transform (fitter folds the activation around exp2).
 #if defined(EXP_HW_COMPOSE_SIGMOID)
@@ -391,7 +400,13 @@ inline vFloat exp_hw_eval_preloaded(
         p = vConstFloatPrgm1;  // degree-0: c[0]
     }
 
-    vFloat y = setexp(p, ep);  // 2^i * 2^f == base^x
+    // Recombine 2^i * 2^f. setexp replaces p's exponent but keeps its mantissa,
+    // which is only correct for p in [1,2). The fitter's g(0)=c[0] dips below 1.0
+    // for some degrees (odd-degree exp2 c0=0.99992), so p lands in [0.5,1) at
+    // f~=0 and a bare setexp(p, ep) over-scales by 2x. Add p's own exponent
+    // deviation from the bias (matches the non-preloaded exp_hw_eval + pow path).
+    vInt pe = exexp(p, ExponentMode::NoDebias);
+    vFloat y = setexp(p, ep + pe - 127);  // 2^i * 2^f == base^x
 
 #if defined(EXP_HW_COMPOSE_SIGMOID)
     y = ckernel::sfpu::sfpu_reciprocal<false>(1.0f + y);
