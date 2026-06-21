@@ -8,13 +8,14 @@
 // and write tiles to the DRAM output tensor at this core's (mt, nt_d) region,
 // looped over `effective_chunks` chunks.
 //
-// Two-RISC weight read: the writer (NCRISC, NoC 1) reads `up` concurrent with
-// the reader's NoC-0 `gate` read. Two modes:
-//   * writer_mcasts_up (UP_WRITER_MCAST, short-seq): writer reads `up` and
-//     multicasts it down its N-column on NoC 1. Unsafe beside fabric CCL ops.
-//   * writer_split_up (UP_SPLIT, 2D/long-seq): writer only reads `up` on NoC 1
-//     into the gy=0 sender's cb_in1_up slot; the reader multicasts it on NoC 0.
-//     A local up_go/up_done handshake orders the two. Fabric-safe.
+// Two-RISC weight read: the writer (NCRISC) reads `up` from DRAM on NoC 1
+// concurrent with the reader's NoC-0 `gate` read. The program factory selects
+// UP_SPLIT (writer_split_up) for ALL layouts: the writer reads `up` into the
+// gy=0 sender's cb_in1_up slot and the reader multicasts it on NoC 0, ordered by
+// a local up_go/up_done handshake. Only a NoC-1 DRAM read happens here — no
+// worker multicast and no NoC-1 atomics — so it is safe beside the fabric CCL
+// ops. The legacy writer-side NoC-1 multicast mode (UP_WRITER_MCAST /
+// writer_mcasts_up) is retired and never selected.
 // Per chunk the writer produces all `up` K-blocks, then drains `cb_out`.
 
 #include <cstdint>
