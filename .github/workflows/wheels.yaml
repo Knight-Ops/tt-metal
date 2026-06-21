@@ -82,15 +82,17 @@ jobs:
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
           echo "CCACHE_REMOTE_STORAGE: ${CCACHE_REMOTE_STORAGE}"
-          # NOTE: do NOT add garage to NO_PROXY here. This job runs directly on the host
-          # runner (no container:), which reaches in-cluster services only through the
-          # restricted Squid proxy (http://proxy.restricted-proxy.svc.cluster.local:3128).
-          # Garage's domain + port 3900 are allowlisted in Squid as plain-HTTP forward-proxy
-          # targets, so traffic must go THROUGH the proxy — bypassing it via NO_PROXY makes
-          # the host attempt a direct connection that has no route and fails (HTTP 400).
-          # curl and the AWS Go SDK both honor HTTP_PROXY and SigV4 signing is unaffected by
-          # forward-proxying, so leaving the proxy in place is correct for both the verify
-          # step below and the ccache-storage-s3 helper inside cibuildwheel.
+          # Garage is a cluster-internal service that is ONLY reachable directly from inside a
+          # Docker bridge network (the same way build-artifact.yaml's container: job reaches it).
+          # The restricted Squid proxy does NOT work for garage from this job: a SigV4-signed
+          # request forward-proxied through Squid is rejected by Garage with HTTP 400, and the
+          # bare host runner has no direct route to the garage ClusterIP at all. Both the verify
+          # step and the cibuildwheel build container below therefore run inside a Docker
+          # container and connect DIRECTLY to garage, bypassing the proxy via NO_PROXY — exactly
+          # like build-artifact.yaml. We export the bypass here so it is inherited by the
+          # docker-run verify step and forwarded into the cibuildwheel container.
+          echo "NO_PROXY=${NO_PROXY:+${NO_PROXY},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
+          echo "no_proxy=${no_proxy:+${no_proxy},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
           # Enable debug logging from the ccache-storage-s3 helper binary.
           echo "CRSH_LOGFILE=/tmp/ccache-storage-s3.log" >> $GITHUB_ENV
           # AWS SDK Go v2 (≥1.32) computes CRC32 checksums on every PutObject by default.
@@ -104,20 +106,37 @@ jobs:
 
       - name: Verify S3 connectivity (write / read-back / delete)
         if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false }}
+        # Run the probe INSIDE a Docker container on the default bridge network, NOT on the bare
+        # host. The host runner cannot reach the garage ClusterIP directly, and forward-proxying
+        # the SigV4 request through Squid returns HTTP 400. A bridge-networked container (the same
+        # context cibuildwheel uses for the build below, and the same context that makes
+        # build-artifact.yaml's container: job pass this identical probe) routes directly to
+        # garage:3900. We bypass the proxy inside the container via --env NO_PROXY so curl
+        # connects straight to garage.
         run: |
-          BASE="http://garage.garage.svc.cluster.local:3900/${CCACHE_S3_BUCKET}/${CCACHE_S3_PREFIX}/.s3-connectivity-test"
-          PAYLOAD="ccache-s3-connectivity-ok"
-          SIGV4="aws:amz:garage:s3"
-          CREDS="${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
-          # PUT
-          echo "${PAYLOAD}" | curl -fsS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
-            "${BASE}" --data-binary @- -o /dev/null
-          # GET and verify
-          RESULT=$(curl -fsS --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}")
-          [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '${RESULT}'"; exit 1; }
-          # DELETE
-          curl -fsS -X DELETE --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" -o /dev/null
-          echo "S3 connectivity verified: write/read-back/delete all OK"
+          docker run --rm \
+            --env AWS_ACCESS_KEY_ID \
+            --env AWS_SECRET_ACCESS_KEY \
+            --env CCACHE_S3_BUCKET \
+            --env CCACHE_S3_PREFIX \
+            --env NO_PROXY=garage.garage.svc.cluster.local \
+            --env no_proxy=garage.garage.svc.cluster.local \
+            "${{ inputs.docker-image }}" \
+            bash -euo pipefail -c '
+              BASE="http://garage.garage.svc.cluster.local:3900/${CCACHE_S3_BUCKET}/${CCACHE_S3_PREFIX}/.s3-connectivity-test"
+              PAYLOAD="ccache-s3-connectivity-ok"
+              SIGV4="aws:amz:garage:s3"
+              CREDS="${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
+              # PUT
+              echo "${PAYLOAD}" | curl -fsS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
+                "${BASE}" --data-binary @- -o /dev/null
+              # GET and verify
+              RESULT=$(curl -fsS --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}")
+              [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '"'"'${RESULT}'"'"'"; exit 1; }
+              # DELETE
+              curl -fsS -X DELETE --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" -o /dev/null
+              echo "S3 connectivity verified: write/read-back/delete all OK"
+            '
 
       - name: ⬇️ Checkout
         uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
@@ -166,18 +185,15 @@ jobs:
             CIBW_ENABLE_TRACY="${{ inputs.tracy && 'ON' || 'OFF' }}"
             CIBW_BUILD_TYPE="${{ inputs.build-type }}"
             CIBW_ENABLE_LTO="${{ inputs.enable-lto && 'ON' || 'OFF' }}"
-          # Forward the host runner's restricted-proxy settings INTO the cibuildwheel
-          # container. The s3:// ccache helper (AWS Go SDK) inside the container reaches
-          # Garage only through the Squid proxy (garage's domain + port 3900 are
-          # allowlisted there); without the proxy it has no route to the in-cluster
-          # service. $HTTP_PROXY expansion in CIBW_ENVIRONMENT resolves against the
-          # *container* env (empty), so we must use environment-pass, which copies the
-          # named variables from the host runner process env into the container.
-          # PyPI and the other build domains are also proxy-allowlisted, so routing the
-          # whole build through the proxy is safe.
-          CIBW_ENVIRONMENT_PASS_LINUX: >-
-            HTTP_PROXY HTTPS_PROXY NO_PROXY
-            http_proxy https_proxy no_proxy
+            NO_PROXY=garage.garage.svc.cluster.local
+            no_proxy=garage.garage.svc.cluster.local
+          # cibuildwheel runs the build in a Docker container on the default bridge network.
+          # From that bridge the ccache-storage-s3 helper (AWS Go SDK) reaches garage:3900
+          # DIRECTLY — the same path that makes build-artifact.yaml's container: job work.
+          # Routing garage through the Squid proxy instead returns HTTP 400 on the SigV4 PUT,
+          # so we set NO_PROXY=garage above to bypass the proxy for garage. The helper honors
+          # NO_PROXY (AWS Go SDK). CCACHE_REMOTE_ONLY=true keeps a helper that still can't
+          # reach garage non-fatal, so the compile proceeds regardless.
           CIBW_BEFORE_BUILD: "mkdir -p /tmp/ccache && ccache -z && ccache -p"
           CIBW_BEFORE_TEST: ccache -s
           CIBW_TEST_COMMAND: 'python -c "import ttnn"'
