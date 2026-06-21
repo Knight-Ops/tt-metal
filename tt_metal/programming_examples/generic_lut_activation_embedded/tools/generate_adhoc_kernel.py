@@ -479,6 +479,28 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
     kind = method[len("exponent_alu_") :]
     metadata = lut_info.get("metadata", {})
 
+    # newton_root: magic-seed + Newton, NO poly coeffs -- mirror run_csv.sh, fully metadata-driven.
+    if kind == "newton_root":
+        magic = metadata.get("newton_root_magic", "0x5f1110a0")
+        c1 = float(metadata.get("newton_root_c1", "2.2825186"))
+        c2 = float(metadata.get("newton_root_c2", "2.2533049"))
+        root_n = int(float(metadata.get("newton_root_n", metadata.get("expalu_root_n", "2")) or "2"))
+        recip = str(
+            metadata.get("newton_root_reciprocal", metadata.get("expalu_reciprocal", "False"))
+        ).strip().lower() in ("true", "1")
+        iters = int(float(metadata.get("newton_root_iters", "3") or "3"))
+        recip_macro = "#define NEWTON_ROOT_RECIPROCAL\n" if recip else ""
+        return (
+            "\n// Newton-Raphson magic-seed integer root (mirrors native sqrt/rsqrt/cbrt)\n"
+            "#define RANGE_REDUCTION_NEWTON_ROOT\n"
+            f"#define NEWTON_ROOT_MAGIC {magic}\n"
+            f"#define NEWTON_ROOT_C1 {c1:.10e}f\n"
+            f"#define NEWTON_ROOT_C2 {c2:.10e}f\n"
+            f"#define NEWTON_ROOT_N {root_n}\n"
+            f"#define NEWTON_ROOT_ITERS {iters}\n"
+            f"{recip_macro}"
+        )
+
     # Coefficients of the (single) reduced-domain polynomial.
     raw = lut_info.get("raw_coefficients")
     if not raw:
