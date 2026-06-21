@@ -130,10 +130,14 @@ def get_affine_collapse_macros(lut_info: Dict) -> str:
         return ""
     if info["identity"]:
         print("AFFINE COLLAPSE: fit is identity (c0=0, c1=1) -> pure-copy bypass (no SFPU eval)")
-        return "\n// Affine collapse: fit is y = x. Emit a pure tile copy (no SFPU eval).\n#define AFFINE_COLLAPSE\n#define AFFINE_IDENTITY\n"
+        return (
+            "\n// eval_method: affine_collapse / identity. fit is y = x -> pure tile copy (no SFPU eval).\n"
+            "#define EVAL_METHOD_AFFINE_COLLAPSE\n#define AFFINE_COLLAPSE\n#define AFFINE_IDENTITY\n"
+        )
     print(f"AFFINE COLLAPSE: fit is y = {info['c0']:.6g} + {info['c1']:.6g}*x -> single SFPMAD bypass")
     return (
-        "\n// Affine collapse: fit is y = c0 + c1*x over the whole domain. One SFPMAD.\n"
+        "\n// eval_method: affine_collapse. fit is y = c0 + c1*x over the whole domain. One SFPMAD.\n"
+        "#define EVAL_METHOD_AFFINE_COLLAPSE\n"
         "#define AFFINE_COLLAPSE\n"
         f"#define AFFINE_C0 {clamp_float32(info['c0']):.10e}f\n"
         f"#define AFFINE_C1 {clamp_float32(info['c1']):.10e}f\n"
@@ -491,8 +495,9 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
         iters = int(float(metadata.get("newton_root_iters", "3") or "3"))
         recip_macro = "#define NEWTON_ROOT_RECIPROCAL\n" if recip else ""
         return (
-            "\n// Newton-Raphson magic-seed integer root (mirrors native sqrt/rsqrt/cbrt)\n"
-            "#define RANGE_REDUCTION_NEWTON_ROOT\n"
+            "\n// eval_method: newton_root (magic-seed + Newton, NO polynomial fit). FIRST-CLASS\n"
+            "// standalone method -- not a 'kind' of exponent_alu. Mirrors native sqrt/rsqrt/cbrt.\n"
+            "#define EVAL_METHOD_NEWTON_ROOT\n"
             f"#define NEWTON_ROOT_MAGIC {magic}\n"
             f"#define NEWTON_ROOT_C1 {c1:.10e}f\n"
             f"#define NEWTON_ROOT_C2 {c2:.10e}f\n"
@@ -544,9 +549,10 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
             compose_macro = "#define EXP_HW_COMPOSE_MINUS_ONE\n"
         print(f"HW exponent-ALU exp2: degree {degree}, mult {mult}, compose {compose or 'none'}")
         return (
-            "\n// Hardware-exponent-ALU range reduction: exp2 (exman/exexp/setexp)"
+            "\n// eval_method: exponent_alu / exp2 (exman/exexp/setexp). STANDALONE evaluator."
             "\n// Natural [0,1)-basis coeffs for g(f)=2^f; kernel normalizes f then Horner.\n"
-            "#define RANGE_REDUCTION_EXP_HW\n"
+            "#define EVAL_METHOD_EXPONENT_ALU\n"
+            "#define EXPONENT_ALU_EXP2\n"
             f"#define EXP_HW_MULT {clamp_float32(float(mult)):.10e}f\n"
             f"{compose_macro}"
             f"{hw_preload_macro}"
@@ -565,9 +571,10 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
         offset_macro = f"#define LOG_HW_INPUT_OFFSET {clamp_float32(offset):.10e}f\n" if offset != 0.0 else ""
         print(f"HW exponent-ALU log2: degree {degree}, scale {scale}, basis {basis}, input_offset {offset}")
         return (
-            "\n// Hardware-exponent-ALU range reduction: log2 (exexp -> e, exman -> m)"
+            "\n// eval_method: exponent_alu / log2 (exexp -> e, exman -> m). STANDALONE evaluator."
             "\n// Natural-basis coeffs for h(m)=log2(m); result = (e + h(m + offset)) * scale.\n"
-            "#define RANGE_REDUCTION_LOG_HW\n"
+            "#define EVAL_METHOD_EXPONENT_ALU\n"
+            "#define EXPONENT_ALU_LOG2\n"
             f"{basis_macro}"
             f"{offset_macro}"
             f"{hw_preload_macro}"
@@ -592,9 +599,10 @@ def get_hw_exponent_alu_macros(method: str, lut_info: Dict) -> str:
                 scale_macros += f"#define POW_HW_SCALE_C{r} {clamp_float32(float(metadata[key])):.10e}f\n"
         print(f"HW exponent-ALU pow: degree {degree}, root_n {root_n}, reciprocal {recip}")
         return (
-            "\n// Hardware-exponent-ALU range reduction: pow/root_N (exexp -> e, exman -> m)"
+            "\n// eval_method: exponent_alu / pow/root_N (exexp -> e, exman -> m). STANDALONE."
             "\n// Natural [1,2)-basis coeffs for root_N(m); recombine 2^(e/N)*root_N(2^r)*p(m).\n"
-            "#define RANGE_REDUCTION_POW_HW\n"
+            "#define EVAL_METHOD_EXPONENT_ALU\n"
+            "#define EXPONENT_ALU_POW\n"
             f"{scale_macros}"
             f"{recip_macro}"
             f"{hw_preload_macro}"
@@ -614,24 +622,42 @@ def get_range_reduction_macros(lut_info: Dict) -> str:
     """
     metadata = lut_info.get("metadata", {})
     method = metadata.get("range_reduction_method", "")
+    # FIRST-CLASS newton_root (and legacy exponent_alu_newton_root) -> standalone
+    # magic-seed + Newton evaluator. Reuse the HW macro builder (kind=newton_root).
+    if method == "newton_root":
+        return get_hw_exponent_alu_macros("exponent_alu_newton_root", lut_info)
     if method.startswith("exponent_alu_"):
         return get_hw_exponent_alu_macros(method, lut_info)
+    # eval_method: reduced_poly -- Cody-Waite / mantissa reduce-then-poly. The
+    # umbrella selector routes; the REDUCE_* sub-tag names the reduction.
     if method == "exp":
-        return "\n// Exp range reduction: input reduced to [-ln(2)/2, ln(2)/2]\n#define RANGE_REDUCTION_EXP\n"
+        return (
+            "\n// eval_method: reduced_poly / exp (Cody-Waite, reduce to [-ln2/2, ln2/2])\n"
+            "#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_EXP\n"
+        )
     elif method == "trig":
-        return "\n// Trig range reduction: input reduced to [-pi/2, pi/2]\n#define RANGE_REDUCTION_TRIG\n"
+        return (
+            "\n// eval_method: reduced_poly / trig (Cody-Waite, reduce to [-pi/2, pi/2])\n"
+            "#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_TRIG\n"
+        )
     elif method == "log":
         # Read expansion constant from CSV metadata (defaults to ln(2) for natural log)
         expand_const = metadata.get("log_ln2_constant", "0.6931471805599453")
         return (
-            f"\n// Log range reduction: input reduced to mantissa [1, 2)"
-            f"\n#define RANGE_REDUCTION_LOG"
+            f"\n// eval_method: reduced_poly / log (reduce to mantissa [1, 2))"
+            f"\n#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_LOG"
             f"\n#define LOG_EXPAND_CONSTANT {expand_const}f\n"
         )
     elif method == "tan":
-        return "\n// Tan range reduction: input reduced to [-pi/4, pi/4]\n#define RANGE_REDUCTION_TAN\n"
+        return (
+            "\n// eval_method: reduced_poly / tan (Cody-Waite, reduce to [-pi/4, pi/4])\n"
+            "#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_TAN\n"
+        )
     elif method == "cbrt":
-        return "\n// Cbrt range reduction: exponent decomposition to mantissa [1, 2)\n#define RANGE_REDUCTION_CBRT\n"
+        return (
+            "\n// eval_method: reduced_poly / cbrt (exponent decomposition to mantissa [1, 2))\n"
+            "#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_CBRT\n"
+        )
     return ""
 
 
@@ -752,6 +778,16 @@ def generate_polynomial_kernel(
     asymptotic = get_asymptotic_macros(lut_info)
     affine = get_affine_collapse_macros(lut_info)
 
+    # Exactly one EVAL_METHOD_* selector is emitted. range_reduction emits
+    # EXPONENT_ALU / NEWTON_ROOT / REDUCED_POLY; affine emits AFFINE_COLLAPSE.
+    # When none of those fire, the method is the default poly_cascade. (Parity /
+    # dual-eval / adaptive-degree / blend are ORTHOGONAL modifiers, not methods.)
+    eval_method_default = (
+        ""
+        if ("EVAL_METHOD_" in range_reduction or "EVAL_METHOD_" in affine)
+        else "\n// eval_method: poly_cascade (default piecewise polynomial cascade)\n#define EVAL_METHOD_POLY_CASCADE\n"
+    )
+
     # Degree 0 (constant) is special case - uses different base kernel
     if degree == 0:
         base_kernel = "../piecewise_constant.cpp"
@@ -792,7 +828,7 @@ constexpr std::array<float, LUT_SIZE_FP32> LUT_DATA_FP32 = {{{{
     constexpr auto& LUT_DATA = LUT_DATA_FP32;
     constexpr uint32_t LUT_SIZE = LUT_SIZE_FP32;
 #endif
-{adaptive_degree}{poly_parity}{range_reduction}{asymptotic}{affine}
+{eval_method_default}{adaptive_degree}{poly_parity}{range_reduction}{asymptotic}{affine}
 #include "{base_kernel}"
 """
 
@@ -819,6 +855,12 @@ def generate_rational_kernel(
         den_degree=den_deg,
     )
 
+    # eval_method: rational_cascade is the base method for this kernel; a
+    # reduced_poly reduction (REDUCE_EXP/TRIG/LOG) may be layered on top.
+    eval_method_rational = (
+        "\n// eval_method: rational_cascade (piecewise P(x)/Q(x))\n#define EVAL_METHOD_RATIONAL_CASCADE\n"
+    )
+
     content = f"""// SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 // SPDX-License-Identifier: Apache-2.0
 
@@ -841,7 +883,7 @@ constexpr uint32_t LUT_SIZE = {lut_info['lut_size']};
 constexpr std::array<float, LUT_SIZE> LUT_DATA = {{{{
 {lut_info['lut_data']}
 }}}};
-{parity}{range_reduction}
+{eval_method_rational}{parity}{range_reduction}
 #include "../piecewise_rational.cpp"
 """
 

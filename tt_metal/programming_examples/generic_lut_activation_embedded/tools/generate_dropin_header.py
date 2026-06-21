@@ -359,12 +359,25 @@ def generate_header(
             lines.append("#define POLY_PARITY_EVEN")
             lines.append("")
 
+    # eval_method: reduced_poly for the Cody-Waite / mantissa reductions. The TTNN
+    # drop-in shared LLK headers read the legacy RANGE_REDUCTION_* names directly
+    # (they do not include eval_method.h), so emit both: the clean selector for
+    # taxonomy consistency + the legacy feature macro the LLK header consumes.
     if range_red == "exp":
+        lines.append("// eval_method: reduced_poly / exp")
+        lines.append("#define EVAL_METHOD_REDUCED_POLY")
+        lines.append("#define REDUCE_EXP")
         lines.append("#define RANGE_REDUCTION_EXP")
     elif range_red == "trig":
+        lines.append("// eval_method: reduced_poly / trig")
+        lines.append("#define EVAL_METHOD_REDUCED_POLY")
+        lines.append("#define REDUCE_TRIG")
         lines.append("#define RANGE_REDUCTION_TRIG")
     elif range_red == "log":
         log_const = bf16_parsed.get("metadata", {}).get("log_ln2_constant", "0.6931471805599453")
+        lines.append("// eval_method: reduced_poly / log")
+        lines.append("#define EVAL_METHOD_REDUCED_POLY")
+        lines.append("#define REDUCE_LOG")
         lines.append(f"#define RANGE_REDUCTION_LOG")
         lines.append(f"#define LOG_EXPAND_CONSTANT {log_const}f")
     if range_red:

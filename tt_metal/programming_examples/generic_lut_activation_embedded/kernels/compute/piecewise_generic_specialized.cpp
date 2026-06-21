@@ -37,11 +37,10 @@
 // folded constants are constexpr and become SFPMAD immediates).
 // ============================================================================
 
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
-    defined(RANGE_REDUCTION_NEWTON_ROOT)
+#if EVAL_METHOD_IS_STANDALONE
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /*lut*/) {
-#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+#if defined(EVAL_METHOD_NEWTON_ROOT)
     // Newton-Raphson magic-seed root: constants preloaded in kernel_main, no
     // per-loop hoist needed. sqrt/rsqrt mirror native (~15-18 SFPU instrs); cbrt
     // is division-free (inverse-cube-root multiply-only Newton). All fit the
@@ -60,7 +59,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
         dst_reg[d] = y;
     }
     return;
-#else  // !RANGE_REDUCTION_NEWTON_ROOT
+#else  // !EVAL_METHOD_NEWTON_ROOT
 #if defined(HW_PRELOAD)
     // GENERIC constant-pool preload path (exp2 / log2 / pow, any degree). The 3
     // hottest constants live in vConstFloatPrgm0/1/2 (programmed ONCE in
@@ -68,7 +67,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
     // magic, the sigmoid MULT) are hoisted into pre-loop LREGs here; the remaining
     // coefficients are read from their constexpr global inside *_hw_eval_preloaded
     // (compiler hoists what fits, literals the rest — the codegen-logged spill).
-#if defined(RANGE_REDUCTION_EXP_HW)
+#if defined(EXPONENT_ALU_EXP2)
     vFloat thr_hoist = 255.0f;
 #if defined(EXP_HW_COMPOSE_SIGMOID)
     vFloat mult_hoist = EXP_HW_MULT;  // prgm0 reserved for sfpu_reciprocal
@@ -101,7 +100,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
         dst_reg[d] = y;
     }
     return;
-#elif defined(RANGE_REDUCTION_LOG_HW)
+#elif defined(EXPONENT_ALU_LOG2)
     // FIX A: hoist below-prgm coeffs c[DEG-2..0] into pre-loop LREGs (see exp).
     vFloat log_cvspill[(LOG_HW_DEGREE >= 2) ? (LOG_HW_DEGREE - 1) : 1];
     if constexpr (LOG_HW_DEGREE >= 2) {
@@ -120,7 +119,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
         dst_reg[d] = y;
     }
     return;
-#elif defined(RANGE_REDUCTION_POW_HW)
+#elif defined(EXPONENT_ALU_POW)
     vFloat magic_hoist = ckernel::sfpu::Converter::as_float(0x4B400000U);
     // FIX A: hoist below-prgm coeffs c[DEG-2..0] into pre-loop LREGs (see exp).
     vFloat pow_cvspill[(POW_HW_DEGREE >= 2) ? (POW_HW_DEGREE - 1) : 1];
@@ -145,9 +144,9 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
 #pragma GCC unroll 8
     for (int d = 0; d < 32; d++) {
         vFloat x = dst_reg[d];
-#if defined(RANGE_REDUCTION_EXP_HW)
+#if defined(EXPONENT_ALU_EXP2)
         vFloat y = exp_hw_eval<EXP_HW_DEGREE>(x);
-#elif defined(RANGE_REDUCTION_LOG_HW)
+#elif defined(EXPONENT_ALU_LOG2)
         vFloat y = log_hw_eval<LOG_HW_DEGREE>(x);
 #else
         vFloat y = pow_hw_eval<POW_HW_DEGREE>(x);
@@ -158,7 +157,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
 #endif
         dst_reg[d] = y;
     }
-#endif  // !RANGE_REDUCTION_NEWTON_ROOT
+#endif  // !EVAL_METHOD_NEWTON_ROOT
 }
 #endif
 
@@ -815,9 +814,8 @@ inline void piecewise_generic_lut_specialized_N_blend_dense(const std::array<flo
 // win materializes, and range-reduction / asymptotic factoring hold extra live
 // registers (vInt exponents, x_orig, etc.) that would push blend over the
 // register frontier. These hold for both parity and non-parity blends.
-#if !defined(RANGE_REDUCTION_EXP) && !defined(RANGE_REDUCTION_TRIG) && !defined(RANGE_REDUCTION_TAN) &&             \
-    !defined(RANGE_REDUCTION_LOG) && !defined(RANGE_REDUCTION_CBRT) && !defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) && \
-    !defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) && !defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR) &&                           \
+#if !defined(EVAL_METHOD_REDUCED_POLY) && !EVAL_METHOD_IS_STANDALONE && !defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) && \
+    !defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) && !defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR) &&                            \
     !defined(ASYMPTOTIC_FACTOR_X)
 #define BLEND_GATE_NO_REDUCTION 1
 #else
@@ -892,10 +890,10 @@ constexpr bool blend_predicted_faster() {
 
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lut) {
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
-    defined(RANGE_REDUCTION_NEWTON_ROOT)
-    // Hardware-exponent-ALU range reduction is a standalone evaluator — it owns
-    // the entire approximation and ignores the piecewise segment cascade.
+#if EVAL_METHOD_IS_STANDALONE
+    // EVAL_METHOD_EXPONENT_ALU / EVAL_METHOD_NEWTON_ROOT are standalone evaluators
+    // — each owns the entire approximation and ignores the piecewise segment
+    // cascade. Route directly to the standalone evaluator and return.
     piecewise_generic_lut_hw_reduce<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
     return;
 #endif
@@ -911,10 +909,10 @@ inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lu
     }
 #endif
 #ifdef USE_DUAL_EVAL
-    // Range reduction keeps extra vInt registers live across the polynomial evaluation,
-    // pushing total SFPU register pressure beyond the hardware limit.
-    // Fall back to single-eval when any range reduction is active.
-    #if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_LOG) || defined(RANGE_REDUCTION_CBRT)
+// Range reduction keeps extra vInt registers live across the polynomial evaluation,
+// pushing total SFPU register pressure beyond the hardware limit.
+// Fall back to single-eval when reduce-then-poly (REDUCED_POLY) is active.
+#if defined(EVAL_METHOD_REDUCED_POLY)
     piecewise_generic_lut_specialized_N<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);
 #elif defined(POLY_PARITY_ODD) || defined(POLY_PARITY_EVEN)
     // Parity x²-Horner threads x² through BOTH dual lanes; at higher degree the combined

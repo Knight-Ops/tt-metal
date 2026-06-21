@@ -333,14 +333,20 @@ elif not is_rational and degree >= 2:
 # Check for range reduction
 rr_macro = ''
 rr_method = metadata.get('range_reduction_method', '')
-if rr_method.startswith('exponent_alu_'):
-    # Hardware-exponent-ALU backend (exp2 / log2 / pow). The fitted poly lives
-    # in the first segment's coefficients (natural reduced-domain basis); the
+# Standalone evaluator tags: exponent_alu (exp2/log2/pow) and the FIRST-CLASS
+# newton_root method. newton_root is no longer nested under exponent_alu in the
+# fitter tag; accept both the first-class 'newton_root' and the legacy
+# 'exponent_alu_newton_root' for back-compat. All standalone paths share the
+# constant-pool hoisting + bypass the cascade.
+if rr_method.startswith('exponent_alu_') or rr_method == 'newton_root':
+    # Hardware-exponent-ALU backend (exp2 / log2 / pow) or newton_root. The
+    # fitted poly (exp/log/pow) lives in the first segment's coefficients; the
     # kernel owns the exman/exexp/setexp decompose + scale fold + recombine.
-    # Disable adaptive-degree / parity (cascade is bypassed) to keep defines clean.
+    # newton_root fits no poly (magic-seed + Newton). Disable adaptive-degree /
+    # parity (cascade is bypassed) to keep defines clean.
     degree_macros = ''
     poly_parity_macro = ''
-    kind = rr_method[len('exponent_alu_'):]
+    kind = 'newton_root' if rr_method == 'newton_root' else rr_method[len('exponent_alu_'):]
     cps = degree + 1
     seg0 = coefficients[0:cps]
 
@@ -398,8 +404,9 @@ if rr_method.startswith('exponent_alu_'):
         elif compose == 'minus_one':
             compose_macro = '#define EXP_HW_COMPOSE_MINUS_ONE\n'
         rr_macro = (
-            '\n// Hardware-exponent-ALU exp2 (exman/exexp/setexp), natural [0,1) coeffs\n'
-            '#define RANGE_REDUCTION_EXP_HW\n'
+            '\n// eval_method: exponent_alu / exp2 (exman/exexp/setexp), natural [0,1) coeffs. STANDALONE\n'
+            '#define EVAL_METHOD_EXPONENT_ALU\n'
+            '#define EXPONENT_ALU_EXP2\n'
             f'#define EXP_HW_MULT {clamp(float(mult)):.10e}f\n'
             f'{compose_macro}'
             f'{hw_preload_macro}'
@@ -416,8 +423,9 @@ if rr_method.startswith('exponent_alu_'):
         offset = float(metadata.get('expalu_input_offset', '0.0') or '0.0')
         offset_macro = f'#define LOG_HW_INPUT_OFFSET {clamp(offset):.10e}f\n' if offset != 0.0 else ''
         rr_macro = (
-            '\n// Hardware-exponent-ALU log2 (exexp -> e, exman -> m), natural coeffs\n'
-            '#define RANGE_REDUCTION_LOG_HW\n'
+            '\n// eval_method: exponent_alu / log2 (exexp -> e, exman -> m), natural coeffs. STANDALONE\n'
+            '#define EVAL_METHOD_EXPONENT_ALU\n'
+            '#define EXPONENT_ALU_LOG2\n'
             f'{basis_macro}'
             f'{offset_macro}'
             f'{hw_preload_macro}'
@@ -438,8 +446,9 @@ if rr_method.startswith('exponent_alu_'):
             if key in metadata:
                 scale_macros += f'#define POW_HW_SCALE_C{r} {clamp(float(metadata[key])):.10e}f\n'
         rr_macro = (
-            '\n// Hardware-exponent-ALU pow/root_N (exexp -> e, exman -> m), natural [1,2) coeffs\n'
-            '#define RANGE_REDUCTION_POW_HW\n'
+            '\n// eval_method: exponent_alu / pow/root_N (exexp -> e, exman -> m), natural [1,2) coeffs. STANDALONE\n'
+            '#define EVAL_METHOD_EXPONENT_ALU\n'
+            '#define EXPONENT_ALU_POW\n'
             f'{scale_macros}'
             f'{recip_macro}'
             f'{hw_preload_macro}'
@@ -467,8 +476,8 @@ if rr_method.startswith('exponent_alu_'):
         iters = int(float(metadata.get('newton_root_iters', '3') or '3'))
         recip_macro = '#define NEWTON_ROOT_RECIPROCAL\n' if recip else ''
         rr_macro = (
-            '\n// Newton-Raphson magic-seed integer root (mirrors native sqrt/rsqrt/cbrt)\n'
-            '#define RANGE_REDUCTION_NEWTON_ROOT\n'
+            '\n// eval_method: newton_root (magic-seed + Newton, NO poly fit). FIRST-CLASS standalone.\n'
+            '#define EVAL_METHOD_NEWTON_ROOT\n'
             f'#define NEWTON_ROOT_MAGIC {magic}\n'
             f'#define NEWTON_ROOT_C1 {c1:.10e}f\n'
             f'#define NEWTON_ROOT_C2 {c2:.10e}f\n'
@@ -483,20 +492,21 @@ if rr_method.startswith('exponent_alu_'):
     else:
         print(f'WARNING: unknown exponent_alu kind {kind}')
 elif rr_method == 'exp':
-    rr_macro = '\n#define RANGE_REDUCTION_EXP\n'
+    rr_macro = '\n// eval_method: reduced_poly / exp\n#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_EXP\n'
     print(f'Range reduction: exp')
 elif rr_method == 'trig':
-    rr_macro = '\n#define RANGE_REDUCTION_TRIG\n'
+    rr_macro = '\n// eval_method: reduced_poly / trig\n#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_TRIG\n'
     print(f'Range reduction: trig')
 elif rr_method == 'log':
     expand_const = metadata.get('log_ln2_constant', '0.6931471805599453')
-    rr_macro = f'\n#define RANGE_REDUCTION_LOG\n#define LOG_EXPAND_CONSTANT {expand_const}f\n'
+    rr_macro = (f'\n// eval_method: reduced_poly / log\n#define EVAL_METHOD_REDUCED_POLY\n'
+                f'#define REDUCE_LOG\n#define LOG_EXPAND_CONSTANT {expand_const}f\n')
     print(f'Range reduction: log (expand_const={expand_const})')
 elif rr_method == 'tan':
-    rr_macro = '\n#define RANGE_REDUCTION_TAN\n'
+    rr_macro = '\n// eval_method: reduced_poly / tan\n#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_TAN\n'
     print(f'Range reduction: tan')
 elif rr_method == 'cbrt':
-    rr_macro = '\n#define RANGE_REDUCTION_CBRT\n'
+    rr_macro = '\n// eval_method: reduced_poly / cbrt\n#define EVAL_METHOD_REDUCED_POLY\n#define REDUCE_CBRT\n'
     print(f'Range reduction: cbrt')
 
 # Detect asymptotic factoring from CSV columns
@@ -553,16 +563,28 @@ if (not is_rational) and rr_method in ('', 'none') and num_segments == 1:
         c0 = float(seg0_coeffs[0]) if len(seg0_coeffs) >= 1 else 0.0
         c1 = float(seg0_coeffs[1]) if len(seg0_coeffs) >= 2 else 0.0
         if c0 == 0.0 and c1 == 1.0:
-            affine_macro = '\n// Affine collapse: fit is y = x. Pure tile copy, no SFPU eval.\n#define AFFINE_COLLAPSE\n#define AFFINE_IDENTITY\n'
+            affine_macro = '\n// eval_method: affine_collapse / identity. fit is y = x. Pure tile copy, no SFPU eval.\n#define EVAL_METHOD_AFFINE_COLLAPSE\n#define AFFINE_COLLAPSE\n#define AFFINE_IDENTITY\n'
             print('AFFINE COLLAPSE: identity (c0=0, c1=1) -> pure-copy bypass (no SFPU eval)')
         else:
             affine_macro = (
-                '\n// Affine collapse: fit is y = c0 + c1*x. One SFPMAD per element.\n'
+                '\n// eval_method: affine_collapse. fit is y = c0 + c1*x. One SFPMAD per element.\n'
+                '#define EVAL_METHOD_AFFINE_COLLAPSE\n'
                 '#define AFFINE_COLLAPSE\n'
                 f'#define AFFINE_C0 {clamp(c0):.10e}f\n'
                 f'#define AFFINE_C1 {clamp(c1):.10e}f\n'
             )
             print(f'AFFINE COLLAPSE: y = {c0:.6g} + {c1:.6g}*x -> single SFPMAD bypass')
+
+# Exactly one EVAL_METHOD_* selector. rr_macro emits EXPONENT_ALU / NEWTON_ROOT /
+# REDUCED_POLY; affine_macro emits AFFINE_COLLAPSE. Otherwise the method is the
+# default poly_cascade (parity / dual / adaptive / blend are orthogonal modifiers).
+eval_method_macro = ''
+if not is_rational:
+    if ('EVAL_METHOD_' not in rr_macro) and ('EVAL_METHOD_' not in affine_macro):
+        eval_method_macro = '\n// eval_method: poly_cascade (default piecewise polynomial cascade)\n#define EVAL_METHOD_POLY_CASCADE\n'
+else:
+    # rational_cascade is the base method; reduced_poly may layer on via rr_macro.
+    eval_method_macro = '\n// eval_method: rational_cascade (piecewise P(x)/Q(x))\n#define EVAL_METHOD_RATIONAL_CASCADE\n'
 
 # Write kernel .cpp
 if is_rational:
@@ -583,7 +605,7 @@ constexpr uint32_t LUT_SIZE = {lut_size};
 constexpr std::array<float, LUT_SIZE> LUT_DATA = {{{{
     {lut_str}
 }}}};
-{poly_parity_macro}{rr_macro}{asymptotic_macro}
+{eval_method_macro}{poly_parity_macro}{rr_macro}{asymptotic_macro}
 #include \"../piecewise_rational.cpp\"
 '''
     # Override degree-related output variables for rational
@@ -618,7 +640,7 @@ constexpr std::array<float, LUT_SIZE_FP32> LUT_DATA_FP32 = {{{{
     constexpr auto& LUT_DATA = LUT_DATA_FP32;
     constexpr uint32_t LUT_SIZE = LUT_SIZE_FP32;
 #endif
-{degree_macros}{poly_parity_macro}{rr_macro}{asymptotic_macro}{affine_macro}
+{eval_method_macro}{degree_macros}{poly_parity_macro}{rr_macro}{asymptotic_macro}{affine_macro}
 #include \"../piecewise_generic.cpp\"
 '''
 

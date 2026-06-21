@@ -8,6 +8,12 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "ttnn/operations/normalization/kernel_util/compute/memory.h"
 
+// Canonical eval_method taxonomy. Translates the single EVAL_METHOD_* selector
+// (+ EXPONENT_ALU_* / REDUCE_* sub-tags) emitted by codegen into the legacy
+// feature macros the kernel bodies below were written against. Must precede any
+// RANGE_REDUCTION_* / EVAL_METHOD_* read.
+#include "eval_method.h"
+
 // Include reciprocal function for tan range reduction (tan_expand needs -1/poly),
 // the exp2 sigmoid compose (1/(1+exp(-x))), and the pow path's final 1/result
 // (rsqrt = 1/sqrt(x), tagged expalu_reciprocal -> POW_HW_RECIPROCAL).
@@ -47,12 +53,9 @@ namespace kutil = norm::kernel_util;
 #ifdef TRISC_MATH
 
 // Range reduction: Cody-Waite method for exp/trig, mantissa/exponent extraction for log/cbrt
-// Only included when RANGE_REDUCTION_* or ASYMPTOTIC_FACTOR_* is defined
-#if defined(RANGE_REDUCTION_EXP) || defined(RANGE_REDUCTION_TRIG) || defined(RANGE_REDUCTION_LOG) ||              \
-    defined(RANGE_REDUCTION_TAN) || defined(RANGE_REDUCTION_CBRT) || defined(RANGE_REDUCTION_EXP_HW) ||           \
-    defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || defined(RANGE_REDUCTION_NEWTON_ROOT) || \
-    defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) ||                          \
-    defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
+// Only included when a reduction/standalone eval_method or ASYMPTOTIC_FACTOR_* is active.
+#if EVAL_METHOD_NEEDS_REDUCTION_HELPERS || defined(ASYMPTOTIC_FACTOR_EXP_QUADRATIC) || \
+    defined(ASYMPTOTIC_FACTOR_EXP_LINEAR) || defined(ASYMPTOTIC_FACTOR_X_EXP_LINEAR)
 #include "sfpu/ckernel_sfpu_converter.h"
 #endif
 
@@ -251,7 +254,7 @@ inline vFloat cbrt_expand(vFloat poly_result, vInt q, vInt r, vInt sign_bits) {
 // directly and the piecewise segment cascade is bypassed entirely.
 // ============================================================================
 
-#if defined(RANGE_REDUCTION_EXP_HW)
+#if defined(EXPONENT_ALU_EXP2)
 // exp(x) = 2^(x * log2e). Decompose x*log2e into integer i + fraction f via the
 // hardware exponent ALU; 2^f via the fitter's degree-N poly; recombine setexp.
 //
@@ -427,7 +430,7 @@ inline vFloat exp_hw_eval_preloaded(
 #endif  // HW_PRELOAD
 #endif
 
-#if defined(RANGE_REDUCTION_LOG_HW)
+#if defined(EXPONENT_ALU_LOG2)
 // log2(x) = e + log2(m) for x = 2^e * m, m in [1,2). The fitter fits h(m)=log2(m)
 // on [1,2) and emits NATURAL [1,2]-basis coeffs (LOG_HW_C0..); the kernel
 // extracts e (integer log2, free via exexp) and m (exman/setexp), evaluates the
@@ -525,7 +528,7 @@ inline vFloat log_hw_eval_preloaded(vFloat x, const vFloat* cvspill) {
 #endif  // HW_PRELOAD
 #endif
 
-#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+#if defined(EVAL_METHOD_NEWTON_ROOT)
 // ============================================================================
 // Newton-Raphson magic-seed square root (mirrors TTNN's native ckernel sqrt).
 //
@@ -675,7 +678,7 @@ inline vFloat newton_root_eval(vFloat x) {
 }
 #endif
 
-#if defined(RANGE_REDUCTION_POW_HW)
+#if defined(EXPONENT_ALU_POW)
 // pow path for sqrt/rsqrt/cbrt. For root order N (POW_HW_ROOT_N) and x = 2^e * m
 // with m in [1,2): root_N(x) = 2^(e/N) * root_N(2^r) * root_N(m), where
 // e = N*q + r, r in {0..N-1}. The fitter fits p(m)=root_N(m) on [1,2)
@@ -1764,7 +1767,7 @@ void kernel_main() {
     // constants for this exponent-ALU kind into the programmable const registers
     // ONCE (they persist across every replayed body and every tile). The
     // per-kind ranking matches the *_hw_eval_preloaded readers above.
-#if defined(RANGE_REDUCTION_EXP_HW)
+#if defined(EXPONENT_ALU_EXP2)
 #if !defined(EXP_HW_COMPOSE_SIGMOID)
     // Under sigmoid compose, prgm0 is reserved for sfpu_reciprocal (set to 2.0 by
     // sfpu_reciprocal_init); MULT is hoisted into an LREG instead (see hw_reduce).
@@ -1772,11 +1775,11 @@ void kernel_main() {
 #endif
     sfpi::vConstFloatPrgm1 = EXP_HW_COEFFS[EXP_HW_DEGREE];
     sfpi::vConstFloatPrgm2 = (EXP_HW_DEGREE >= 1) ? EXP_HW_COEFFS[EXP_HW_DEGREE - 1] : 0.0f;
-#elif defined(RANGE_REDUCTION_LOG_HW)
+#elif defined(EXPONENT_ALU_LOG2)
     sfpi::vConstFloatPrgm0 = LOG_HW_SCALE;
     sfpi::vConstFloatPrgm1 = LOG_HW_COEFFS[LOG_HW_DEGREE];
     sfpi::vConstFloatPrgm2 = (LOG_HW_DEGREE >= 1) ? LOG_HW_COEFFS[LOG_HW_DEGREE - 1] : 0.0f;
-#elif defined(RANGE_REDUCTION_POW_HW)
+#elif defined(EXPONENT_ALU_POW)
     // Only plain sqrt (ROOT_N==2, no reciprocal) uses the preload fast path;
     // cbrt/rsqrt fall back to the general evaluator (see pow_hw_eval_preloaded),
     // which reads no prgm registers, so we must not clobber them there.
@@ -1788,7 +1791,7 @@ void kernel_main() {
 #endif
 #endif
 
-#if defined(RANGE_REDUCTION_NEWTON_ROOT) && defined(TRISC_MATH)
+#if defined(EVAL_METHOD_NEWTON_ROOT) && defined(TRISC_MATH)
     // Newton-Raphson magic-seed root: preload the seed magic + Newton coeffs into
     // the programmable const registers ONCE so the recorded per-element body
     // reloads none of them (mirrors native sqrt_init).

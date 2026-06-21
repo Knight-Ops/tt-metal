@@ -8,6 +8,12 @@
 #include "api/compute/eltwise_unary/eltwise_unary.h"
 #include "ttnn/operations/normalization/kernel_util/compute/memory.h"
 
+// Canonical eval_method taxonomy. For the rational base kernel the method is
+// EVAL_METHOD_RATIONAL_CASCADE (implied by including this file); REDUCED_POLY
+// reduce-then-poly may still be layered on (REDUCE_EXP/TRIG/LOG). The shim maps
+// the clean selector to the legacy RANGE_REDUCTION_* the bodies below use.
+#include "eval_method.h"
+
 // Include reciprocal function for rational evaluation
 #ifdef TRISC_MATH
 #include "ckernel_sfpu_recip.h"
