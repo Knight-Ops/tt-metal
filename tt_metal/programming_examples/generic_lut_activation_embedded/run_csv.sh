@@ -367,6 +367,12 @@ if rr_method.startswith('exponent_alu_'):
             pool.append(('round_magic', 60))
             for k in range(degree, -1, -1):
                 pool.append((f'c{k}', 50 + k))
+        elif kind == 'newton_root':
+            # Newton path: 3 loop-invariants (seed magic + 2 Newton coeffs), all
+            # in prgm const regs. No polynomial coeffs touched on this path.
+            pool.append(('NEWTON_MAGIC', 100))
+            pool.append(('NEWTON_C1', 90))
+            pool.append(('NEWTON_C2', 80))
         pool.sort(key=lambda t: -t[1])
         return [n for n, _ in pool]
     _pool = _build_pool(kind, degree)
@@ -441,6 +447,25 @@ if rr_method.startswith('exponent_alu_'):
             f'constexpr float POW_HW_COEFFS[] = {{{coeff_str}}};\n'
         )
         print(f'Range reduction: HW exponent-ALU pow (degree {degree}, root_n {root_n}, reciprocal {recip})')
+    elif kind == 'newton_root':
+        # Newton-Raphson magic-seed integer root (sqrt). Mirrors TTNN native sqrt:
+        # y0 = bits(MAGIC - (bits(x)>>1)); two Newton steps. The seed magic +
+        # Newton coeffs are loop-invariant -> preloaded into prgm const registers.
+        # No exexp/setexp/parity cascade -> ~18 SFPU body instrs (vs ~39 for pow).
+        # The fitter owns the constants (defaults = the SQRT_23-bit algorithm).
+        magic = metadata.get('newton_root_magic', '0x5f1110a0')
+        c1 = float(metadata.get('newton_root_c1', '2.2825186'))
+        c2 = float(metadata.get('newton_root_c2', '2.2533049'))
+        rr_macro = (
+            '\n// Newton-Raphson magic-seed integer root (mirrors native sqrt)\n'
+            '#define RANGE_REDUCTION_NEWTON_ROOT\n'
+            f'#define NEWTON_ROOT_MAGIC {magic}\n'
+            f'#define NEWTON_ROOT_C1 {c1:.10e}f\n'
+            f'#define NEWTON_ROOT_C2 {c2:.10e}f\n'
+            # POLY_DEGREE template arg is unused on this path but the kernel
+            # signature still takes it; the LUT/coeffs are ignored.
+        )
+        print(f'Range reduction: Newton-Raphson magic-seed root (magic {magic}, c1 {c1}, c2 {c2})')
     else:
         print(f'WARNING: unknown exponent_alu kind {kind}')
 elif rr_method == 'exp':

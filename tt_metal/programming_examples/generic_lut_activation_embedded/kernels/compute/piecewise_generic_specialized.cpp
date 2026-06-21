@@ -37,9 +37,24 @@
 // folded constants are constexpr and become SFPMAD immediates).
 // ============================================================================
 
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
+    defined(RANGE_REDUCTION_NEWTON_ROOT)
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /*lut*/) {
+#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+    // Newton-Raphson magic-seed sqrt: constants preloaded in kernel_main, no
+    // per-loop hoist needed. Recorded body mirrors native sqrt (~15 SFPU instrs).
+#pragma GCC unroll 8
+    for (int d = 0; d < 32; d++) {
+        vFloat x = dst_reg[d];
+        vFloat y = newton_root_eval<POLY_DEGREE>(x);
+#ifdef USE_BF16
+        y = convert<vFloat16b>(y, RoundMode::Nearest);
+#endif
+        dst_reg[d] = y;
+    }
+    return;
+#else  // !RANGE_REDUCTION_NEWTON_ROOT
 #if defined(HW_PRELOAD)
     // GENERIC constant-pool preload path (exp2 / log2 / pow, any degree). The 3
     // hottest constants live in vConstFloatPrgm0/1/2 (programmed ONCE in
@@ -110,6 +125,7 @@ inline void piecewise_generic_lut_hw_reduce(const std::array<float, LUT_SIZE>& /
 #endif
         dst_reg[d] = y;
     }
+#endif  // !RANGE_REDUCTION_NEWTON_ROOT
 }
 #endif
 
@@ -843,7 +859,8 @@ constexpr bool blend_predicted_faster() {
 
 template <uint32_t POLY_DEGREE, uint32_t NUM_SEGMENTS, uint32_t LUT_SIZE>
 inline void piecewise_generic_lut_dispatch(const std::array<float, LUT_SIZE>& lut) {
-#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW)
+#if defined(RANGE_REDUCTION_EXP_HW) || defined(RANGE_REDUCTION_LOG_HW) || defined(RANGE_REDUCTION_POW_HW) || \
+    defined(RANGE_REDUCTION_NEWTON_ROOT)
     // Hardware-exponent-ALU range reduction is a standalone evaluator — it owns
     // the entire approximation and ignores the piecewise segment cascade.
     piecewise_generic_lut_hw_reduce<POLY_DEGREE, NUM_SEGMENTS, LUT_SIZE>(lut);

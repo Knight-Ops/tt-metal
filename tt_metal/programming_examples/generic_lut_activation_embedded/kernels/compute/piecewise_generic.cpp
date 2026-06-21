@@ -516,6 +516,65 @@ inline vFloat log_hw_eval_preloaded(vFloat x) {
 #endif  // HW_PRELOAD
 #endif
 
+#if defined(RANGE_REDUCTION_NEWTON_ROOT)
+// ============================================================================
+// Newton-Raphson magic-seed square root (mirrors TTNN's native ckernel sqrt).
+//
+// This is the INTEGER-ROOT fast path. Instead of decomposing x = 2^e * m and
+// rebuilding the exponent (the pow_hw path, ~39 SFPU instrs), we operate
+// directly on the raw IEEE bits:
+//
+//   i  = bits(x) >> 1                                  (one shift)
+//   y0 = bits( MAGIC - i )                             (one integer subtract)
+//
+// The magic-constant subtraction produces a seed y0 ~= 1/sqrt(x)-ish whose
+// EXPONENT is already halved AND whose parity (the sqrt(2) odd-exponent scale)
+// is already folded into the seed -- so there is NO exexp/setexp/cast/parity
+// cascade at all. Two Newton-Raphson refinement steps recover full fp32
+// precision. The 3 loop-invariant constants (MAGIC seed, two Newton coeffs)
+// live in the programmable const registers (preloaded once), so the recorded
+// per-element body reloads NONE of them.
+//
+// Algorithm: SQRT_23-bits from Kokosinski et al. (2024), the exact algorithm
+// the native blackhole ckernel_sfpu_sqrt.h uses. The fitter owns the seed
+// magic and Newton coefficients (metadata: newton_root_magic / newton_root_c1
+// / newton_root_c2), so this generalizes to any even-root / accuracy target it
+// chooses to tune -- it is not hand-wired for sqrt.
+#ifndef NEWTON_ROOT_MAGIC
+#define NEWTON_ROOT_MAGIC 0x5f1110a0
+#endif
+#ifndef NEWTON_ROOT_C1
+#define NEWTON_ROOT_C1 2.2825186f
+#endif
+#ifndef NEWTON_ROOT_C2
+#define NEWTON_ROOT_C2 2.2533049f
+#endif
+template <uint32_t DEG>
+inline vFloat newton_root_eval(vFloat x) {
+    (void)DEG;  // degree is irrelevant for the Newton path (kept for caller symmetry)
+    vInt i = reinterpret<vInt>(reinterpret<vUInt>(x) >> 1);
+    vFloat y = reinterpret<vFloat>(vConstIntPrgm0 - i);  // MAGIC seed (preloaded)
+
+    // SQRT_23-bits: two Newton-Raphson steps. prgm1/prgm2 preloaded.
+    vFloat xy = x * y;
+    vFloat negative_y = -y;
+    vFloat c = negative_y * xy;
+    y = y * (vConstFloatPrgm1 + c * (vConstFloatPrgm2 + c));
+    xy = x * y;
+    negative_y = -y;
+    vFloat one_minus_xyy = vConst1 + (negative_y * xy);
+    vFloat half_xy = addexp(xy, -1);  // 0.5*xy via exponent decrement (no 0.5 immediate)
+    vFloat infinity = sFloat16b(std::numeric_limits<float>::infinity());
+    // Skip the final correction at x==inf (avoids inf-inf = NaN; y already inf).
+    v_if(reinterpret<vInt>(x) < reinterpret<vInt>(infinity)) { y = one_minus_xyy * half_xy + xy; }
+    v_endif;
+    // sqrt of a negative is NaN.
+    v_if(x < 0.0f) { y = std::numeric_limits<float>::quiet_NaN(); }
+    v_endif;
+    return y;
+}
+#endif
+
 #if defined(RANGE_REDUCTION_POW_HW)
 // pow path for sqrt/rsqrt/cbrt. For root order N (POW_HW_ROOT_N) and x = 2^e * m
 // with m in [1,2): root_N(x) = 2^(e/N) * root_N(2^r) * root_N(m), where
@@ -1607,6 +1666,15 @@ void kernel_main() {
     sfpi::vConstFloatPrgm2 = (POW_HW_DEGREE >= 1) ? POW_HW_COEFFS[POW_HW_DEGREE - 1] : 0.0f;
 #endif
 #endif
+#endif
+
+#if defined(RANGE_REDUCTION_NEWTON_ROOT) && defined(TRISC_MATH)
+    // Newton-Raphson magic-seed sqrt: preload the seed magic + two Newton coeffs
+    // into the programmable const registers ONCE so the recorded per-element body
+    // reloads none of them (mirrors native sqrt_init).
+    sfpi::vConstIntPrgm0 = NEWTON_ROOT_MAGIC;
+    sfpi::vConstFloatPrgm1 = NEWTON_ROOT_C1;
+    sfpi::vConstFloatPrgm2 = NEWTON_ROOT_C2;
 #endif
 
 #if defined(RANGE_REDUCTION_TAN) && defined(TRISC_MATH)
