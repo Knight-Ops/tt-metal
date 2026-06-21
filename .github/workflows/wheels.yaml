@@ -113,6 +113,16 @@ jobs:
         # build-artifact.yaml's container: job pass this identical probe) routes directly to
         # garage:3900. We bypass the proxy inside the container via --env NO_PROXY so curl
         # connects straight to garage.
+        #
+        # The PUT body MUST come from a real file (--data-binary @file), never a stdin pipe.
+        # This job's manylinux image (AlmaLinux 9.7) ships a curl whose `--data-binary @-`
+        # reading from a pipe cannot determine Content-Length, so it streams the body with
+        # Transfer-Encoding: chunked. Under --aws-sigv4 that yields a streaming/aws-chunked
+        # signed request that Garage rejects with HTTP 400 (Garage does not implement streaming
+        # SigV4). Uploading from a file gives curl a known length, so it sends one fixed-length,
+        # fully-signed body that Garage accepts — independent of the curl build. (Ubuntu's curl
+        # in build-artifact.yaml happens to buffer the pipe, which is why its look-alike probe
+        # passed; reading from a file makes the request deterministic across both images.)
         run: |
           docker run --rm \
             --env AWS_ACCESS_KEY_ID \
@@ -123,18 +133,27 @@ jobs:
             --env no_proxy=garage.garage.svc.cluster.local \
             "${{ inputs.docker-image }}" \
             bash -euo pipefail -c '
+              curl --version | head -1
               BASE="http://garage.garage.svc.cluster.local:3900/${CCACHE_S3_BUCKET}/${CCACHE_S3_PREFIX}/.s3-connectivity-test"
               PAYLOAD="ccache-s3-connectivity-ok"
               SIGV4="aws:amz:garage:s3"
               CREDS="${AWS_ACCESS_KEY_ID}:${AWS_SECRET_ACCESS_KEY}"
-              # PUT
-              echo "${PAYLOAD}" | curl -fsS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
-                "${BASE}" --data-binary @- -o /dev/null
+              TMP="$(mktemp)"
+              printf "%s" "${PAYLOAD}" > "${TMP}"
+              # PUT a fixed-length, fully-signed body from a file (no chunked streaming).
+              # On failure, surface Garage'"'"'s HTTP status + XML error body instead of failing blind.
+              if ! curl -sS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" \
+                     "${BASE}" --data-binary "@${TMP}" -o /dev/null -w "PUT HTTP %{http_code}\n" --fail-with-body; then
+                echo "PUT failed; Garage response body:" >&2
+                curl -sS -X PUT --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" --data-binary "@${TMP}" >&2 || true
+                exit 22
+              fi
               # GET and verify
               RESULT=$(curl -fsS --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}")
               [ "${RESULT}" = "${PAYLOAD}" ] || { echo "Read-back mismatch: got '"'"'${RESULT}'"'"'"; exit 1; }
               # DELETE
               curl -fsS -X DELETE --aws-sigv4 "${SIGV4}" --user "${CREDS}" "${BASE}" -o /dev/null
+              rm -f "${TMP}"
               echo "S3 connectivity verified: write/read-back/delete all OK"
             '
 
