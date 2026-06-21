@@ -82,10 +82,15 @@ jobs:
           fi
           echo "CCACHE_REMOTE_STORAGE=${CCACHE_REMOTE_STORAGE}" >> $GITHUB_ENV
           echo "CCACHE_REMOTE_STORAGE: ${CCACHE_REMOTE_STORAGE}"
-          # Garage is a cluster-internal service — bypass the restricted proxy (which only routes
-          # internet egress) so the Go binary connects directly. Same pattern as large-file-cache.
-          echo "NO_PROXY=${NO_PROXY:+${NO_PROXY},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
-          echo "no_proxy=${no_proxy:+${no_proxy},}garage.garage.svc.cluster.local" >> $GITHUB_ENV
+          # NOTE: do NOT add garage to NO_PROXY here. This job runs directly on the host
+          # runner (no container:), which reaches in-cluster services only through the
+          # restricted Squid proxy (http://proxy.restricted-proxy.svc.cluster.local:3128).
+          # Garage's domain + port 3900 are allowlisted in Squid as plain-HTTP forward-proxy
+          # targets, so traffic must go THROUGH the proxy — bypassing it via NO_PROXY makes
+          # the host attempt a direct connection that has no route and fails (HTTP 400).
+          # curl and the AWS Go SDK both honor HTTP_PROXY and SigV4 signing is unaffected by
+          # forward-proxying, so leaving the proxy in place is correct for both the verify
+          # step below and the ccache-storage-s3 helper inside cibuildwheel.
           # Enable debug logging from the ccache-storage-s3 helper binary.
           echo "CRSH_LOGFILE=/tmp/ccache-storage-s3.log" >> $GITHUB_ENV
           # AWS SDK Go v2 (≥1.32) computes CRC32 checksums on every PutObject by default.
@@ -158,10 +163,21 @@ jobs:
             AWS_REQUEST_CHECKSUM_CALCULATION=when_required
             AWS_ENDPOINT_URL_S3=http://garage.garage.svc.cluster.local:3900
             CRSH_LOGFILE=/tmp/ccache-storage-s3.log
-            NO_PROXY=garage.garage.svc.cluster.local
             CIBW_ENABLE_TRACY="${{ inputs.tracy && 'ON' || 'OFF' }}"
             CIBW_BUILD_TYPE="${{ inputs.build-type }}"
             CIBW_ENABLE_LTO="${{ inputs.enable-lto && 'ON' || 'OFF' }}"
+          # Forward the host runner's restricted-proxy settings INTO the cibuildwheel
+          # container. The s3:// ccache helper (AWS Go SDK) inside the container reaches
+          # Garage only through the Squid proxy (garage's domain + port 3900 are
+          # allowlisted there); without the proxy it has no route to the in-cluster
+          # service. $HTTP_PROXY expansion in CIBW_ENVIRONMENT resolves against the
+          # *container* env (empty), so we must use environment-pass, which copies the
+          # named variables from the host runner process env into the container.
+          # PyPI and the other build domains are also proxy-allowlisted, so routing the
+          # whole build through the proxy is safe.
+          CIBW_ENVIRONMENT_PASS_LINUX: >-
+            HTTP_PROXY HTTPS_PROXY NO_PROXY
+            http_proxy https_proxy no_proxy
           CIBW_BEFORE_BUILD: "mkdir -p /tmp/ccache && ccache -z && ccache -p"
           CIBW_BEFORE_TEST: ccache -s
           CIBW_TEST_COMMAND: 'python -c "import ttnn"'
