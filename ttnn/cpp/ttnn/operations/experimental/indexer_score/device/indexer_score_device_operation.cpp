@@ -10,6 +10,8 @@
 #include <tt-metalium/constants.hpp>
 #include <tt-metalium/hal.hpp>
 
+#include "ttnn/operations/creation/creation.hpp"  // ttnn::full for the synthesized constant gate
+
 namespace ttnn::operations::experimental::indexer_score {
 
 IndexerScoreDeviceOperation::program_factory_t IndexerScoreDeviceOperation::select_program_factory(
@@ -121,14 +123,29 @@ void IndexerScoreDeviceOperation::validate_on_program_cache_miss(
     // KC need not divide Tt: the last unit is then partial. Compute still runs a full KC-wide strip
     // (pad cols matmul stale k, overwritten with full -inf) and the writer clips to the valid width.
     TT_FATAL(HB > 0 && Hi % HB == 0, "head_group_size {} must divide Hi {}", HB, Hi);
+
+    // num_groups: 1 sums all heads (DeepSeek/GLM); G>1 emits G per-group planes [B,G,Sq,T] (MiniMax M3).
+    // G>1 reuses the all-resident full-strip path one group at a time, so require those knobs (the
+    // streaming / per-column fallback is not wired for groups).
+    const uint32_t G = attrs.num_groups;
+    TT_FATAL(G >= 1 && Hi % G == 0, "num_groups {} must be >= 1 and divide Hi {}", G, Hi);
+    if (G > 1) {
+        TT_FATAL(HB == Hi, "num_groups {}>1 requires all heads resident (head_group_size 0 or Hi); got HB={}", G, HB);
+        TT_FATAL(
+            KC >= 2,
+            "num_groups {}>1 requires k_chunk_size>=64 (the full-strip path); got k_chunk_size={}",
+            G,
+            cfg.k_chunk_size);
+    }
 }
 
 IndexerScoreDeviceOperation::spec_return_value_t IndexerScoreDeviceOperation::compute_output_specs(
-    const operation_attributes_t&, const tensor_args_t& tensor_args) {
+    const operation_attributes_t& attrs, const tensor_args_t& tensor_args) {
     const auto& q_shape = tensor_args.q.logical_shape();
     const auto& k_shape = tensor_args.k.logical_shape();
-    // score [B, 1, Sq, T], row-major bf16 (consumed by the row-major topk)
-    ttnn::Shape out_shape({q_shape[0], 1, q_shape[2], k_shape[2]});
+    // score [B, num_groups, Sq, T], row-major bf16 (consumed by the row-major topk). num_groups==1 is
+    // the head-summed DeepSeek/GLM score; >1 gives one plane per GQA group (MiniMax M3).
+    ttnn::Shape out_shape({q_shape[0], attrs.num_groups, q_shape[2], k_shape[2]});
     return TensorSpec(
         out_shape,
         tt::tt_metal::TensorLayout(
@@ -205,11 +222,15 @@ IndexerScoreDeviceOperation::invoke(
     const Tensor& k,
     const Tensor& weights,
     uint32_t chunk_start_idx,
+    bool apply_relu,
+    uint32_t num_groups,
     const IndexerScoreProgramConfig& program_config,
     const DeviceComputeKernelConfig& compute_kernel_config) {
     return {
         operation_attributes_t{
             .chunk_start_idx = chunk_start_idx,
+            .apply_relu = apply_relu,
+            .num_groups = num_groups,
             .program_config = program_config,
             .compute_kernel_config = compute_kernel_config},
         tensor_args_t{.q = q, .k = k, .weights = weights}};
@@ -222,8 +243,11 @@ namespace ttnn::experimental {
 ttnn::Tensor indexer_score(
     const ttnn::Tensor& q,
     const ttnn::Tensor& k,
-    const ttnn::Tensor& weights,
+    const std::optional<ttnn::Tensor>& weights,
     uint32_t chunk_start_idx,
+    bool apply_relu,
+    float scale,
+    uint32_t num_groups,
     const ttnn::operations::experimental::indexer_score::IndexerScoreProgramConfig& program_config,
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config) {
     using OperationType = ttnn::operations::experimental::indexer_score::IndexerScoreDeviceOperation;
@@ -239,9 +263,18 @@ ttnn::Tensor indexer_score(
         /*default_fp32_acc=*/false,
         /*default_l1_acc=*/false,
         /*default_dst_full_sync_en=*/false);
+    // DeepSeek/GLM pass learned per-head gates in `weights`. MiniMax M3 has no gates, only a 1/sqrt(d)
+    // scale: when weights is omitted, synthesize a constant gate (= scale) of the required [B,Hi,Sq,1]
+    // shape so the kernel's gate-multiply path is unchanged (it just multiplies by the constant). The
+    // local lives until launch() returns below, which is where the tensor's buffer is read.
+    const auto& qs = q.logical_shape();
+    const ttnn::Tensor w =
+        weights.has_value()
+            ? weights.value()
+            : ttnn::full(ttnn::Shape({qs[0], qs[1], qs[2], 1}), scale, DataType::BFLOAT16, Layout::TILE, *q.device());
     // Reuse invoke() so attribute/tensor packing lives in one place.
     auto [operation_attributes, tensor_args] =
-        OperationType::invoke(q, k, weights, chunk_start_idx, program_config, resolved);
+        OperationType::invoke(q, k, w, chunk_start_idx, apply_relu, num_groups, program_config, resolved);
     return ttnn::device_operation::launch<OperationType>(operation_attributes, tensor_args);
 }
 

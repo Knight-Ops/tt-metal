@@ -28,6 +28,16 @@ inline uint32_t resolve_head_group(const IndexerScoreProgramConfig& cfg, uint32_
 
 struct operation_attributes_t {
     uint32_t chunk_start_idx{0};
+    // ReLU on each per-head q.kT before the gate-multiply. true = DeepSeek/GLM lightning indexer
+    // (relu(q.k)*w); false = raw dot product q.k*w (e.g. MiniMax M3 MSA, which has no ReLU). A
+    // compile-time arg in the compute kernel, so the apply_relu==true path is byte-identical to before.
+    bool apply_relu{true};
+    // Number of output groups. 1 = sum ALL Hi heads into one plane -> score [B,1,Sq,T] (DeepSeek/GLM).
+    // G>1 = partition the Hi heads into G contiguous groups of Hi/G, sum WITHIN each group only ->
+    // score [B,G,Sq,T] (MiniMax M3 MSA per-GQA-group selection, multiple groups resident on one chip).
+    // Compile-time, with G==1 byte-identical to before. G>1 requires all heads resident (head_group_size
+    // 0 or Hi) and the full-strip path (k_chunk_size>=64).
+    uint32_t num_groups{1};
     IndexerScoreProgramConfig program_config{};
     // Resolved (not optional) so it is part of the reflected program-cache key; the public callable
     // fills it from the user's optional config, defaulting math_fidelity to the dtype-derived choice.

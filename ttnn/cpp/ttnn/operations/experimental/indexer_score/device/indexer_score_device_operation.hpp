@@ -42,6 +42,8 @@ struct IndexerScoreDeviceOperation {
         const Tensor& k,
         const Tensor& weights,
         uint32_t chunk_start_idx,
+        bool apply_relu,
+        uint32_t num_groups,
         const IndexerScoreProgramConfig& program_config,
         const DeviceComputeKernelConfig& compute_kernel_config);
 };
@@ -50,15 +52,26 @@ struct IndexerScoreDeviceOperation {
 
 namespace ttnn::experimental {
 
-// DeepSeek-V3.2 DSA lightning-indexer scorer (the public callable, ttnn.experimental.indexer_score):
-//   score[b, s, t] = sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]
-// q [B, Hi, Sq, D], k [B, 1, T, D], weights [B, Hi, Sq, 1] -> score [B, 1, Sq, T] (row-major bf16).
+// DeepSeek-V3.2 DSA / MiniMax-M3 MSA lightning-indexer scorer (the public callable,
+// ttnn.experimental.indexer_score):
+//   score[b, s, t] = sum_h act(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]
+//     act = relu (apply_relu=true, DeepSeek/GLM) or identity (apply_relu=false, MiniMax M3).
+// q [B, Hi, Sq, D], k [B, 1, T, D] -> score [B, num_groups, Sq, T] (row-major bf16).
+// weights [B, Hi, Sq, 1] are DeepSeek/GLM's learned per-head gates (scale pre-folded). MiniMax M3 has
+// NO gates, only a 1/sqrt(d) scale: pass weights=nullopt and scale=1/sqrt(d), and the op runs with a
+// constant gate (= scale) so no dummy gate tensor is needed. `scale` is used only when weights==nullopt.
+// num_groups: 1 sums all Hi heads into one plane (DeepSeek/GLM). G>1 partitions the heads into G groups
+// of Hi/G and sums within each group -> G output planes (MiniMax M3 per-GQA-group selection, multiple
+// groups on one chip); G>1 needs all heads resident and k_chunk_size>=64.
 // Causality from chunk_start_idx: key t visible to query s iff t <= chunk_start_idx + s.
 ttnn::Tensor indexer_score(
     const ttnn::Tensor& q,
     const ttnn::Tensor& k,
-    const ttnn::Tensor& weights,
+    const std::optional<ttnn::Tensor>& weights = std::nullopt,
     uint32_t chunk_start_idx = 0,
+    bool apply_relu = true,
+    float scale = 1.0f,
+    uint32_t num_groups = 1,
     const ttnn::operations::experimental::indexer_score::IndexerScoreProgramConfig& program_config = {},
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
 

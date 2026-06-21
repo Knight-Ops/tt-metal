@@ -19,12 +19,14 @@ constexpr uint32_t page_bytes = get_compile_time_arg_val(num_common_ct_args);  /
 
 constexpr uint32_t frag_bytes = tt::constants::TILE_WIDTH * sizeof(uint16_t);  // one bf16 tile row
 
-/** Scatter one strip into the 32 output rows of q-tile-row q_row at column tile k_tile_start. Strip is
- *  always KC tiles wide; each row written as ONE contiguous run (1 async_write/row, not KC fragments).
- *  `valid_w` = KC tiles inside T (< KC on a partial last unit; KC need not divide Tt). CB always pops
- *  full KC; only the in-bounds prefix is written. */
+/** Scatter one strip into 32 consecutive output rows starting at page `page_row_start`, column tile
+ *  k_tile_start. Strip is always KC tiles wide; each row written as ONE contiguous run (1 async_write/row,
+ *  not KC fragments). `valid_w` = KC tiles inside T (< KC on a partial last unit; KC need not divide Tt).
+ *  CB always pops full KC; only the in-bounds prefix is written. The output is [B, num_out_groups, Sq, T]
+ *  flattened to rows, so the caller folds the group plane into page_row_start. */
 template <typename OutAcc>
-inline void write_strip(Noc noc, const OutAcc& out_acc, uint32_t q_row, uint32_t k_tile_start, uint32_t valid_w) {
+inline void write_strip(
+    Noc noc, const OutAcc& out_acc, uint32_t page_row_start, uint32_t k_tile_start, uint32_t valid_w) {
     CircularBuffer cb(cb_out_strip);
     cb.wait_front(k_tiles_per_unit);
     uint32_t src = cb.get_read_ptr();
@@ -36,7 +38,7 @@ inline void write_strip(Noc noc, const OutAcc& out_acc, uint32_t q_row, uint32_t
             out_acc,
             write_bytes,
             {},
-            {.page_id = q_row * tt::constants::TILE_HEIGHT + rr, .offset_bytes = k_tile_start * frag_bytes});
+            {.page_id = page_row_start + rr, .offset_bytes = k_tile_start * frag_bytes});
         src += row_pitch;
     }
     noc.async_write_barrier();
@@ -56,12 +58,20 @@ void kernel_main() {
     WorkUnitSpan span;
     span.start(flat_start);
 
+    // Output is [B, num_out_groups, Sq, T]: plane g occupies rows [g*Sq, (g+1)*Sq). Compute pushes
+    // num_out_groups * QC strips per unit in g-major order, so drain them the same way.
+    constexpr uint32_t sq_rows = q_len_tiles * tt::constants::TILE_HEIGHT;  // rows per output plane (Sq)
+
     for (uint32_t i = 0; i < flat_count; ++i) {
         const uint32_t k_tile0 = span.k_tile_start();
         const uint32_t valid_w = span.k_tiles();  // == KC for interior units, < KC for a partial last unit
         // One KC-wide strip per row; masked suffix already stamped by compute. Write only valid_w columns.
-        for (uint32_t r = 0; r < q_tiles_per_unit; ++r) {
-            write_strip(noc, out_acc, span.q_tile_start() + r, k_tile0, valid_w);
+        for (uint32_t g = 0; g < num_out_groups; ++g) {
+            const uint32_t plane_row0 = g * sq_rows;
+            for (uint32_t r = 0; r < q_tiles_per_unit; ++r) {
+                const uint32_t page_row_start = plane_row0 + (span.q_tile_start() + r) * tt::constants::TILE_HEIGHT;
+                write_strip(noc, out_acc, page_row_start, k_tile0, valid_w);
+            }
         }
         span.advance();
     }

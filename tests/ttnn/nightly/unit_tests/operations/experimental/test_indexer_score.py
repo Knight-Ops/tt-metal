@@ -44,16 +44,40 @@ GLX_CASES = [("glm5", 8), ("dsv32", 16)]
 GLX_IDS = [c[0] for c in GLX_CASES]
 
 
-def indexer_score_ref(q, k, w, chunk_start):
-    """Per-head fp32 accumulation (a full [Hi,Sq,T] tensor is many GB at GLX sizes)."""
+def indexer_score_ref(q, k, w, chunk_start, apply_relu=True):
+    """Per-head fp32 accumulation (a full [Hi,Sq,T] tensor is many GB at GLX sizes).
+
+    apply_relu=True  -> sum_h relu(q.kT) * w   (DeepSeek-V3.2 / GLM-5 lightning indexer)
+    apply_relu=False -> sum_h (q.kT)    * w    (MiniMax M3 MSA: raw dot, scale folded into w)
+    """
     b, hi, sq, _ = q.shape
     t = k.shape[2]
     q, k, w = q.float(), k.float(), w.float()
     score = torch.zeros(b, sq, t)
     for h in range(hi):
-        score += torch.relu(q[:, h] @ k[:, 0].transpose(-2, -1)) * w[:, h]
+        qk = q[:, h] @ k[:, 0].transpose(-2, -1)
+        score += (torch.relu(qk) if apply_relu else qk) * w[:, h]
     future = torch.arange(t).unsqueeze(0) > chunk_start + torch.arange(sq).unsqueeze(1)
     return score.masked_fill(future, float("-inf")).unsqueeze(1)
+
+
+def indexer_score_grouped_ref(q, k, w, chunk_start, num_groups, apply_relu=True):
+    """Per-GQA-group reference: partition the Hi heads into num_groups contiguous groups of Hi/num_groups
+    and sum act(q.kT)*w WITHIN each group only -> [b, num_groups, sq, t]. num_groups==1 == indexer_score_ref.
+    """
+    b, hi, sq, _ = q.shape
+    t = k.shape[2]
+    hog = hi // num_groups
+    q, k, w = q.float(), k.float(), w.float()
+    future = torch.arange(t).unsqueeze(0) > chunk_start + torch.arange(sq).unsqueeze(1)
+    planes = []
+    for g in range(num_groups):
+        score = torch.zeros(b, sq, t)
+        for h in range(g * hog, (g + 1) * hog):
+            qk = q[:, h] @ k[:, 0].transpose(-2, -1)
+            score += (torch.relu(qk) if apply_relu else qk) * w[:, h]
+        planes.append(score.masked_fill(future, float("-inf")))
+    return torch.stack(planes, dim=1)  # [b, num_groups, sq, t]
 
 
 def make_inputs(heads, dim, sq, t, seed=42):
@@ -83,6 +107,8 @@ def run_indexer(
     q_dtype=ttnn.bfloat16,
     k_dtype=ttnn.bfloat16,
     compute_kernel_config=None,
+    apply_relu=True,
+    num_groups=1,
 ):
     """Run the device op and return the row-major bf16 score as a torch tensor.
 
@@ -96,6 +122,8 @@ def run_indexer(
         to_device(k, device, dtype=k_dtype),
         to_device(w, device),
         chunk_start_idx=chunk_start,
+        apply_relu=apply_relu,
+        num_groups=num_groups,
         **kwargs,
     )
     return ttnn.to_torch(out)
@@ -114,6 +142,17 @@ def assert_indexer_match(out, ref, sq, t, check_neg=False):
     if check_neg:
         # negative gates -> a zero-filled column can't masquerade as valid
         assert (ref[~masked] < 0).any()
+
+
+def assert_grouped_match(out, ref, num_groups, sq, t):
+    """Per-group [1,G,Sq,T] check: exact -inf map + PCC>=0.999 on visible scores (same bar as the single
+    plane), so any cross-group leakage (a plane summing another group's heads) fails the PCC."""
+    assert out.shape == (1, num_groups, sq, t)
+    masked = ref == float("-inf")
+    assert torch.equal(out <= torch.finfo(torch.bfloat16).min, masked)
+    a, b = out[~masked].flatten().float(), ref[~masked].flatten().float()
+    pcc = torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+    assert pcc >= 0.999, f"PCC {pcc} < 0.999"
 
 
 def glx_config(heads):
@@ -272,6 +311,194 @@ def test_indexer_score_determinism(device, case_id, heads):
 # tests/pipeline_reorg/ttnn-tests.yaml selects its sp_rank-7 GLM5.1/DSv32 cases via `-k "accuracy and
 # rank7"`. No separate post-commit test (that would re-run the same cases under nightly); post-commit just
 # runs a subset of the nightly accuracy parametrization.
+
+
+# ---------------------------------------------------------------------------
+# apply_relu / MiniMax M3 MSA path: raw dot product (no ReLU), no per-head gates.
+#
+# DeepSeek-V3.2 / GLM-5 score sum_h relu(q.kT)*w_h. MiniMax M3 MSA scores the raw dot product q.kT
+# (no ReLU, no learned gates) per GQA group, scaled by 1/sqrt(d). At the group-aligned deployment
+# (TP = num GQA groups) each device owns one index head (Hi=1), so the op's head-sum is a no-op and
+# the [1,1,Sq,T] output is that group's score row, fed to the downstream block-max top-k.
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("apply_relu", [True, False], ids=["relu", "no_relu"])
+@pytest.mark.parametrize(
+    "q_chunk, k_chunk, head_group",
+    [(32, 32, 0), (32, 128, 0), (32, 32, 8)],
+    ids=["fallback_kc1", "fullstrip_kc4", "stream_hb8"],
+)
+def test_indexer_score_activation(device, apply_relu, q_chunk, k_chunk, head_group):
+    """apply_relu toggles relu(q.kT) (DeepSeek/GLM, True) vs the raw dot product (MiniMax M3, False).
+
+    Swept over the head-major full-strip path (KC=4 all-resident), the per-column fallback (KC=1), and
+    head streaming (HB=8) so the relu/no-relu packer config is exercised on every compute path. 64-head
+    MINI shape with explicit (random, some-negative) gates; checked the same way as the deployments.
+    """
+    heads, dim, sq, t, chunk_start = MINI["heads"], MINI["dim"], MINI["sq"], MINI["t"], 128
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=q_chunk, k_chunk_size=k_chunk, head_group_size=head_group)
+    q, k, w = make_inputs(heads, dim, sq, t)
+    out = run_indexer(q, k, w, chunk_start, device, program_config=cfg, apply_relu=apply_relu)
+    ref = indexer_score_ref(q, k, w, chunk_start, apply_relu=apply_relu)
+    assert_indexer_match(out, ref, sq, t, check_neg=True)
+
+
+def test_indexer_score_optional_weights(device):
+    """Omitting weights runs with a constant gate equal to `scale` (MiniMax M3 has no per-head gates).
+
+    Bit-identical to passing an explicit constant-gate [1,Hi,Sq,1] tensor -- the synthesized gate is the
+    only difference, so any mismatch would be the synthesis path, not numerics.
+    """
+    heads, dim, sq, t, chunk_start = 1, 128, 64, 256, 128
+    scale = dim**-0.5
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=32, k_chunk_size=32, head_group_size=0)
+    q, k, _ = make_inputs(heads, dim, sq, t)
+    out_none = ttnn.to_torch(
+        ttnn.experimental.indexer_score(
+            to_device(q, device),
+            to_device(k, device),
+            chunk_start_idx=chunk_start,
+            apply_relu=False,
+            scale=scale,
+            program_config=cfg,
+        )
+    )
+    w = torch.full((1, heads, sq, 1), scale, dtype=torch.bfloat16)
+    out_explicit = run_indexer(q, k, w, chunk_start, device, program_config=cfg, apply_relu=False)
+    assert torch.equal(out_none, out_explicit), "weights=None (constant gate) must match an explicit constant gate"
+
+
+@pytest.mark.parametrize("sp_rank", [0, 7], ids=["rank0", "rank7"])
+@pytest.mark.parametrize("k_dtype", [ttnn.bfloat16, ttnn.bfloat8_b], ids=["k_bf16", "k_bfp8"])
+def test_indexer_score_m3_per_group(device, k_dtype, sp_rank):
+    """MiniMax M3 MSA indexer, per GQA group as deployed at TP=4 (one index head per device, Hi=1).
+
+    Raw dot product q.k scaled by 1/sqrt(d), no ReLU, no per-head gates (weights omitted -> constant
+    gate = scale). GLX-style chunked prefill geometry (D=128, 640 q/device, 56320 keys, SP=8 ring
+    position via chunk_start). Output [1,1,Sq,T] is the group's score row for the downstream block-max
+    top-k. bfp8 k is the bandwidth-friendly deployed dtype.
+    """
+    heads, dim = 1, GLX_DIM  # one GQA group's single index head, head_dim 128
+    sq, t = GLX_SQ, GLX_T
+    chunk_start = GLX_HISTORY + sp_rank * GLX_SQ
+    scale = dim**-0.5
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=512, head_group_size=0)
+    q, k, _ = make_inputs(heads, dim, sq, t)
+    out = ttnn.to_torch(
+        ttnn.experimental.indexer_score(
+            to_device(q, device),
+            to_device(k, device, dtype=k_dtype),
+            chunk_start_idx=chunk_start,
+            apply_relu=False,
+            scale=scale,
+            program_config=cfg,
+        )
+    )
+    w_scale = torch.full((1, heads, sq, 1), scale, dtype=torch.bfloat16)
+    ref = indexer_score_ref(q, k, w_scale, chunk_start, apply_relu=False)
+    assert_indexer_match(out, ref, sq, t)
+
+
+# ---------------------------------------------------------------------------
+# num_groups > 1: per-GQA-group output [B, G, Sq, T], multiple groups resident on ONE chip (the TP < 4
+# fallback; the head-reduction is partitioned into G separate accumulators in-kernel, one output plane
+# per group, NO cross-group summation). Requires all heads resident + the full-strip path (KC>=2).
+# ---------------------------------------------------------------------------
+@pytest.mark.parametrize("apply_relu", [True, False], ids=["relu", "no_relu"])
+@pytest.mark.parametrize(
+    "heads, num_groups",
+    [(4, 4), (8, 4), (8, 2), (64, 4)],
+    ids=["g4_hog1", "g4_hog2", "g2_hog4", "g4_hog16"],
+)
+def test_indexer_score_multigroup(device, heads, num_groups, apply_relu):
+    """num_groups>1 emits one plane per group, each summing only its Hi/G heads (no cross-group sum).
+
+    Spans hog=1 (MiniMax M3: one index head per group), hog=2/4 (several index heads per group), and the
+    64-head MINI geometry. Explicit random (some-negative) gates exercise the weighted reduction; the
+    no_relu axis is the M3 raw-dot case. Each plane is checked against the per-group reference (exact -inf
+    map + PCC), so a plane that summed the wrong heads would fail.
+    """
+    dim, sq, t, chunk_start = 128, 64, 256, 128
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=32, k_chunk_size=64, head_group_size=0)  # all resident, KC=2
+    q, k, w = make_inputs(heads, dim, sq, t)
+    out = ttnn.to_torch(
+        ttnn.experimental.indexer_score(
+            to_device(q, device),
+            to_device(k, device),
+            to_device(w, device),
+            chunk_start_idx=chunk_start,
+            apply_relu=apply_relu,
+            num_groups=num_groups,
+            program_config=cfg,
+        )
+    )
+    ref = indexer_score_grouped_ref(q, k, w, chunk_start, num_groups, apply_relu=apply_relu)
+    assert_grouped_match(out, ref, num_groups, sq, t)
+
+
+def test_indexer_score_multigroup_m3(device):
+    """MiniMax M3 with multiple GQA groups on one chip (TP<4 fallback): 4 groups, one index head each,
+    raw dot (no relu), no gates (weights omitted -> constant gate = 1/sqrt(d)). Output [1,4,Sq,T] is the
+    4 per-group score rows for the downstream block-max top-k.
+    """
+    heads, num_groups, dim = 4, 4, 128
+    sq, t, chunk_start = 128, 256, 128
+    scale = dim**-0.5
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=64, head_group_size=0)
+    q, k, _ = make_inputs(heads, dim, sq, t)
+    out = ttnn.to_torch(
+        ttnn.experimental.indexer_score(
+            to_device(q, device),
+            to_device(k, device),
+            chunk_start_idx=chunk_start,
+            apply_relu=False,
+            scale=scale,
+            num_groups=num_groups,
+            program_config=cfg,
+        )
+    )
+    w_scale = torch.full((1, heads, sq, 1), scale, dtype=torch.bfloat16)
+    ref = indexer_score_grouped_ref(q, k, w_scale, chunk_start, num_groups, apply_relu=False)
+    assert_grouped_match(out, ref, num_groups, sq, t)
+
+
+def test_indexer_score_multigroup_equals_single(device):
+    """num_groups=Hi (one head per group) must equal running each head as its own single-head op: plane g
+    of the grouped output == indexer_score(q[:, g:g+1]). Direct cross-check that the in-kernel per-group
+    split matches the validated single-plane path head-for-head.
+    """
+    heads, dim, sq, t, chunk_start = 4, 128, 64, 256, 128
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=32, k_chunk_size=64, head_group_size=0)
+    q, k, w = make_inputs(heads, dim, sq, t)
+    grouped = ttnn.to_torch(
+        ttnn.experimental.indexer_score(
+            to_device(q, device),
+            to_device(k, device),
+            to_device(w, device),
+            chunk_start_idx=chunk_start,
+            apply_relu=False,
+            num_groups=heads,
+            program_config=cfg,
+        )
+    )
+    for g in range(heads):
+        single = run_indexer(
+            q[:, g : g + 1], k, w[:, g : g + 1], chunk_start, device, program_config=cfg, apply_relu=False
+        )
+        assert torch.equal(grouped[:, g : g + 1], single), f"group {g} plane != single-head op"
+
+
+@pytest.mark.parametrize(
+    "k_chunk, head_group, match",
+    [(32, 0, "k_chunk_size"), (64, 4, "all heads resident")],
+    ids=["kc1_rejected", "streaming_rejected"],
+)
+def test_indexer_score_multigroup_rejects(device, k_chunk, head_group, match):
+    """num_groups>1 requires all heads resident + the full-strip path; reject KC<2 and head streaming."""
+    heads, dim, sq, t = 8, 128, 64, 256
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=32, k_chunk_size=k_chunk, head_group_size=head_group)
+    q, k, w = make_inputs(heads, dim, sq, t)
+    with pytest.raises(RuntimeError, match=match):
+        run_indexer(q, k, w, 128, device, program_config=cfg, apply_relu=False, num_groups=2)
 
 
 # ---------------------------------------------------------------------------

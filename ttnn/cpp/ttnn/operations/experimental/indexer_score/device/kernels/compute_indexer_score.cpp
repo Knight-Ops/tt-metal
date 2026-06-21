@@ -29,6 +29,8 @@ constexpr uint32_t heads_per_dest_pass = get_compile_time_arg_val(num_common_ct_
 constexpr uint32_t qk_batch_heads = get_compile_time_arg_val(num_common_ct_args + 1);
 // k-columns batched per matmul<->mul mode switch in the full-strip path (1 = per-column, no batching).
 constexpr uint32_t qk_col_batch = get_compile_time_arg_val(num_common_ct_args + 2);
+// 1 = relu(q.kT) before the gate-mul (DeepSeek/GLM lightning indexer); 0 = raw q.kT (MiniMax M3 MSA).
+constexpr bool apply_relu = get_compile_time_arg_val(num_common_ct_args + 3) != 0;
 
 // k-cols sharing ONE dest acquire in the blocked-custom mul; bounded by the dest budget. One unpack
 // context per head loads w[h] + ct_dim qk cols, so unpack-context sync is paid 1/ct_dim as often as
@@ -52,7 +54,14 @@ inline void set_matmul_mode() {
     pack_reconfig_l1_acc(0);  // cb_qk packs overwrite (mul phase turns L1-acc on for cb_acc_strip)
     mm_block_init_short(
         q_cb, k_cb, 1 /*transpose k*/, 1 /*ct_dim*/, heads_per_dest_pass /*rt_dim*/, head_dim_tiles /*kt_dim*/);
-    pack_relu_config(ReluConfig::zero());  // relu in the packer for the whole matmul phase
+    // relu(q.kT) in the packer for the matmul phase (DeepSeek/GLM). apply_relu=false (e.g. MiniMax M3)
+    // keeps the packer linear so the raw dot product flows to the gate-mul. Compile-time, so the
+    // apply_relu=true path is unchanged.
+    if constexpr (apply_relu) {
+        pack_relu_config(ReluConfig::zero());
+    } else {
+        pack_relu_config(ReluConfig::none());
+    }
 }
 
 /** Matmul one DEST pass of relu(q.kT): HP head-rows of q row r vs k col c, left in DEST (caller packs).
@@ -128,16 +137,22 @@ void mul_accum_chunk(uint32_t w_base, uint32_t chunk_heads, bool first, uint32_t
     qk.pop_front(chunk_heads);
 }
 
-/** Matmul DEST pass packed HEAD-MAJOR: head h's `cols` columns land contiguous in cb_qk (slot
- *  (head+d)*cols + col_in_batch), the layout the blocked mul streams as SrcA. Uses llk_matmul_pack
- *  out_of_order (generic pack misreads the matmul DEST layout). Caller reserves cols*num_heads once. */
+/** Matmul DEST pass packed HEAD-MAJOR: head's `cols` columns land contiguous in cb_qk at the
+ *  group-local pack slot (pack_head+d)*cols + col_in_batch, the layout the blocked mul streams as SrcA.
+ *  q_head is the (global) q head index for the matmul; pack_head is its index within the current output
+ *  group (== q_head when num_out_groups==1). Uses llk_matmul_pack out_of_order (generic pack misreads
+ *  the matmul DEST layout). Caller reserves cols*reduce_heads once. */
 template <uint32_t q_cb, uint32_t k_cb, uint32_t qk_cb>
-void matmul_relu_pass_headmajor(uint32_t head_in_group, uint32_t r, uint32_t c, uint32_t col_in_batch, uint32_t cols) {
-    emit_qk_matmul_block<q_cb, k_cb>(head_in_group, r, c);
+void matmul_relu_pass_headmajor(
+    uint32_t q_head, uint32_t pack_head, uint32_t r, uint32_t c, uint32_t col_in_batch, uint32_t cols) {
+    emit_qk_matmul_block<q_cb, k_cb>(q_head, r, c);
     tile_regs_wait();
     for (uint32_t d = 0; d < heads_per_dest_pass; ++d) {
         PACK((llk_matmul_pack<DST_ACCUM_MODE, true /*out_of_order*/, PackMode::Default>(
-            d, qk_cb, 1 /*ntiles*/, (head_in_group + d) * cols + col_in_batch)));  // relu(q.kT), head-major slot
+            d,
+            qk_cb,
+            1 /*ntiles*/,
+            (pack_head + d) * cols + col_in_batch)));  // relu(q.kT), head-major (group-local) slot
     }
     tile_regs_release();
 }
@@ -214,14 +229,16 @@ inline void stamp_mask_tile(uint32_t slot, uint32_t k_tile, uint32_t diag_tile) 
 
 /** PHASE 1 -- fill cb_qk HEAD-MAJOR with relu(q[:,r].k[col_base..]^T) for one k-col batch of row r.
  *  One set_matmul_mode for the batch (reinit hoisted out of the col loop), one cb_qk reserve/push. */
-inline void matmul_phase(uint32_t r, uint32_t col_base, uint32_t cols) {
-    const uint32_t batch_tiles = cols * num_heads;
+inline void matmul_phase(uint32_t r, uint32_t col_base, uint32_t cols, uint32_t head_base) {
+    const uint32_t batch_tiles = cols * reduce_heads;
     CircularBuffer qk(cb_qk);
     set_matmul_mode<cb_q, cb_k, cb_qk>();
     qk.reserve_back(batch_tiles);
     for (uint32_t col_in_batch = 0; col_in_batch < cols; ++col_in_batch) {
-        for (uint32_t head = 0; head < num_heads; head += heads_per_dest_pass) {
-            matmul_relu_pass_headmajor<cb_q, cb_k, cb_qk>(head, r, col_base + col_in_batch, col_in_batch, cols);
+        // hl indexes this output group's heads [head_base, head_base+reduce_heads); pack head-major at hl.
+        for (uint32_t hl = 0; hl < reduce_heads; hl += heads_per_dest_pass) {
+            matmul_relu_pass_headmajor<cb_q, cb_k, cb_qk>(
+                head_base + hl, hl, r, col_base + col_in_batch, col_in_batch, cols);
         }
     }
     qk.push_back(batch_tiles);
@@ -232,9 +249,10 @@ inline void matmul_phase(uint32_t r, uint32_t col_base, uint32_t cols) {
  *  is one unpack context (w[h] once + ct_dim cols) that MACs onto dest[0..n_cols), so unpack-context
  *  sync is per head, not per (col, head). ELWMUL accumulates in dest -> one pack per column. cb_qk is
  *  head-major (head h's cols contiguous); whole batch shares one set_mul_mode (w is column-independent). */
-inline void mul_phase(uint32_t r, uint32_t slot_base, uint32_t col_base, uint32_t cols) {
-    const uint32_t batch_tiles = cols * num_heads;
-    const uint32_t w_base = r * num_heads;  // single chunk (group_start = 0); gate per (head, row)
+inline void mul_phase(uint32_t r, uint32_t slot_base, uint32_t col_base, uint32_t cols, uint32_t head_base) {
+    const uint32_t batch_tiles = cols * reduce_heads;
+    // gate per (head, row); this output group's heads are [head_base, head_base+reduce_heads) of row r.
+    const uint32_t w_base = r * num_heads + head_base;
     // gates consumed only here: wait now (after this batch's matmuls) so the reader reads w behind the
     // latency-critical q/k. Cumulative wait -> no-op once the resident group is in.
     CircularBuffer qk(cb_qk);
@@ -244,8 +262,8 @@ inline void mul_phase(uint32_t r, uint32_t slot_base, uint32_t col_base, uint32_
     for (uint32_t sub_base = 0; sub_base < cols; sub_base += mul_ct_dim) {
         const uint32_t n_cols = (sub_base + mul_ct_dim <= cols) ? mul_ct_dim : (cols - sub_base);
         tile_regs_acquire();
-        for (uint32_t h = 0; h < num_heads; ++h) {
-            mul_tiles_bcast_cols_custom(cb_qk, cb_w, h * cols + sub_base, w_base + h, 0, n_cols);
+        for (uint32_t hl = 0; hl < reduce_heads; ++hl) {
+            mul_tiles_bcast_cols_custom(cb_qk, cb_w, hl * cols + sub_base, w_base + hl, 0, n_cols);
         }
         tile_regs_commit();
         tile_regs_wait();
@@ -309,34 +327,49 @@ void kernel_main() {
         k.wait_front(k_chunk_tiles);
         const uint32_t k_tiles_in_unit = span.k_tiles();
 
-        acc.reserve_back(unit_strip);
-        for (uint32_t r = 0; r < q_tiles_per_unit; ++r) {
-            // wait q rows 0..r only (reader pushes per row): row r reads only its row, so row 0 runs
-            // while row 1 arrives. Cumulative + non-consuming -> immediate once q is resident.
-            if constexpr (!stream_heads) {
-                q.wait_front((r + 1) * q_row_tiles);
-            }
-            const uint32_t slot_base = r * k_tiles_per_unit;
-
-            // PHASE 1 (matmul) + PHASE 2 (mul) per k-col batch. cb_qk holds one batch, so they
-            // alternate; GLM5/DSv32 (heads8/16) = one of each per row.
-            if constexpr (qk_col_batch > 1) {
-                for (uint32_t col_base = 0; col_base < k_tiles_per_unit; col_base += qk_col_batch) {
-                    const uint32_t cols =
-                        (col_base + qk_col_batch <= k_tiles_per_unit) ? qk_col_batch : (k_tiles_per_unit - col_base);
-                    matmul_phase(r, col_base, cols);          // PHASE 1: relu(q.kT) -> cb_qk (head-major)
-                    mul_phase(r, slot_base, col_base, cols);  // PHASE 2: gate-mul + head-reduce -> cb_acc_strip
+        // One output plane per group (g-major): group g sums only its reduce_heads heads
+        // [g*reduce_heads, +reduce_heads) into the accumulator, then untilizes/writes its own plane.
+        // num_out_groups==1 is the head-summed DeepSeek/GLM score (single pass, identical to before);
+        // >1 emits per-GQA-group planes (MiniMax M3). k/q/w stay resident across all groups of a unit.
+        for (uint32_t g = 0; g < num_out_groups; ++g) {
+            const uint32_t head_base = g * reduce_heads;
+            acc.reserve_back(unit_strip);
+            for (uint32_t r = 0; r < q_tiles_per_unit; ++r) {
+                // wait q rows 0..r only (reader pushes per row): row r reads only its row, so row 0 runs
+                // while row 1 arrives. Cumulative + non-consuming -> immediate once q is resident (and a
+                // no-op for groups g>0, which reuse the same resident q).
+                if constexpr (!stream_heads) {
+                    q.wait_front((r + 1) * q_row_tiles);
                 }
-            } else {
-                accumulate_row_streaming(r, slot_base);  // PHASE 1+2 head-streaming / KC==1 fallback
+                const uint32_t slot_base = r * k_tiles_per_unit;
+
+                // PHASE 1 (matmul) + PHASE 2 (mul) per k-col batch. cb_qk holds one batch, so they
+                // alternate; GLM5/DSv32 (heads8/16) = one of each per row.
+                if constexpr (qk_col_batch > 1) {
+                    for (uint32_t col_base = 0; col_base < k_tiles_per_unit; col_base += qk_col_batch) {
+                        const uint32_t cols = (col_base + qk_col_batch <= k_tiles_per_unit)
+                                                  ? qk_col_batch
+                                                  : (k_tiles_per_unit - col_base);
+                        matmul_phase(r, col_base, cols, head_base);  // PHASE 1: relu(q.kT) -> cb_qk (head-major)
+                        mul_phase(
+                            r,
+                            slot_base,
+                            col_base,
+                            cols,
+                            head_base);  // PHASE 2: gate-mul + head-reduce -> cb_acc_strip
+                    }
+                } else {
+                    accumulate_row_streaming(
+                        r, slot_base);  // PHASE 1+2 head-streaming / KC==1 fallback (num_out_groups==1)
+                }
+
+                stamp_masked_suffix(span, r, slot_base, k_tiles_in_unit);  // causal -inf on the row's masked suffix
             }
+            acc.push_back(unit_strip);
 
-            stamp_masked_suffix(span, r, slot_base, k_tiles_in_unit);  // causal -inf on the row's masked suffix
+            // PHASE 3 -- untilize this plane's QC strips in ONE pack_untilize bracket (cost amortizes over QC*KC).
+            compute_kernel_lib::untilize<k_tiles_per_unit, cb_acc_strip, cb_out_strip>(q_tiles_per_unit);
         }
-        acc.push_back(unit_strip);
-
-        // PHASE 3 -- untilize all QC strips in ONE pack_untilize bracket (cost amortizes over QC*KC).
-        compute_kernel_lib::untilize<k_tiles_per_unit, cb_acc_strip, cb_out_strip>(q_tiles_per_unit);
 
         k.pop_front(k_chunk_tiles);
         if (span.advance()) {

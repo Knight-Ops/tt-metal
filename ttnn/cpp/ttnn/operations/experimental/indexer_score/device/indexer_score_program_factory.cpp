@@ -128,6 +128,13 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     const uint32_t KC = cfg.k_chunk_size / tt::constants::TILE_WIDTH;
     const uint32_t HB = resolve_head_group(cfg, Hi);
 
+    // num_groups: G==1 sums all heads (DeepSeek/GLM); G>1 sums Hi/G heads per group into G output planes
+    // (MiniMax M3). The matmul subblock height and cb_qk batch key off the per-plane reduction width:
+    // HB when G==1 (unchanged), plane_heads when G>1 (validate guarantees HB==Hi there).
+    const uint32_t G = args.num_groups;
+    const uint32_t plane_heads = Hi / G;
+    const uint32_t subblock_basis = (G > 1) ? plane_heads : HB;
+
     // Compute knobs from the resolved compute config. math_fidelity defaults to the dtype-derived
     // choice (bf16 -> HiFi2, both bfp8 -> LoFi) but a caller can override it; validate guarantees
     // fp32_dest_acc_en==false / dst_full_sync_en==false (the bf16-DEST half-sync layout the custom
@@ -138,8 +145,13 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     // qk matmul subblock: heads are output rows, k column is 1 tile wide (SDPA-style), so only the
     // subblock height (head rows) is needed.
     const uint32_t dst_size = fp32_dest_acc_en ? 4 : 8;  // half-sync, as in sdpa_program_factory
-    const uint32_t qk_subblock_h = ttnn::prim::detail::determine_largest_subblock_size(HB, 1, dst_size).first;
-    TT_FATAL(HB % qk_subblock_h == 0, "head group {} must be divisible by qk_subblock_h={}", HB, qk_subblock_h);
+    const uint32_t qk_subblock_h =
+        ttnn::prim::detail::determine_largest_subblock_size(subblock_basis, 1, dst_size).first;
+    TT_FATAL(
+        subblock_basis % qk_subblock_h == 0,
+        "per-plane head count {} must be divisible by qk_subblock_h={}",
+        subblock_basis,
+        qk_subblock_h);
 
     // QC/KC/HB are verbatim from the config -- no auto-tune; the caller owns the perf trade-off (see
     // glx_config() in the test). An oversized config is not clamped; it fails at CB allocation.
@@ -239,23 +251,32 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     // cb_qk buffers a batch of the group's relu(q.kT) tiles so compute runs that batch's matmuls then
     // its mul+accumulates, hoisting the matmul<->eltwise reinit out of the per-head-pass loop.
     // QC==1 has spare L1 -> batch the whole group; QC>1 doubles cb_q/cb_w, so cap at 32.
-    const uint32_t qk_batch_cap = (QC == 1) ? HB : 32u;
-    const uint32_t qk_batch_heads = std::min<uint32_t>(HB, qk_batch_cap);  // multiple of qk_subblock_h
-    // The compute kernel walks HB in qk_batch_heads-sized chunks (chunk += qk_batch_heads), so HB must
-    // be a whole multiple or the last chunk over-reads past the resident head group. Only reachable when
-    // the 32-cap engages (HB > 32 && QC > 1); the deployed cases never hit it, but guard loudly.
+    const uint32_t qk_batch_cap = (QC == 1) ? subblock_basis : 32u;
+    const uint32_t qk_batch_heads = std::min<uint32_t>(subblock_basis, qk_batch_cap);  // multiple of qk_subblock_h
+    // The compute kernel walks the per-plane heads in qk_batch_heads-sized chunks, so the per-plane head
+    // count must be a whole multiple or the last chunk over-reads. Only reachable when the 32-cap engages
+    // (basis > 32 && QC > 1); the deployed cases never hit it, but guard loudly.
     TT_FATAL(
-        HB % qk_batch_heads == 0,
-        "head_group {} not divisible by qk_batch_heads {} (QC>1 with HB>32); reduce head_group_size or q_chunk_size",
-        HB,
+        subblock_basis % qk_batch_heads == 0,
+        "per-plane head count {} not divisible by qk_batch_heads {} (QC>1 with >32 heads); reduce head_group_size, "
+        "q_chunk_size, or raise num_groups",
+        subblock_basis,
         qk_batch_heads);
     // Full-strip path batches the whole k chunk's columns per matmul<->mul mode switch (one switch per
     // batch, not per output tile): w is column-independent and the whole k chunk is resident, so a row's
     // columns share one switch. Only when the group is a single chunk (qk_batch_heads == Hi) and the fast
     // strip is used (KC >= 2); cb_qk then holds KC * qk_batch_heads tiles and fails at allocation if the
     // caller's k_chunk_size is too large for L1 (the caller owns the knob trade-off).
-    const bool single_chunk = (qk_batch_heads == Hi) && !stream_heads;
+    const bool single_chunk = (qk_batch_heads == subblock_basis) && !stream_heads;
     const uint32_t qk_col_batch = (KC >= 2 && single_chunk) ? KC : 1u;
+    // G>1 reuses the all-resident full-strip path one group at a time; the per-column / streaming
+    // fallback is not wired for groups. validate already requires HB==Hi and KC>=2, so this only fires
+    // if the per-plane head count exceeds the batch cap (QC>1 with plane_heads>32).
+    TT_FATAL(
+        G == 1 || qk_col_batch > 1,
+        "num_groups {}>1 requires the full-strip path (got qk_col_batch=1; plane_heads {} likely > batch cap)",
+        G,
+        plane_heads);
     make_cb(cb_qk_arg, qk_col_batch * qk_batch_heads, acc_fmt, acc_tile);
     // cb_out_strip holds a unit's untilized output. Uniform KC push/pop keeps the packer's KC-tile
     // reads contiguous (a non-uniform push would wrap the ring mid-strip).
@@ -268,8 +289,8 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     // No up-front L1-fit guard: an oversized QC/KC/head_group config fails at CB allocation. The caller
     // owns the knob trade-off (see glx_config() in the test).
 
-    // Common args: 8 dims then the CB indices in CbArg order (kernels read both from this shared base).
-    std::vector<uint32_t> common_ct = {Hi, Sqt, Tt, Dt, chunk_t, QC, KC, HB};
+    // Common args: 9 dims then the CB indices in CbArg order (kernels read both from this shared base).
+    std::vector<uint32_t> common_ct = {Hi, Sqt, Tt, Dt, chunk_t, QC, KC, HB, G};
     common_ct.insert(common_ct.end(), cb_id.begin(), cb_id.end());
 
     std::vector<uint32_t> reader_ct = common_ct;
@@ -294,8 +315,9 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
 
     std::vector<uint32_t> compute_ct = common_ct;
     compute_ct.push_back(qk_subblock_h);
-    compute_ct.push_back(qk_batch_heads);  // head tiles per matmul/mul phase chunk
-    compute_ct.push_back(qk_col_batch);    // k-columns batched per mode switch in the full-strip path
+    compute_ct.push_back(qk_batch_heads);             // head tiles per matmul/mul phase chunk
+    compute_ct.push_back(qk_col_batch);               // k-columns batched per mode switch in the full-strip path
+    compute_ct.push_back(args.apply_relu ? 1u : 0u);  // 1 = relu(q.kT) (DeepSeek/GLM), 0 = raw q.kT (M3)
 
     const std::string kdir = "ttnn/cpp/ttnn/operations/experimental/indexer_score/device/kernels/";
     auto reader_id = tt::tt_metal::CreateKernel(

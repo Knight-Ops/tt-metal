@@ -24,7 +24,12 @@ constexpr uint32_t chunk_start_tiles = get_compile_time_arg_val(4);  // q chunk 
 constexpr uint32_t q_tiles_per_unit = get_compile_time_arg_val(5);   // q-tile-rows per work unit (q_chunk knob)
 constexpr uint32_t k_tiles_per_unit = get_compile_time_arg_val(6);   // k tiles per work unit (k_chunk knob)
 constexpr uint32_t heads_per_group = get_compile_time_arg_val(7);    // heads resident at once (head_group knob)
-constexpr uint32_t num_dim_args = 8;
+constexpr uint32_t num_out_groups = get_compile_time_arg_val(8);     // output groups; score [B, num_out_groups, Sq, T]
+constexpr uint32_t num_dim_args = 9;
+
+// Heads summed into one output plane. num_out_groups==1 sums all heads (DeepSeek/GLM); >1 partitions the
+// heads into num_out_groups contiguous groups of reduce_heads each, summed within a group (MiniMax M3).
+constexpr uint32_t reduce_heads = num_heads / num_out_groups;
 
 // CB indices, forwarded from the factory in CbArg order right after the dim args. Bare names so
 // kernels (and their template-arg uses) read like the host-side constants did.

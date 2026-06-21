@@ -24,16 +24,33 @@ void bind_indexer_score(nb::module_& mod) {
     ttnn::bind_function<"indexer_score", "ttnn.experimental.">(
         mod,
         R"doc(
-        DeepSeek-V3.2 DSA lightning-indexer scorer.
+        DeepSeek-V3.2 DSA / MiniMax-M3 MSA lightning-indexer scorer.
 
-        score[b, s, t] = sum_h relu(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]
+        score[b, s, t] = sum_h act(q[b,h,s,:] . k[b,t,:]) * weights[b,h,s]
+
+        with act = relu when apply_relu=True (DeepSeek-V3.2 / GLM-5), or the
+        identity when apply_relu=False (MiniMax M3 MSA: raw dot product, with
+        the 1/sqrt(d) scale folded into weights). For M3's per-GQA-group
+        selection, run one group per device (index head Hi=1) so the head-sum
+        is a no-op and the output [B,1,Sq,T] is that group's score row.
 
         Args:
             q: [B, Hi, Sq, D] bf16 or bfp8_b tiled (post non-interleaved RoPE)
             k: [B, 1, T, D] bf16 or bfp8_b tiled, single shared head
-            weights: [B, Hi, Sq, 1] bf16 tiled, scales pre-folded
+            weights: optional [B, Hi, Sq, 1] bf16 tiled learned per-head gates
+                (DeepSeek/GLM; scale pre-folded). Omit for MiniMax M3 (no gates):
+                the op then uses a constant gate equal to `scale`.
             chunk_start_idx: global position of query row 0 (causality: key t
                 visible to query s iff t <= chunk_start_idx + s)
+            apply_relu: apply relu(q.kT) before the gate-multiply (default True,
+                DeepSeek/GLM). Set False for the raw dot product (MiniMax M3).
+            scale: constant gate value used only when weights is omitted (e.g.
+                1/sqrt(d) for MiniMax M3). Ignored when weights is given.
+            num_groups: 1 sums all Hi heads into one plane (DeepSeek/GLM). G>1
+                partitions the heads into G groups of Hi/G and sums within each
+                group -> output [B, G, Sq, T] (MiniMax M3 per-GQA-group selection,
+                multiple groups on one chip). G>1 needs all heads resident
+                (head_group_size 0 or Hi) and k_chunk_size >= 64.
             program_config: work-unit knobs (q_chunk_size, k_chunk_size,
                 head_group_size; elements, tile-aligned). Defaults always fit
                 L1; raise head_group_size (0 = all resident) for performance.
@@ -47,9 +64,12 @@ void bind_indexer_score(nb::module_& mod) {
         &ttnn::experimental::indexer_score,
         nb::arg("q"),
         nb::arg("k"),
-        nb::arg("weights"),
+        nb::arg("weights") = std::nullopt,
         nb::kw_only(),
         nb::arg("chunk_start_idx") = 0,
+        nb::arg("apply_relu") = true,
+        nb::arg("scale") = 1.0f,
+        nb::arg("num_groups") = 1,
         nb::arg("program_config") = IndexerScoreProgramConfig{},
         nb::arg("compute_kernel_config") = std::nullopt);
 }
