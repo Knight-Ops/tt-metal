@@ -76,10 +76,8 @@ void kernel_main() {
     const uint32_t act_ready_sem_addr = get_semaphore(act_ready_sem_id);
     const uint32_t act_valid_sem_addr = get_semaphore(act_valid_sem_id);
 
-    // UP_SPLIT local same-core handshake (BRISC reader <-> NCRISC writer).
-    // up_go: reader -> writer ("cb_in1_up slot reserved for this K-block, read
-    // it"). up_done: writer -> reader ("up block landed in L1, multicast it").
-    // Monotonic counters; only the gy=0 in1-sender cores use them.
+    // UP_SPLIT local handshake (reader <-> writer): up_go = slot reserved,
+    // up_done = up block landed in L1. Monotonic; gy=0 in1-sender cores only.
     const uint32_t up_go_sem_id = get_arg_val<uint32_t>(31);
     const uint32_t up_done_sem_id = get_arg_val<uint32_t>(32);
     volatile tt_l1_ptr uint32_t* up_go_local =
@@ -116,15 +114,9 @@ void kernel_main() {
     constexpr uint32_t cb_activated = get_compile_time_arg_val(20);
     constexpr uint32_t GRID_X_NOC = get_compile_time_arg_val(21);  // M-row mcast group size
     constexpr uint32_t K_down_tiles_padded = get_compile_time_arg_val(22);
-    // Two-RISC weight read mode for `up`:
-    //   reader_reads_up  — reader issues the `up` DRAM read (LEGACY only).
-    //   reader_mcasts_up — reader NoC-0 multicasts `up` and receivers push it
-    //                      (LEGACY and UP_SPLIT). In UP_SPLIT the block is read
-    //                      from DRAM by the writer on NoC 1 (writer_split_up)
-    //                      into this sender's cb_in1_up slot; the reader waits
-    //                      on the local up_done handshake instead of reading.
-    //   Both 0 => UP_WRITER_MCAST (short-seq): writer owns `up` end-to-end and
-    //   the reader skips it entirely.
+    // `up` read mode: reader_reads_up = reader does the DRAM read (LEGACY);
+    // reader_mcasts_up = reader NoC-0 mcasts up (UP_SPLIT: writer reads it on
+    // NoC 1 into cb_in1_up); both 0 = UP_WRITER_MCAST, reader skips up.
     constexpr uint32_t reader_reads_up = get_compile_time_arg_val(23);
     constexpr uint32_t reader_mcasts_up = get_compile_time_arg_val(24);
     // UP_SPLIT iff the reader multicasts up but does not read it from DRAM.
@@ -239,8 +231,7 @@ void kernel_main() {
     const uint64_t in0_mcast_valid_noc = get_noc_multicast_addr(
         in0_mcast_nx_start, in0_mcast_ny_start, in0_mcast_nx_end, in0_mcast_ny_end, in0_valid_sem_addr);
 
-    // UP_SPLIT handshake counter: incremented once per gate/up K-block on the
-    // in1-sender cores, kept in lockstep with the writer's identical counter.
+    // UP_SPLIT handshake counter, kept in lockstep with the writer's.
     uint32_t up_seq = 0;
 
     // Bound the chunk loop by effective_chunks (= ceil_div(count, chunk_M_tiles))
@@ -290,10 +281,8 @@ void kernel_main() {
                 cb_reserve_back(cb_in1_up, g_in1_block_num_tiles);
             }
 
-            // UP_SPLIT: now that the cb_in1_up slot is reserved, release the
-            // writer (NCRISC) to read this K-block's `up` from DRAM on NoC 1
-            // into that slot — concurrent with the reader's NoC-0 `gate` read
-            // below. Monotonic counter kept in lockstep with the writer.
+            // UP_SPLIT: slot reserved -> release writer to read `up` on NoC 1,
+            // concurrent with the reader's NoC-0 `gate` read below.
             if constexpr (up_split) {
                 if (is_in1_sender) {
                     ++up_seq;
@@ -385,11 +374,9 @@ void kernel_main() {
                         l1_w_gate += gate_tile_bytes;
                     }
                 }
-                // `up` weight slot (same cb_in1_up block the writer reads into
-                // in UP_SPLIT). reader_reads_up (LEGACY): the reader issues the
-                // up DRAM read on NoC 0. UP_SPLIT: the writer already issued the
-                // read on NoC 1; the reader only needs the L1 block start now
-                // and waits for the up_done handshake (below) before mcasting.
+                // `up` slot. LEGACY: reader reads it on NoC 0. UP_SPLIT: writer
+                // already read it on NoC 1; reader just takes the L1 start and
+                // waits on up_done (below) before mcasting.
                 uint32_t up_block_start = 0;
                 if constexpr (reader_mcasts_up) {
                     up_block_start = get_write_ptr(cb_in1_up);
@@ -416,23 +403,19 @@ void kernel_main() {
                 }
                 noc_async_read_barrier(/*noc=*/0);
 
-                // UP_SPLIT: ensure the writer's NoC-1 `up` DRAM read for this
-                // K-block has landed in L1 before we multicast it on NoC 0.
+                // UP_SPLIT: wait for the writer's NoC-1 `up` read before mcast.
                 if constexpr (up_split) {
                     noc_semaphore_wait_min(up_done_local, up_seq);
                 }
 
-                // GRID_Y == 1 (short-sequence 1D layout): no column receivers,
-                // so this core is its own consumer — skip the weight multicast
-                // and the valid-sem broadcast entirely. The cb_push_back below
-                // hands the locally-read weights straight to compute.
+                // GRID_Y == 1: no column receivers — skip mcast/valid-sem; the
+                // locally-read weights go straight to compute via cb_push_back.
                 if (in1_num_receivers > 0) {
                     const uint64_t gate_mcast_noc = get_noc_multicast_addr(
                         in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, gate_block_start);
                     const uint32_t gate_block_bytes = g_in1_block_num_tiles * gate_tile_bytes;
-                    // When the reader mcasts up (LEGACY and UP_SPLIT), gate links
-                    // to the up mcast that follows (shared NoC path setup). In
-                    // UP_WRITER_MCAST the reader skips up, so gate is unlinked.
+                    // Link gate to the up mcast that follows when up is mcast;
+                    // unlinked in UP_WRITER_MCAST (no up mcast).
                     noc_async_write_multicast(
                         gate_block_start,
                         gate_mcast_noc,
@@ -592,9 +575,8 @@ void kernel_main() {
             // in flight during step 3 activated mcast on NoC 1), then mcast.
             if (is_in1_sender) {
                 noc_async_read_barrier(/*noc=*/0);
-                // GRID_Y == 1: no column receivers — the locally-read down
-                // weight block is consumed by this core directly (pushed
-                // below); skip the multicast and valid-sem broadcast.
+                // GRID_Y == 1: no column receivers — skip mcast/valid-sem; this
+                // core consumes the locally-read down weight directly.
                 if (in1_num_receivers > 0) {
                     const uint64_t mcast_data_noc = get_noc_multicast_addr(
                         in1_mcast_nx_start, in1_mcast_ny_start, in1_mcast_nx_end, in1_mcast_ny_end, in1_block_start);
