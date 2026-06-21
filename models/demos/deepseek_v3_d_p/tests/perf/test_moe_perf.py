@@ -41,13 +41,17 @@ def test_deepseek_v3_moe_perf_loudbox():
     """
     run_moe_perf_with_approximation(
         command_8x1=_CMD_8X1,
-        expected_ns_8x1=36_272_143,
+        # Recalibrated 2026-06-21 on BH LoudBox 8x1. This baseline had not been
+        # re-centered for the UP_SPLIT speedup, so it now absorbs both that and the
+        # ttnn::empty output-buffer change (no full-buffer device fill per layer):
+        # 36.27ms -> 28.27ms. Was 36_272_143.
+        expected_ns_8x1=28_270_000,
         model_name_8x1="deepseek_v3_moe_lb_8x1_dispatch_combine",
         command_2x4=_CMD_2X4,
-        # Recalibrated 2026-06-21 on BH LoudBox 2x4 after the unified_routed_expert_ffn
-        # two-RISC (UP_SPLIT) read overlap sped up the gate/up weight stream (~10% MoE
-        # device-time drop, bit-exact). Was 39_194_517.
-        expected_ns_2x4=35_127_772,
+        # Recalibrated 2026-06-21 on BH LoudBox 2x4. UP_SPLIT was already baked in
+        # (39_194_517 -> 35_127_772); this re-center picks up the ttnn::empty
+        # output-buffer change: 35.13ms -> 33.14ms. Was 35_127_772.
+        expected_ns_2x4=33_140_000,
         model_name_2x4="deepseek_v3_moe_lb_2x4_gate",
         subdir="deepseek_v3_moe",
         margin=0.03,
