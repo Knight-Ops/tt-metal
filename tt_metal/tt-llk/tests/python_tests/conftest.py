@@ -9,6 +9,7 @@ import os
 import re
 import signal
 import sys
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import asdict
 from pathlib import Path
 from typing import Optional
@@ -671,6 +672,57 @@ def pytest_runtest_setup(item):
 def pytest_sessionstart(session):
     if hasattr(session.config, "workerinput"):
         return
+
+
+def _precompile_item(item):
+    """Invoke one collected test's compile path without pytest fixture injection.
+
+    Catches Skipped (the expected outcome in PRODUCE mode) and all other
+    exceptions so that failures don't abort the pool — workers will retry
+    any variant that didn't compile via the existing per-variant FileLock.
+    """
+    params = getattr(getattr(item, "callspec", None), "params", {})
+    try:
+        item.obj(**params)
+    except Exception:
+        pass  # Skipped = success; anything else = workers will retry
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_finish(session):
+    """Master-only pre-compile pass: compile all variants before xdist workers start.
+
+    Runs every collected test function directly (bypassing fixture injection) so
+    that build_elfs() runs and sets the done_marker for each unique variant.
+    Workers then find the markers on their first check and skip instantly,
+    eliminating the sequential compile→skip bottleneck inside each worker.
+    """
+    if not session.config.getoption("--compile-producer", default=False):
+        return
+    if hasattr(session.config, "workerinput"):
+        return  # xdist workers skip; master handles pre-compile
+
+    n = len(session.items)
+    if n == 0:
+        return
+
+    n_threads = os.cpu_count() or 40
+    logger.info(
+        "Pre-compile pass: {} items across {} threads (compile-slot semaphore caps g++ at {})",
+        n,
+        n_threads,
+        n_threads,
+    )
+
+    with ThreadPoolExecutor(max_workers=n_threads) as pool:
+        futures = [pool.submit(_precompile_item, item) for item in session.items]
+        done = 0
+        for _ in as_completed(futures):
+            done += 1
+            if done % 200 == 0:
+                logger.info("Pre-compile pass: {}/{} items done", done, n)
+
+    logger.info("Pre-compile pass complete ({} items); xdist workers will skip ELF builds", n)
 
 
 @pytest.fixture(scope="module", autouse=True)
