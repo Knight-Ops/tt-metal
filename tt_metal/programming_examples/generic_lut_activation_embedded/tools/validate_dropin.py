@@ -24,24 +24,12 @@ Usage:
 """
 
 import argparse
-import struct
 import sys
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
-
-
-def bf16_to_signed(val):
-    f32_bytes = struct.pack("f", float(val))
-    bits = (struct.unpack("I", f32_bytes)[0] >> 16) & 0xFFFF
-    return -(bits & 0x7FFF) if bits & 0x8000 else bits
-
-
-def fp32_to_signed(val):
-    bits = struct.unpack("I", struct.pack("f", float(val)))[0]
-    return -(bits & 0x7FFFFFFF) if bits & 0x80000000 else bits
 
 
 def exhaustive_bf16_inputs(lo=-10.0, hi=10.0):
@@ -52,16 +40,30 @@ def exhaustive_bf16_inputs(lo=-10.0, hi=10.0):
     return torch.from_numpy(np.sort(all_vals[mask])).bfloat16()
 
 
-def compute_ulps(hw, ref, is_bf16):
-    to_signed = bf16_to_signed if is_bf16 else fp32_to_signed
-    if is_bf16:
-        hw = torch.tensor(hw).bfloat16().float().numpy()
-        ref = torch.tensor(ref).bfloat16().float().numpy()
-    ulps = np.zeros(len(hw), dtype=np.int64)
-    for i in range(len(hw)):
-        if hw[i] != ref[i]:
-            ulps[i] = abs(to_signed(hw[i]) - to_signed(ref[i]))
-    return ulps
+def compute_ulps(hw, ref, is_bf16, inputs=None):
+    """Per-point canonical Goldberg ULP error (ttpoly.spec.units).
+
+    Delegates to the SINGLE ULP owner so this validator reports the SAME robust
+    metric as the device sweep / fitter (FTZ before spacing, subnormal golden &
+    inputs masked to NaN). Replaces the old bit-distance reimplementation, which
+    blew up near roots and is the forbidden "raw" alternative. Returns a float
+    array (NaN where masked); aggregate with nanmax / nanmean / nanpercentile.
+    """
+    import os as _os
+
+    _fit_dir = _os.environ.get("TT_POLY_FIT_DIR", "/localdev/nkapre/tt-polynomial-fitter")
+    if _fit_dir not in sys.path:
+        sys.path.insert(0, _fit_dir)
+    from ttpoly.spec import units as _units
+
+    precision = "bf16" if is_bf16 else "fp32"
+    return _units.ulp_error(
+        np.asarray(ref, dtype=np.float64),
+        np.asarray(hw, dtype=np.float64),
+        precision=precision,
+        inputs=None if inputs is None else np.asarray(inputs, dtype=np.float64),
+        flush_to_zero=True,
+    )
 
 
 def load_activation_configs():
@@ -187,8 +189,9 @@ def validate(act_name, device, precisions, timing_iters=20):
         y_tt = ttnn_fn(x_tt)
         y_hw = ttnn.to_torch(y_tt).squeeze().float().numpy()[:n]
 
-        # Metrics
-        ulps = compute_ulps(y_hw, y_ref, is_bf16)
+        # Metrics — canonical Goldberg ULP (NaN where masked); aggregate with nan*
+        x_in = x_cpu.float().numpy()
+        ulps = compute_ulps(y_hw, y_ref, is_bf16, inputs=x_in)
         abs_err = np.abs(y_hw - y_ref)
 
         # Timing (256 tiles)
@@ -207,9 +210,9 @@ def validate(act_name, device, precisions, timing_iters=20):
             "n": n,
             "mae": float(np.mean(abs_err)),
             "max_err": float(np.max(abs_err)),
-            "max_ulp": int(np.max(ulps)),
-            "mean_ulp": float(np.mean(ulps)),
-            "p99_ulp": int(np.percentile(ulps, 99)),
+            "max_ulp": float(np.nanmax(ulps)) if np.any(np.isfinite(ulps)) else float("nan"),
+            "mean_ulp": float(np.nanmean(ulps)) if np.any(np.isfinite(ulps)) else float("nan"),
+            "p99_ulp": float(np.nanpercentile(ulps, 99)) if np.any(np.isfinite(ulps)) else float("nan"),
             "host_us": us,
         }
 
@@ -227,7 +230,7 @@ def print_results(name, results):
     for prec, r in results.items():
         print(
             f"  {prec.upper():<6} {r['n']:>6} {r['mae']:>10.2e} {r['max_err']:>10.2e} "
-            f"{r['max_ulp']:>8} {r['mean_ulp']:>8.2f} {r['p99_ulp']:>6} {r['host_us']:>7.1f}"
+            f"{r['max_ulp']:>8.2f} {r['mean_ulp']:>8.2f} {r['p99_ulp']:>6.2f} {r['host_us']:>7.1f}"
         )
 
     print(f"\n  PR Markdown:")
@@ -236,7 +239,7 @@ def print_results(name, results):
     for prec, r in results.items():
         print(
             f"  | {prec.upper()} | {r['n']} | {r['mae']:.2e} | {r['max_err']:.2e} | "
-            f"{r['max_ulp']} | {r['mean_ulp']:.2f} | {r['p99_ulp']} | {r['host_us']:.1f} |"
+            f"{r['max_ulp']:.2f} | {r['mean_ulp']:.2f} | {r['p99_ulp']:.2f} | {r['host_us']:.1f} |"
         )
     print()
 
