@@ -180,6 +180,43 @@ def _assert_l1_resident(tensor, name: str):
     assert tensor.memory_config().buffer_type == ttnn.BufferType.L1, f"{name} should reside in L1"
 
 
+def _decode_tp_mesh_is_2d(mesh_device):
+    """True when the mesh is a 2-D DP_TP mesh (both axes > 1), e.g. DP2_TP4 -> (2, 4)."""
+    if not hasattr(mesh_device, "shape"):
+        return False
+    shape = list(mesh_device.shape)
+    return len(shape) >= 2 and int(shape[0]) > 1 and int(shape[-1]) > 1
+
+
+def _decode_tp_input_mapper(mesh_device, hidden_dim_index):
+    """Mesh mapper that shards the decode hidden dim across the TP axis only.
+
+    1-D TP mesh ``(1, n)``: the whole mesh is the TP group, so shard the hidden
+    dim across all devices. 2-D DP_TP mesh ``(dp, n)`` (e.g. ``DP2_TP4`` ->
+    ``(2, 4)``): shard the hidden dim along the TP axis (mesh axis 1) and
+    replicate along the DP axis (mesh axis 0) -- this matches the model's decode
+    CCL, which all-reduces/all-gathers on ``cluster_axis=1``. A plain
+    ``ShardTensorToMesh(dim=-1)`` on a 2-D mesh would instead flatten all
+    ``dp*n`` devices and shard hidden into ``dp*n`` pieces (1536/8 = 192), which
+    matches neither the TP shard width nor the model's CCL groups.
+    """
+    if _decode_tp_mesh_is_2d(mesh_device):
+        return ttnn.ShardTensor2dMesh(mesh_device, dims=(None, hidden_dim_index), mesh_shape=tuple(mesh_device.shape))
+    return ttnn.ShardTensorToMesh(mesh_device, dim=-1)
+
+
+def _decode_tp_output_composer(mesh_device, hidden_dim_index):
+    """Composer that re-assembles the TP-sharded decode hidden dim.
+
+    Mirrors :func:`_decode_tp_input_mapper`: on a 2-D DP_TP mesh, concat the TP
+    shards along the hidden dim and the DP replicas along dim 0 (the caller takes
+    one replica); on a 1-D TP mesh, concat the hidden dim across all devices.
+    """
+    if _decode_tp_mesh_is_2d(mesh_device):
+        return ttnn.ConcatMesh2dToTensor(mesh_device, dims=(0, hidden_dim_index), mesh_shape=tuple(mesh_device.shape))
+    return ttnn.ConcatMeshToTensor(mesh_device, dim=-1)
+
+
 def _assert_ttnn_tensor(tensor, name: str):
     assert isinstance(tensor, ttnn.Tensor), f"{name} should be a TTNN tensor"
 
@@ -511,7 +548,7 @@ def test_dots_ocr_decode_one_layer_l1_boundaries(mesh_device, tp_decode_scheme):
     # stack input along hidden on a TP mesh and concat (dim=-1) for PCC.
     uses_tp_shard = is_tp_mesh and tp_decode_scheme in ("row", "col_parallel")
     if uses_tp_shard:
-        input_mapper = ttnn.ShardTensorToMesh(mesh_device, dim=-1)
+        input_mapper = _decode_tp_input_mapper(mesh_device, hidden_states_torch.dim() - 1)
     else:
         input_mapper = None
     hidden_state_kwargs = {"mesh_mapper": input_mapper} if input_mapper is not None else {}
@@ -585,8 +622,11 @@ def test_dots_ocr_decode_one_layer_l1_boundaries(mesh_device, tp_decode_scheme):
     if uses_tp_shard:
         ttnn_output_torch = ttnn.to_torch(
             output,
-            mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=-1),
+            mesh_composer=_decode_tp_output_composer(mesh_device, len(output.shape) - 1),
         )
+        if _decode_tp_mesh_is_2d(mesh_device):
+            # 2-D DP_TP mesh: the composer also stacks DP replicas along dim 0.
+            ttnn_output_torch = ttnn_output_torch[:1]
     elif num_devices > 1:
         # Pure-DP meshes replicate the single-token decode stream on each device.
         # ``ConcatMeshToTensor(dim=0)`` stacks replicas along batch, after which
@@ -1248,7 +1288,7 @@ def test_dots_ocr_decode_full_decoder_l1_boundaries(mesh_device, tp_decode_schem
     # sharded output back for PCC.
     uses_tp_shard = is_tp_mesh and tp_decode_scheme in ("row", "col_parallel")
     if uses_tp_shard:
-        input_mapper = ttnn.ShardTensorToMesh(mesh_device, dim=-1)
+        input_mapper = _decode_tp_input_mapper(mesh_device, hidden_states_torch.dim() - 1)
     else:
         input_mapper = None
     hidden_state_kwargs = {"mesh_mapper": input_mapper} if input_mapper is not None else {}
@@ -1315,11 +1355,14 @@ def test_dots_ocr_decode_full_decoder_l1_boundaries(mesh_device, tp_decode_schem
     if uses_tp_shard:
         # Both ``row`` and ``col_parallel`` TP keep the hidden dim sharded across
         # TP all the way to the stack output; concat the per-device shards back
-        # into full hidden.
+        # into full hidden. On a 2-D DP_TP mesh the composer also stacks the DP
+        # replicas along dim 0, so take the first replica.
         ttnn_output_torch = ttnn.to_torch(
             output,
-            mesh_composer=ttnn.ConcatMeshToTensor(mesh_device, dim=-1),
+            mesh_composer=_decode_tp_output_composer(mesh_device, len(output.shape) - 1),
         )
+        if _decode_tp_mesh_is_2d(mesh_device):
+            ttnn_output_torch = ttnn_output_torch[:1]
     elif num_devices > 1:
         # Multi-device mesh (T3K DP (8,1) or TP (1,8)/``col_parallel``):
         # DP-with-batch=1 and TP-after-all-reduce both produce identical data on

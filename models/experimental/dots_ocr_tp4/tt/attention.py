@@ -353,7 +353,13 @@ class DotsOCRAttentionTP4(TTNNModule):
         q, k, v = self._project_qkv_heads(x, batch_size, 1, ttnn.DRAM_MEMORY_CONFIG)
 
         cos, sin = self._rotary_setup.get_cos_sin_for_decode(cur_pos)
-        q = ttnn.experimental.rotary_embedding(q, cos, sin)
+        # paged_sdpa_decode asserts a DRAM (or sharded) Q
+        # (sdpa_decode_device_operation.cpp:89). nlp_create_qkv_heads emits L1 and
+        # rotary_embedding defaults its output to the input's memory config, so
+        # request DRAM explicitly for Q (the slice + permute below preserve it).
+        # Mirrors the symbiote decode path; K stays L1 (height-sharded below for
+        # paged_update).
+        q = ttnn.experimental.rotary_embedding(q, cos, sin, memory_config=ttnn.DRAM_MEMORY_CONFIG)
         k = ttnn.experimental.rotary_embedding(k, cos, sin)
 
         # rotary_embedding materializes the tile-padded seq dim (S=1 -> 32);

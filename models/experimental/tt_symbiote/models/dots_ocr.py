@@ -101,6 +101,19 @@ def _deep_sync_profile_enabled() -> bool:
     return os.environ.get("DOTS_OCR_PROFILE_DECODE_GRAPH", "").lower() in {"1", "true", "yes", "on"}
 
 
+def _tp4_kv_gather_bfp8_enabled() -> bool:
+    """Narrow the TP4->decode KV-cache relayout all_gather to BFP8.
+
+    The hybrid prefill adapter gathers the per-chip K/V across the TP axis to
+    build the replicated two-head decode cache (see
+    ``_TP4PrefillDecodeCacheAdapter``). That all_gather is bandwidth-bound, so
+    gathering BFP8 (then typecasting the two picked heads back to BF16 for the
+    BF16 paged_fill) ~halves the moved bytes. dots.ocr tolerates BFP8 K/V (the
+    TP2 path runs a fully-BFP8 cache), so the transient BF16->BFP8->BF16 round
+    trip on the gathered values is acceptable. Default OFF (A/B lever)."""
+    return os.environ.get("DOTS_OCR_TP4_KV_GATHER_BFP8", "0").lower() in {"1", "true", "yes", "on"}
+
+
 def _decode_tp_scheme_from_env() -> str:
     """Tensor-parallel decode scheme for full dots.ocr pipeline construction.
 
@@ -769,6 +782,15 @@ class _TP4PrefillDecodeCacheAdapter(TTNNPagedAttentionKVCache):
         local_heads = int(key_states.shape[1])  # KV heads per chip (1 for TP4)
         # Per chip: [K heads ... , V heads ...] on the head dim -> one tensor to gather.
         kv = ttnn.concat([key_states, value_states], dim=1, memory_config=ttnn.L1_MEMORY_CONFIG)
+        # Optionally narrow the (bandwidth-bound) all_gather to BFP8: ~half the
+        # moved bytes. The picked heads are typecast back to BF16 below for the
+        # BF16 paged_fill. Contiguous step-1 dim-1 (head) slices stay TILE-valid
+        # in BFP8, so the _pick path is unchanged. See _tp4_kv_gather_bfp8_enabled.
+        gather_bfp8 = _tp4_kv_gather_bfp8_enabled()
+        if gather_bfp8:
+            kv_bfp8 = ttnn.typecast(kv, ttnn.bfloat8_b, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(kv)
+            kv = kv_bfp8
         gathered = ttnn.all_gather(
             kv,
             dim=1,
@@ -810,6 +832,14 @@ class _TP4PrefillDecodeCacheAdapter(TTNNPagedAttentionKVCache):
         decode_k = _pick(0)
         decode_v = _pick(1)
         ttnn.deallocate(gathered)
+        if gather_bfp8:
+            # paged_fill_cache requires BF16/FP32 input (it writes BF16 bytes, not
+            # a BFP8 re-pack), so restore BF16 on just the two picked heads.
+            decode_k_bf16 = ttnn.typecast(decode_k, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            decode_v_bf16 = ttnn.typecast(decode_v, ttnn.bfloat16, memory_config=ttnn.L1_MEMORY_CONFIG)
+            ttnn.deallocate(decode_k)
+            ttnn.deallocate(decode_v)
+            decode_k, decode_v = decode_k_bf16, decode_v_bf16
         return decode_k, decode_v
 
     def paged_fill_on_device(
