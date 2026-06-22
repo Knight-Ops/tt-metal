@@ -36,6 +36,7 @@ import os
 import torch
 
 import ttnn
+from models.common import moe_gather
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt.common import as_weight, to_tt
@@ -68,6 +69,10 @@ class TtMoE(LightweightModule):
         # nnz hint for the decode sparse_matmuls: top_k makes the kernel iterate only the active
         # experts instead of scanning all E slots (see forward_sparse_decode). QWEN36_MOE_NNZ=0 -> None.
         self._decode_nnz = None if os.environ.get("QWEN36_MOE_NNZ") == "0" else top_k
+        # Indexed/gather decode: pass the active expert ids to ttnn.sparse_matmul so the kernels iterate
+        # only the top_k selected experts (compact output) instead of scanning all E sparsity slots.
+        # Orthogonal to _decode_nnz; default ON. QWEN36_MOE_GATHER=0 falls back to the 256-slot scan.
+        self._decode_gather = os.environ.get("QWEN36_MOE_GATHER", "1") != "0"
         # Compute-kernel config for the dense PREFILL expert matmuls (LoFi is correct for BFP4 experts;
         # PCC-identical to the default here). None falls back to the ttnn default.
         self.compute_kernel_config = compute_kernel_config
@@ -152,9 +157,13 @@ class TtMoE(LightweightModule):
     def _sparse_pc(cls, m, n):
         Nt = (n + 31) // 32
         cx, cy = cls._grid_for(Nt)
+        # in0_block_w = K-tiles processed per K-block. Larger -> fewer K-block iterations -> fewer
+        # per-block multicast-semaphore handshakes (the measured decode MoE bottleneck). Must divide
+        # Kt for both expert matmuls (gate_up Kt=64, down Kt=16 -> common divisors 1,2,4,8,16).
+        in0bw = int(os.environ.get("QWEN36_SPARSE_IN0BW", "8"))
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(cx, cy),
-            in0_block_w=1,
+            in0_block_w=in0bw,
             out_subblock_h=1,
             out_subblock_w=1,
             out_block_h=1,
@@ -166,10 +175,16 @@ class TtMoE(LightweightModule):
             mcast_in0=True,
         )
 
-    def forward_sparse_decode(self, x2, sparsity):
+    def forward_sparse_decode(self, x2, sparsity, topv=None, indices=None):
         """x2: [1, hidden] (single token). sparsity: [1,1,1,E] bf16 routing weights. Computes only
         the experts with nonzero routing weight via ttnn.sparse_matmul (no host sync, traceable).
         gate+up are one fused sparse_matmul, then split for the SwiGLU.
+
+        If ``indices`` (the top_k active expert ids, [1,1,1,top_k] uint16) and ``topv`` ([1,top_k]
+        routing weights) are given, runs the INDEXED/GATHER path: both sparse_matmuls iterate only the
+        top_k selected experts and return a COMPACT [.., top_k, ..] output (no 256-slot scan); the
+        combine is sum_i topv[i]*down[i] over top_k. Otherwise the legacy 256-slot sparsity-scan path
+        (weight by sparsity, sum over E) is used.
 
         nnz: with nnz=None the kernel still iterates ALL E sparsity slots (per-slot multicast
         semaphores) even though it skips the DRAM reads of zero experts — that 256-slot scan is the
@@ -180,8 +195,33 @@ class TtMoE(LightweightModule):
         (the gpt-oss deadlock was a routing where the active count could drop below a static nnz; that
         cannot happen for a fixed top-k). Disable with QWEN36_MOE_NNZ=0 if a routing ever violates this."""
         E, H, I = self.num_experts, self.hidden, self.inter
-        nnz = self._decode_nnz
         x4 = ttnn.reshape(x2, [1, 1, 1, H])
+
+        if indices is not None:
+            # --- indexed/gather path: iterate only the top_k active experts, compact output ---
+            gu = ttnn.sparse_matmul(
+                x4,
+                self.gate_up_sp,
+                sparsity=sparsity,
+                indices=indices,
+                program_config=self._sparse_pc(1, 2 * I),
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )  # [.., top_k, 1, 2I]
+            gate, up = self._split_last(gu, I)
+            h = ttnn.multiply(ttnn.silu(gate), up)  # [.., top_k, 1, I]
+            down = ttnn.sparse_matmul(
+                h,
+                self.down_sp,
+                sparsity=sparsity,
+                indices=indices,
+                is_input_a_sparse=True,
+                program_config=self._sparse_pc(1, H),
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )  # [.., top_k, 1, H]
+            return moe_gather.gather_combine(down, topv, H, self.top_k)  # [hidden]
+
+        # --- legacy 256-slot sparsity-scan path ---
+        nnz = self._decode_nnz
         gu = ttnn.sparse_matmul(
             x4,
             self.gate_up_sp,
@@ -280,7 +320,12 @@ class TtMoE(LightweightModule):
         if T == 1:
             # --- sparse_matmul decode: compute only selected experts, NO host sync (traceable) ---
             sparsity = ttnn.to_layout(ttnn.reshape(routing, [1, 1, 1, self.num_experts]), ttnn.ROW_MAJOR_LAYOUT)
-            routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity), [1, hidden])
+            if self._decode_gather:
+                # gather path: pass the active expert ids -> kernels iterate top_k, not all E
+                indices = moe_gather.topk_to_indices(topi, self.top_k)
+                routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity, topv, indices), [1, hidden])
+            else:
+                routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity), [1, hidden])
             return ttnn.reshape(ttnn.add(routed, shared), [1, 1, T, hidden])
 
         if T % 32 == 0 and os.environ.get("QWEN36_SPARSE_PREFILL"):

@@ -1,8 +1,42 @@
 # MoE 8-of-256 Expert Gather — Implementation Plan (Decode Tier 1)
 
 The single biggest remaining decode lever for Qwen3.6-35B-A3B. Companion to `DECODE.md` (§4A) which
-ranks it; this is the concrete implementation plan. **Status: not started.** Effort: large (multi-day,
-core-ttnn C++). Expected win: **MoE ~46 → ~10 ms/token → decode ~74 → ~40 ms → ~25 tok/s/user.**
+ranks it; this is the concrete implementation plan.
+
+## STATUS: DONE — but the hypothesis was wrong, and a cheaper lever did most of the work
+
+**Result: 40-layer decode 74 → 43 ms/token (13.4 → 23.2 tok/s/user, +73%), greedy-identical.** Two
+independent, additive levers got us there (measured 2×2 at 4 layers, `execute_trace` ms/token):
+
+| | `in0_block_w=1` | `in0_block_w=8` |
+|---|---|---|
+| **scan** (default, pre-work) | 8.61 | 6.70 |
+| **gather** (this work) | 7.37 | **5.46** |
+
+- **The planning hypothesis below was REFUTED.** This doc (and `DECODE.md`) claimed the MoE cost was a
+  256-slot multicast-semaphore *scan* burning ~0.94 ms/layer, so iterating 8 experts would collapse
+  MoE ~46→~10 ms. Measured, the scan was only ~0.31 ms/layer: the shipped `nnz=top_k` path already did
+  real multicast/compute work for just the 8 active experts; the other 248 slots were a cheap
+  branch+skip. The gather removes that branch → **~14–18% on its own** (8.61→7.37, additive at any
+  block size).
+- **The bigger lever was `in0_block_w` — pure Python, no C++.** Profiling the gather MoE (Tracy)
+  showed the real bottleneck is **per-K-block** multicast-handshake overhead (gate_up's 64 K-tiles ×
+  8 experts at `in0_block_w=1`), NOT weight bandwidth (the visualizer's >100% DRAM% is the nominal-256
+  byte-estimate artifact — it assumes 256 experts read when 8 are). Raising `in0_block_w` 1→8 in
+  `TtMoE._sparse_pc` amortizes the handshake over wider K-blocks: **−22% on the scan path alone**.
+  Env `QWEN36_SPARSE_IN0BW` (default 8; 16 is marginally faster).
+- **Both kept** — they attack different costs and stack (8.61→5.46, −37% at 4L; 74→43 at 40L). The
+  gather is the reusable, generalizable piece (any MoE; see §7); `in0_block_w` is a one-line config.
+
+**What shipped:** the generalized opt-in `indices` mode on `ttnn.sparse_matmul` (compact `[..,
+num_active, M, N]` output, presence-gated so all existing callers are byte-identical), the
+`models/common/moe_gather.py` helper, the qwen36 wiring (`QWEN36_MOE_GATHER`, default on), the
+`in0_block_w` tuning, op-level probe `tests/ttnn/.../test_sparse_matmul_indexed.py` (9/9), and the
+E=256 three-way PCC test. gpt_oss/gemma4 adoption is the documented follow-up (§7).
+
+The original plan (effort/approach/milestones) is preserved below for provenance.
+
+---
 
 ---
 

@@ -147,9 +147,18 @@ fusions, and BFP4 lm_head — together 110 → 74 ms. What remains is harder, an
 re-ranked it and overturned several original premises. Below: what's done, the remaining levers, and
 the current decision.
 
-### 4A. True 8-of-256 expert-weight gather for MoE  *(THE remaining lever — biggest, hardest)*
-- **Full implementation plan: [`MOE_GATHER_PLAN.md`](MOE_GATHER_PLAN.md)** (files touched, kernel
-  changes, de-risking milestones, fallback). The summary below.
+### 4A. True 8-of-256 expert-weight gather for MoE  *(DONE — see MOE_GATHER_PLAN.md for the measured result)*
+- **Full plan + measured result: [`MOE_GATHER_PLAN.md`](MOE_GATHER_PLAN.md).** SHIPPED: **40-layer
+  decode 74 → 43 ms/token (13.4 → 23.2 tok/s/user), greedy-identical.**
+- **The "scan dominates MoE" premise here was REFUTED by profiling.** Two additive levers delivered the
+  win: (1) the **gather** — an opt-in `indices` mode on `ttnn.sparse_matmul` (iterate 8 experts not
+  256, compact output) — worth ~14–18%; (2) **`in0_block_w` tuning** (pure Python config, no C++) —
+  worth ~22% — because the real bottleneck is per-K-block multicast-handshake overhead, not the scan
+  and not weight bandwidth. The Tracy >100% DRAM% on the sparse_matmul is a byte-estimate artifact
+  (assumes all 256 experts read), NOT evidence of bandwidth-bound; raising `in0_block_w` (which changes
+  iterations, not bytes) cutting time 22% proves it was overhead-bound. Env knobs: `QWEN36_MOE_GATHER`
+  (default on), `QWEN36_SPARSE_IN0BW` (default 8).
+- *(Historical analysis below; superseded by the measured result above.)*
 - **Status:** the prerequisite cheap win (`nnz=top_k`, compute only 8 experts) is landed (64.8 → 46.4 ms).
   The gather itself is **not done**.
 - **Why:** MoE is still ~62% (~46 ms). The sparse_matmul reader is **scan-overhead-bound** — Tracy's
