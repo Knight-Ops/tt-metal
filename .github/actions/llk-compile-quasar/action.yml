@@ -34,7 +34,7 @@ runs:
           --interval 1 \
           --label "Quasar compile (group ${{ inputs.test-group }}/${{ inputs.test-splits }})" \
           --output "$GITHUB_STEP_SUMMARY" \
-          -- pytest -q --compile-producer -n 14 \
+          -- pytest -q --compile-producer -n 40 \
                 --maxschedchunk=100 \
                 -m "${{ inputs.pytest-markers }}" \
                 --splits ${{ inputs.test-splits }} --group ${{ inputs.test-group }} \
