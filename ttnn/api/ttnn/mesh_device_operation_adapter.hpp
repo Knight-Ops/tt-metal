@@ -166,6 +166,17 @@ struct MeshDeviceOperationAdapter {
     using spec_return_value_t = typename DeviceOperation::spec_return_value_t;
     using tensor_return_value_t = typename DeviceOperation::tensor_return_value_t;
 
+    // Size-1 per-thread carry of the ProgramArtifacts that compute_mesh_workload_hash builds (for a
+    // spec factory) so the immediately-following cache-miss create_mesh_workload reuses them instead of
+    // rebuilding the spec -- otherwise the spec is built twice on a miss (once to hash, once to stamp).
+    //
+    // Safe without a key: compute_mesh_workload_hash is always followed in the same launch by either the
+    // cache-hit path (which resets this) or the cache-miss create (which consumes + resets it), so it is
+    // empty at the start of every launch; a launch that skips hashing (cache disabled) finds it empty and
+    // builds fresh. Only set for non-owned spec factories -- an owned factory builds the spec with the
+    // owned tensors on the create path but without them on the hash path, so the two are not interchangeable.
+    inline static thread_local std::optional<ProgramArtifacts> s_hashed_artifacts{};
+
 private:
     struct DirectDescriptorFactory {
         static tt::tt_metal::ProgramDescriptor create_descriptor(
@@ -759,6 +770,14 @@ public:
                         tensor_return_value,
                         std::span<const tt::tt_metal::MeshTensor>(*op_owned_tensors));
                 } else {
+                    // Reuse the spec built moments ago by compute_mesh_workload_hash for this same
+                    // dispatch instead of rebuilding it (the whole point of s_hashed_artifacts). Consumed
+                    // on use; falls back to a fresh build if hashing was skipped (e.g. cache disabled).
+                    if (s_hashed_artifacts.has_value()) {
+                        ProgramArtifacts reused = std::move(*s_hashed_artifacts);
+                        s_hashed_artifacts.reset();
+                        return reused;
+                    }
                     return MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
                 }
             }();
@@ -841,8 +860,13 @@ public:
                         ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
                 } else if constexpr (MetalV2FactoryConcept<Factory>) {
                     auto artifacts = Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
-                    return ttsl::hash::hash_objects(
+                    auto key = ttsl::hash::hash_objects(
                         ttsl::hash::type_hash<DeviceOperation>, program_spec_cache_key(artifacts.spec));
+                    // Carry the just-built artifacts to the cache-miss create so it doesn't rebuild the
+                    // spec (consumed there, or cleared on a cache hit). Only the spec was needed for the
+                    // key; the run_params come along for free.
+                    s_hashed_artifacts = std::move(artifacts);
+                    return key;
                 } else if constexpr (requires { DeviceOperation::compute_program_hash(attrs, tensor_args); }) {
                     return DeviceOperation::compute_program_hash(attrs, tensor_args);
                 } else {

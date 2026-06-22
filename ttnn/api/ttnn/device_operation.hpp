@@ -259,6 +259,13 @@ void handle_mesh_adapter_cache_hit(
         mesh_device_operation_t::validate_on_program_cache_miss(operation_attributes, tensor_args);
     }
 
+    // A cache hit won't run create_mesh_workload, so the spec that compute_mesh_workload_hash may have
+    // stashed for reuse goes unconsumed -- drop it so it can't be mistaken for a later op's spec.
+    // (Keeps the carry empty at the start of every launch; see s_hashed_artifacts.)
+    if constexpr (requires { mesh_device_operation_t::s_hashed_artifacts.reset(); }) {
+        mesh_device_operation_t::s_hashed_artifacts.reset();
+    }
+
     auto& cached_program_factory = program_cache.get(program_hash);
     auto program_factory_index = cached_program_factory.program_factory_index;
     auto program_factory = map_index_to_variant(
