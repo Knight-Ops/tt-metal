@@ -23,6 +23,7 @@ import ttnn
 from ttnn.operations.ccl import Topology
 from loguru import logger
 import pytest
+from models.common.utility_functions import skip_with_llk_assert
 
 from tests.ttnn.unit_tests.operations.sdpa.sdpa_test_utils import fa_rand
 from tests.nightly.sdpa_perf_utils import (
@@ -805,6 +806,7 @@ EXP_RING_JOINT_PERF_CHECK_CONFIGS = [
     EXP_RING_JOINT_PERF_CHECK_CONFIGS,
     ids=[f"ring{cfg[0]}-{cfg[2]}" for cfg in EXP_RING_JOINT_PERF_CHECK_CONFIGS],
 )
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
 def test_exp_ring_joint_attention_perf_check(ring_size_expected, max_payload_size, payload_id, expected_util):
     """Measure exp ring joint SDPA math utilization via tracy and assert within +/- EXP_RING_JOINT_PERF_MARGIN."""
     from tracy.process_model_log import run_device_profiler

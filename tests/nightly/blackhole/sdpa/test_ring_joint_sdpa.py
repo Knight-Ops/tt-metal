@@ -34,6 +34,7 @@ import ttnn
 from ttnn.operations.ccl import Topology
 from loguru import logger
 import pytest
+from models.common.utility_functions import skip_with_llk_assert
 
 # ============================================================================
 # CONFIGURATION CONSTANTS
@@ -3342,6 +3343,7 @@ else:
     RING_JOINT_PERF_CHECK_CONFIGS,
     ids=[f"{cfg[0]}-q{cfg[1]}-k{cfg[2]}-ring{cfg[3]}" for cfg in RING_JOINT_PERF_CHECK_CONFIGS],
 )
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
 def test_ring_joint_attention_perf_check(
     model_name, q_chunk_size, k_chunk_size, ring_size_expected, expected_util, margin
 ):
@@ -3863,6 +3865,7 @@ else:
     RING_MLA_CHUNKED_PERF_CHECK_CONFIGS,
     ids=[f"{cfg[0]}-q{cfg[1]}-k{cfg[2]}-ring{cfg[3]}" for cfg in RING_MLA_CHUNKED_PERF_CHECK_CONFIGS],
 )
+@skip_with_llk_assert("No need to verify LLK asserts for performance tests.")
 def test_ring_mla_chunked_perf_check(model_name, q_chunk_size, k_chunk_size, ring_size_expected, expected_util):
     """Measure ring_mla chunked-prefill math utilization for the kimi 50k+5k galaxy chunk (a 5k Q
     chunk against a 50k K/V prefix), simulated on the 4-device QuietBox, via tracy and assert
