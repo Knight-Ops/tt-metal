@@ -17,7 +17,7 @@ from typing import Any, ClassVar, List
 
 import numpy as np
 import pytest
-from filelock import FileLock
+from filelock import FileLock, Timeout
 from ttexalens.tt_exalens_lib import (
     TTException,
     load_elf,
@@ -81,6 +81,31 @@ from .test_variant_parameters import (
     TemplateParameter,
 )
 from .utils import create_directories, run_shell_command
+
+# ---------------------------------------------------------------------------
+# Cross-process compile-slot semaphore
+# ---------------------------------------------------------------------------
+# Caps total concurrent g++ invocations system-wide at cpu_count(), enforced
+# across separate xdist worker processes via file-based locking.  Without this,
+# N workers × 4 kernel components = N×4 simultaneous g++ processes, which
+# over-subscribes the CPU and causes memory-bandwidth thrashing beyond n≈10.
+_COMPILE_SLOT_DIR = Path("/tmp/tt-llk-compile-slots")
+_NUM_COMPILE_SLOTS: int = os.cpu_count() or 40
+
+
+def _acquire_compile_slot() -> FileLock:
+    """Block until a compile slot is available; return the held FileLock."""
+    _COMPILE_SLOT_DIR.mkdir(parents=True, exist_ok=True)
+    while True:
+        for i in range(_NUM_COMPILE_SLOTS):
+            lock = FileLock(str(_COMPILE_SLOT_DIR / f"slot-{i}.lock"))
+            try:
+                lock.acquire(timeout=0)
+                return lock
+            except Timeout:
+                continue
+        time.sleep(0.01)
+# ---------------------------------------------------------------------------
 
 
 class ProfilerBuild(Enum):
@@ -1293,11 +1318,15 @@ class TestConfig:
 
                 logger.trace(compile_command)
 
-                run_shell_command(  # %.elf : path/to/kernel/test.cpp trisc.cpp [coverage.o libgcov.a]
-                    compile_command,
-                    TestConfig.TESTS_WORKING_DIR,
-                    (f"#include  <{self.test_name}>\n" "#include  <trisc.cpp>\n"),
-                )
+                slot = _acquire_compile_slot()
+                try:
+                    run_shell_command(  # %.elf : path/to/kernel/test.cpp trisc.cpp [coverage.o libgcov.a]
+                        compile_command,
+                        TestConfig.TESTS_WORKING_DIR,
+                        (f"#include  <{self.test_name}>\n" "#include  <trisc.cpp>\n"),
+                    )
+                finally:
+                    slot.release()
 
             with ThreadPoolExecutor(
                 max_workers=len(TestConfig.KERNEL_COMPONENTS)
