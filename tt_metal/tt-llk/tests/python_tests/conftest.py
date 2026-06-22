@@ -38,6 +38,7 @@ if _SHOULD_RUN_SIMULATOR and _SIMULATOR_PATH and _SIMULATOR_PATH.endswith(".so")
         simulation_directory=_SIMULATOR_PATH, use_4B_mode=False
     )
 
+import helpers._precompile_flags as _precompile_flags
 import helpers.order_processing as order_processing
 import helpers.utils as utils_module
 import pytest
@@ -759,13 +760,17 @@ def pytest_collection_finish(session):
         n_threads,
     )
 
-    with ThreadPoolExecutor(max_workers=n_threads) as pool:
-        futures = [pool.submit(_precompile_item, item) for item in session.items]
-        done = 0
-        for _ in as_completed(futures):
-            done += 1
-            if done % 200 == 0:
-                logger.info("Pre-compile pass: {}/{} items done", done, n)
+    _precompile_flags.ACTIVE = True
+    try:
+        with ThreadPoolExecutor(max_workers=n_threads) as pool:
+            futures = [pool.submit(_precompile_item, item) for item in session.items]
+            done = 0
+            for _ in as_completed(futures):
+                done += 1
+                if done % 200 == 0:
+                    logger.info("Pre-compile pass: {}/{} items done", done, n)
+    finally:
+        _precompile_flags.ACTIVE = False
 
     logger.info("Pre-compile pass complete ({} items); xdist workers will skip ELF builds", n)
 

@@ -25,6 +25,7 @@ from .utils import (
     calculate_tile_and_face_counts,
     calculate_tile_and_face_counts_w_tile_dimensions,
 )
+from .. import _precompile_flags
 
 # ─────────────────────────────────────────────────────────────────────────────
 # Public: single-face generator
@@ -351,6 +352,11 @@ def generate_stimuli(
         tile_cnt_A, tile_cnt_B, _ = calculate_tile_and_face_counts(
             input_dimensions_A, input_dimensions_B, face_r_dim, num_faces
         )
+
+    # During the pre-compile pass the stimulus content is irrelevant (variant_stimuli
+    # is excluded from the compilation hash). Skip the expensive tensor generation.
+    if _precompile_flags.ACTIVE:
+        return torch.zeros(1), tile_cnt_A, torch.zeros(1), tile_cnt_B
 
     num_elements_A = input_dimensions_A[0] * input_dimensions_A[1]
     num_elements_B = input_dimensions_B[0] * input_dimensions_B[1]

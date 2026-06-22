@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: © 2025 Tenstorrent AI ULC
 import math
+from . import _precompile_flags
 import os
 import struct
 from enum import Enum
@@ -284,6 +285,8 @@ def register_golden(cls):
 
 def get_golden_generator(cls):
     """Retrieve the registered golden class instance."""
+    if _precompile_flags.ACTIVE:
+        return DummyGoldenGenerator()
     if cls not in golden_registry:
         raise KeyError(f"Golden class {cls.__name__} is not registered.")
     return golden_registry[cls]
