@@ -125,6 +125,20 @@ inline void build_mask_tiles(Noc noc) {
     cb.push_back(num_mask_tiles);
 }
 
+/** Block-max-pool only: fill cb_scaler with one bf16 tile of 1.0 (the reduce-MAX scaler -- MAX scales its
+ *  result by this, so it must be 1). Pushed once and never popped (compute keeps it resident). */
+inline void build_scaler_tile() {
+    CircularBuffer cb(cb_scaler);
+    cb.reserve_back(1);
+    volatile tt_l1_ptr uint32_t* ptr = reinterpret_cast<volatile tt_l1_ptr uint32_t*>(cb.get_write_ptr());
+    constexpr uint32_t total_words = bf16_tile_bytes / sizeof(uint32_t);
+    constexpr uint32_t one_bf16_pair = 0x3F803F80;  // two bf16 1.0 values per word
+    for (uint32_t i = 0; i < total_words; ++i) {
+        ptr[i] = one_bf16_pair;
+    }
+    cb.push_back(1);
+}
+
 /** Read ONE q-row (heads_per_group heads x head_dim_tiles tiles, heads starting at first_head) from
  *  DRAM into L1 at `ptr`; returns the advanced write pointer. Shared inner loop of the resident
  *  (read_q_rows, first_head=0) and head-streaming (read_q_block, varying first_head) paths -- the q
@@ -244,6 +258,9 @@ void kernel_main() {
     Noc noc;
 
     build_mask_tiles(noc);
+    if constexpr (block_pool) {
+        build_scaler_tile();  // 1.0 reduce-MAX scaler for the block-max-pool
+    }
 
     WorkUnitSpan span;
     span.start(flat_start);

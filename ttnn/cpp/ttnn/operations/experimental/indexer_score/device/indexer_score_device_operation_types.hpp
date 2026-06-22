@@ -38,6 +38,13 @@ struct operation_attributes_t {
     // Compile-time, with G==1 byte-identical to before. G>1 requires all heads resident (head_group_size
     // 0 or Hi) and the full-strip path (k_chunk_size>=64).
     uint32_t num_groups{1};
+    // Block-max-pool width in keys. 0 = no pooling -> score [B,G,Sq,T] (DeepSeek/GLM token-level, and the
+    // M3 token path). >0 = max over each block_size-key block -> score [B,G,Sq,T/block_size] (MiniMax M3
+    // block selection: the downstream topk then runs per-group top-16 over the pooled blocks). Compile-time
+    // (block_tiles = block_size/TILE_WIDTH), with block_size==0 byte-identical to before. block_size>0
+    // requires block_size % TILE_WIDTH == 0, T % block_size == 0, and k_chunk_size % block_size == 0 (so a
+    // block never straddles a work unit), plus blocks-per-unit <= TILE_HEIGHT (the writer's row scratch).
+    uint32_t block_size{0};
     IndexerScoreProgramConfig program_config{};
     // Resolved (not optional) so it is part of the reflected program-cache key; the public callable
     // fills it from the user's optional config, defaulting math_fidelity to the dtype-derived choice.

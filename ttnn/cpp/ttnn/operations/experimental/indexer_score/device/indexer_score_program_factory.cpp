@@ -135,6 +135,14 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     const uint32_t plane_heads = Hi / G;
     const uint32_t subblock_basis = (G > 1) ? plane_heads : HB;
 
+    // block-max-pool: 0 = off (full [.,.,Sq,T] strip, DeepSeek/GLM and M3-token); >0 = max over each
+    // block_size-key block -> [.,.,Sq,T/block_size] (MiniMax M3). block_tiles k-tiles per block; a unit's
+    // KC tiles pool to blocks_per_unit block scores. validate guarantees the divisibility + fit.
+    const uint32_t block_tiles = args.block_size ? args.block_size / tt::constants::TILE_WIDTH : 0;
+    const bool block_pool = block_tiles != 0;
+    const uint32_t blocks_per_unit = block_pool ? (KC / block_tiles) : KC;
+    const uint32_t nblocks = block_pool ? (Tt / block_tiles) : Tt;  // total block columns per output row
+
     // Compute knobs from the resolved compute config. math_fidelity defaults to the dtype-derived
     // choice (bf16 -> HiFi2, both bfp8 -> LoFi) but a caller can override it; validate guarantees
     // fp32_dest_acc_en==false / dst_full_sync_en==false (the bf16-DEST half-sync layout the custom
@@ -278,9 +286,17 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
         G,
         plane_heads);
     make_cb(cb_qk_arg, qk_col_batch * qk_batch_heads, acc_fmt, acc_tile);
-    // cb_out_strip holds a unit's untilized output. Uniform KC push/pop keeps the packer's KC-tile
-    // reads contiguous (a non-uniform push would wrap the ring mid-strip).
-    make_cb(cb_out_strip_arg, 2 * KC, tt::DataFormat::Float16_b, bf16_tile);
+    // cb_out_strip holds a q-tile-row's output, double-buffered. block_size==0: untilized KC-wide strip
+    // (uniform KC push/pop keeps the packer's KC-tile reads contiguous). block-pool: blocks_per_unit
+    // tilized tiles, each with the per-query block max in column 0 (the writer extracts column 0).
+    make_cb(cb_out_strip_arg, 2 * (block_pool ? blocks_per_unit : KC), tt::DataFormat::Float16_b, bf16_tile);
+    // Block-max-pool scratch CBs (allocated only when pooling, so block_size==0 keeps the CB set identical):
+    //   cb_scaler      -- one bf16 tile of 1.0, the reduce-MAX scaler (reader-filled once).
+    //   cb_pool_scratch -- the writer's one-tile row-assembly buffer (blocks-per-unit <= TILE_HEIGHT fits).
+    if (block_pool) {
+        make_cb(cb_scaler_arg, 1, tt::DataFormat::Float16_b, bf16_tile);
+        make_cb(cb_pool_scratch_arg, 1, tt::DataFormat::Float16_b, bf16_tile);
+    }
     // cb_acc_strip accumulates a whole unit's QC*KC strip, then all QC strips untilize under ONE
     // pack_untilize bracket (per-strip cost amortizes over QC*KC, not KC). max(2*KC, .) keeps the
     // QC<=2 double buffer and a whole multiple of the QC*KC batch so a uniform push never wraps mid-unit.
@@ -289,8 +305,8 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
     // No up-front L1-fit guard: an oversized QC/KC/head_group config fails at CB allocation. The caller
     // owns the knob trade-off (see glx_config() in the test).
 
-    // Common args: 9 dims then the CB indices in CbArg order (kernels read both from this shared base).
-    std::vector<uint32_t> common_ct = {Hi, Sqt, Tt, Dt, chunk_t, QC, KC, HB, G};
+    // Common args: 10 dims then the CB indices in CbArg order (kernels read both from this shared base).
+    std::vector<uint32_t> common_ct = {Hi, Sqt, Tt, Dt, chunk_t, QC, KC, HB, G, block_tiles};
     common_ct.insert(common_ct.end(), cb_id.begin(), cb_id.end());
 
     std::vector<uint32_t> reader_ct = common_ct;
@@ -310,7 +326,9 @@ IndexerScoreProgramFactory::cached_program_t IndexerScoreProgramFactory::create(
 
     std::vector<uint32_t> writer_ct = common_ct;
     const uint32_t out_elem_bytes = out.element_size();  // from the output tensor's dtype (bf16 today)
-    writer_ct.push_back(T * out_elem_bytes);             // row-major page = one full row of T scores
+    // row-major page = one full output row: T scores, or T/block_size (= nblocks) block-scores when pooling.
+    const uint32_t out_row_elems = block_pool ? nblocks : T;
+    writer_ct.push_back(out_row_elems * out_elem_bytes);
     tt::tt_metal::TensorAccessorArgs(*out.buffer()).append_to(writer_ct);
 
     std::vector<uint32_t> compute_ct = common_ct;

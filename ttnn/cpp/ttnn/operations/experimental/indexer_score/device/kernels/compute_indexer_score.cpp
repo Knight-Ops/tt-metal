@@ -17,6 +17,8 @@
 #include "api/compute/reconfig_data_format.h"
 #include "api/compute/cb_api.h"
 #include "api/compute/tile_move_copy.h"
+#include "api/compute/reduce.h"            // block-max-pool: reduce<MAX, REDUCE_ROW>
+#include "api/compute/binary_max_min.h"    // block-max-pool: binary_max_tile (fold partials)
 #include "api/dataflow/circular_buffer.h"  // Device 2.0 CircularBuffer wrapper (cb ops)
 
 #include "ttnn/cpp/ttnn/kernel_lib/untilize_helpers.hpp"
@@ -296,6 +298,43 @@ inline void stamp_masked_suffix(const WorkUnitSpan& span, uint32_t r, uint32_t s
     }
 }
 
+/** PHASE 3 (block-max-pool) -- replaces untilize when block_pool. The accumulated QC x KC strip is already
+ *  in cb_acc_strip (one unit, masked). For each q-tile-row and each block (block_tiles consecutive k-tiles),
+ *  reduce<MAX, REDUCE_ROW> the block's tiles -> per-query row max in column 0, fold the block_tiles partials
+ *  with binary_max_tile, and pack ONE tile per block to cb_out_strip (col 0 = the block's per-query maxes;
+ *  the writer extracts column 0). Future/pad keys are already -inf in the strip, so a causal-straddling
+ *  block keeps only its visible tokens and a fully-future block reduces to -inf -- exactly M3's semantics
+ *  (token-level causal mask applied before the block max). One q-tile-row's blocks_per_unit tiles are pushed
+ *  together, mirroring the untilize path's per-strip push granularity. */
+inline void pool_blocks() {
+    constexpr uint32_t unit_strip = q_tiles_per_unit * k_tiles_per_unit;
+    CircularBuffer acc(cb_acc_strip);
+    CircularBuffer out(cb_out_strip);
+    acc.wait_front(unit_strip);  // QC x KC pushed by the caller
+    for (uint32_t r = 0; r < q_tiles_per_unit; ++r) {
+        out.reserve_back(blocks_per_unit);
+        for (uint32_t b = 0; b < blocks_per_unit; ++b) {
+            const uint32_t base = r * k_tiles_per_unit + b * block_tiles;  // first tile of this block
+            tile_regs_acquire();
+            reduce_init<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_acc_strip, cb_scaler, cb_out_strip);
+            for (uint32_t t = 0; t < block_tiles; ++t) {
+                reduce_tile<PoolType::MAX, ReduceDim::REDUCE_ROW>(cb_acc_strip, cb_scaler, base + t, 0, t);
+            }
+            reduce_uninit();
+            binary_max_tile_init();
+            for (uint32_t t = 1; t < block_tiles; ++t) {
+                binary_max_tile(0, t, 0);  // DEST[0] col 0 = max over the block's block_tiles tiles
+            }
+            tile_regs_commit();
+            tile_regs_wait();
+            pack_tile(0, cb_out_strip);  // col 0 = per-query block max (rest unused; writer reads col 0 only)
+            tile_regs_release();
+        }
+        out.push_back(blocks_per_unit);
+    }
+    acc.pop_front(unit_strip);
+}
+
 void kernel_main() {
     const uint32_t flat_start = get_arg_val<uint32_t>(0);
     const uint32_t flat_count = get_arg_val<uint32_t>(1);
@@ -306,6 +345,9 @@ void kernel_main() {
     mm_block_init(
         cb_q, cb_k, cb_qk, 1 /*transpose k*/, 1 /*ct_dim*/, heads_per_dest_pass /*rt_dim*/, head_dim_tiles /*kt_dim*/);
     CircularBuffer(cb_mask).wait_front(num_mask_tiles);  // single use; the mask CB is never popped
+    if constexpr (block_pool) {
+        CircularBuffer(cb_scaler).wait_front(1);  // reader-filled 1.0 reduce-MAX scaler, reused, never popped
+    }
 
     // CBs touched twice below (wait/pop, reserve/push) get one instance each.
     CircularBuffer k(cb_k);
@@ -367,8 +409,13 @@ void kernel_main() {
             }
             acc.push_back(unit_strip);
 
-            // PHASE 3 -- untilize this plane's QC strips in ONE pack_untilize bracket (cost amortizes over QC*KC).
-            compute_kernel_lib::untilize<k_tiles_per_unit, cb_acc_strip, cb_out_strip>(q_tiles_per_unit);
+            // PHASE 3 -- emit this plane's output. block_size==0: untilize the QC strips in ONE pack_untilize
+            // bracket (cost amortizes over QC*KC). block-pool: max-reduce each block to one col-0 tile.
+            if constexpr (block_pool) {
+                pool_blocks();
+            } else {
+                compute_kernel_lib::untilize<k_tiles_per_unit, cb_acc_strip, cb_out_strip>(q_tiles_per_unit);
+            }
         }
 
         k.pop_front(k_chunk_tiles);

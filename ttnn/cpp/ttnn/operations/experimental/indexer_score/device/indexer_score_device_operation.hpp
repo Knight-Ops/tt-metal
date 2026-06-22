@@ -44,6 +44,7 @@ struct IndexerScoreDeviceOperation {
         uint32_t chunk_start_idx,
         bool apply_relu,
         uint32_t num_groups,
+        uint32_t block_size,
         const IndexerScoreProgramConfig& program_config,
         const DeviceComputeKernelConfig& compute_kernel_config);
 };
@@ -63,6 +64,8 @@ namespace ttnn::experimental {
 // num_groups: 1 sums all Hi heads into one plane (DeepSeek/GLM). G>1 partitions the heads into G groups
 // of Hi/G and sums within each group -> G output planes (MiniMax M3 per-GQA-group selection, multiple
 // groups on one chip); G>1 needs all heads resident and k_chunk_size>=64.
+// block_size: 0 = no pooling -> score [B,G,Sq,T]. >0 = block-max-pool over block_size keys ->
+// score [B,G,Sq,T/block_size] (MiniMax M3 block selection; downstream topk picks per-group top-k blocks).
 // Causality from chunk_start_idx: key t visible to query s iff t <= chunk_start_idx + s.
 ttnn::Tensor indexer_score(
     const ttnn::Tensor& q,
@@ -72,6 +75,7 @@ ttnn::Tensor indexer_score(
     bool apply_relu = true,
     float scale = 1.0f,
     uint32_t num_groups = 1,
+    uint32_t block_size = 0,
     const ttnn::operations::experimental::indexer_score::IndexerScoreProgramConfig& program_config = {},
     const std::optional<ttnn::DeviceComputeKernelConfig>& compute_kernel_config = std::nullopt);
 

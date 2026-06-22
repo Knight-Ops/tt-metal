@@ -51,6 +51,11 @@ void bind_indexer_score(nb::module_& mod) {
                 group -> output [B, G, Sq, T] (MiniMax M3 per-GQA-group selection,
                 multiple groups on one chip). G>1 needs all heads resident
                 (head_group_size 0 or Hi) and k_chunk_size >= 64.
+            block_size: 0 (default) = no pooling -> score [B, G, Sq, T]. >0 =
+                block-max-pool over block_size keys -> score [B, G, Sq, T/block_size]
+                (MiniMax M3 block selection; the downstream topk then picks per-group
+                top-k blocks). Requires block_size a multiple of 32, T % block_size == 0,
+                and k_chunk_size % block_size == 0.
             program_config: work-unit knobs (q_chunk_size, k_chunk_size,
                 head_group_size; elements, tile-aligned). Defaults always fit
                 L1; raise head_group_size (0 = all resident) for performance.
@@ -59,7 +64,8 @@ void bind_indexer_score(nb::module_& mod) {
                 are both bfloat8_b); fp32_dest_acc_en / dst_full_sync_en must
                 stay false (the custom LLK is validated for bf16 DEST half-sync).
 
-        Returns: score [B, 1, Sq, T] bf16 row-major; future/pad columns -inf.
+        Returns: score [B, num_groups, Sq, T_out] bf16 row-major (T_out = T, or
+            T/block_size when block-max-pooling); future/pad columns/blocks -inf.
         )doc",
         &ttnn::experimental::indexer_score,
         nb::arg("q"),
@@ -70,6 +76,7 @@ void bind_indexer_score(nb::module_& mod) {
         nb::arg("apply_relu") = true,
         nb::arg("scale") = 1.0f,
         nb::arg("num_groups") = 1,
+        nb::arg("block_size") = 0,
         nb::arg("program_config") = IndexerScoreProgramConfig{},
         nb::arg("compute_kernel_config") = std::nullopt);
 }

@@ -109,6 +109,7 @@ def run_indexer(
     compute_kernel_config=None,
     apply_relu=True,
     num_groups=1,
+    block_size=0,
 ):
     """Run the device op and return the row-major bf16 score as a torch tensor.
 
@@ -124,6 +125,7 @@ def run_indexer(
         chunk_start_idx=chunk_start,
         apply_relu=apply_relu,
         num_groups=num_groups,
+        block_size=block_size,
         **kwargs,
     )
     return ttnn.to_torch(out)
@@ -153,6 +155,29 @@ def assert_grouped_match(out, ref, num_groups, sq, t):
     a, b = out[~masked].flatten().float(), ref[~masked].flatten().float()
     pcc = torch.corrcoef(torch.stack([a, b]))[0, 1].item()
     assert pcc >= 0.999, f"PCC {pcc} < 0.999"
+
+
+def block_max_pool_ref(scores, block_size):
+    """Reference block-max-pool: max over each block_size-key block of the (already causal-masked) per-group
+    scores [b, g, sq, t] -> [b, g, sq, t//block_size] (MiniMax M3 MSA block scores). A fully-future block is
+    all -inf -> -inf; a causal-straddling block keeps only its visible tokens (the mask is applied before
+    the max, as in the M3 reference)."""
+    b, g, sq, t = scores.shape
+    nb = t // block_size
+    return scores.reshape(b, g, sq, nb, block_size).amax(dim=-1)
+
+
+def assert_pooled_match(out, ref, num_groups, sq, nblocks, pcc_floor=0.999):
+    """Pooled [1,G,Sq,nblocks] check: exact -inf map (a fully-masked block stays -inf) + PCC on the visible
+    block maxes. The -inf map (checked first) pins the block->column mapping and causal masking exactly;
+    block-max amplifies the bf16 per-token error (the max is biased toward the most positively-rounded
+    token), so the visible-value PCC floor is relaxed for the large-T raw-dot deployment shape."""
+    assert out.shape == (1, num_groups, sq, nblocks), f"{out.shape} != {(1, num_groups, sq, nblocks)}"
+    masked = ref == float("-inf")
+    assert torch.equal(out <= torch.finfo(torch.bfloat16).min, masked)
+    a, b = out[~masked].flatten().float(), ref[~masked].flatten().float()
+    pcc = torch.corrcoef(torch.stack([a, b]))[0, 1].item()
+    assert pcc >= pcc_floor, f"PCC {pcc} < {pcc_floor}"
 
 
 def glx_config(heads):
@@ -735,3 +760,117 @@ def test_indexer_score_perf_check(case_id, heads, expected_util):
         f"Math utilization {utilization:.2f}% outside band [{lower:.2f}, {upper:.2f}] "
         f"(expected {expected_util:.2f}%, margin +/- {INDEXER_PERF_MARGIN * 100:.1f}%)"
     )
+
+
+# ---------------------------------------------------------------------------
+# block-max-pool (block_size > 0): MiniMax M3 MSA block scoring. The op fuses the per-128-key block max
+# into the score op, so the output is [B, G, Sq, T/block_size] instead of [B, G, Sq, T]; the downstream
+# topk then picks per-group top-k BLOCKS. block_size==0 (every other test here) is byte-identical to before.
+#
+# Validation for the pooled path (Blackhole 16 B DRAM-write alignment + the full-strip pool):
+#   T % block_size == 0, k_chunk_size % block_size == 0, k_chunk_size | T (no partial unit),
+#   and k_chunk_size/block_size in {8,16,24,32} (each unit's row-major output slice is 16 B-aligned).
+# block_size=128 (the M3 block) with k_chunk_size=1024 gives blocks_per_unit=8 -> satisfies all of these.
+# ---------------------------------------------------------------------------
+BLOCK_POOL_BS = 128  # MiniMax M3 sparse_block_size
+
+
+@pytest.mark.parametrize("num_groups", [1, 4], ids=["g1", "g4"])
+@pytest.mark.parametrize("apply_relu", [True, False], ids=["relu", "no_relu"])
+@pytest.mark.parametrize("k_dtype", [ttnn.bfloat16, ttnn.bfloat8_b], ids=["k_bf16", "k_bfp8"])
+def test_indexer_score_block_pool(device, k_dtype, apply_relu, num_groups):
+    """block_size=128 block-max-pool on a small synthetic shape. chunk_start is small so some blocks are
+    fully future (-inf) and one straddles the causal boundary -- the block max must keep only visible
+    tokens and a fully-masked block must stay -inf. Checked per group against block_max_pool_ref."""
+    heads, dim, sq, t = 4, GLX_DIM, 128, 2048
+    chunk_start = 512  # leaves fully-future blocks for early queries + a straddling block
+    q, k, w = make_inputs(heads, dim, sq, t)
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=1024, head_group_size=0)
+    out = run_indexer(
+        q,
+        k,
+        w,
+        chunk_start,
+        device,
+        program_config=cfg,
+        k_dtype=k_dtype,
+        apply_relu=apply_relu,
+        num_groups=num_groups,
+        block_size=BLOCK_POOL_BS,
+    )
+    ref = block_max_pool_ref(
+        indexer_score_grouped_ref(q, k, w, chunk_start, num_groups, apply_relu=apply_relu), BLOCK_POOL_BS
+    )
+    assert_pooled_match(out, ref, num_groups, sq, t // BLOCK_POOL_BS)
+
+
+@pytest.mark.parametrize("k_dtype", [ttnn.bfloat16, ttnn.bfloat8_b], ids=["k_bf16", "k_bfp8"])
+@pytest.mark.parametrize("sp_rank", [0, 7], ids=["rank0", "rank7"])
+def test_indexer_score_block_pool_m3(device, k_dtype, sp_rank):
+    """MiniMax M3 MSA block scoring at GLX chunked-prefill geometry: 4 GQA groups on one chip (the TP<4
+    fallback), raw dot (apply_relu=False), no gates (constant scale gate), block_size=128 -> per-group
+    block scores [1,4,640,440]. k_chunk_size=1024 (KC=32 | Tt=1760, blocks_per_unit=8)."""
+    heads, dim, sq, t = 4, GLX_DIM, GLX_SQ, GLX_T
+    chunk_start = GLX_HISTORY + sp_rank * GLX_SQ
+    scale = 1.0 / (dim**0.5)
+    q, k, _ = make_inputs(heads, dim, sq, t)
+    w_scale = torch.full((1, heads, sq, 1), scale, dtype=torch.bfloat16)  # constant gate = scale (M3 has no gates)
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=1024, head_group_size=0)
+    out = ttnn.experimental.indexer_score(
+        to_device(q, device),
+        to_device(k, device, dtype=k_dtype),
+        weights=None,
+        chunk_start_idx=chunk_start,
+        apply_relu=False,
+        scale=scale,
+        num_groups=heads,
+        block_size=BLOCK_POOL_BS,
+        program_config=cfg,
+    )
+    out = ttnn.to_torch(out)
+    ref = block_max_pool_ref(
+        indexer_score_grouped_ref(q, k, w_scale, chunk_start, heads, apply_relu=False), BLOCK_POOL_BS
+    )
+    # 0.995 floor: block-max amplifies the bf16 per-token matmul error over the full 56320-key raw-dot
+    # reduction (no ReLU clamp). The exact pool logic is pinned by the -inf map here and, free of matmul
+    # error, by test_indexer_score_block_pool_exact_vs_unpooled below.
+    assert_pooled_match(out, ref, heads, sq, t // BLOCK_POOL_BS, pcc_floor=0.995)
+
+
+def test_indexer_score_block_pool_exact_vs_unpooled(device):
+    """Pool exactness, free of matmul precision: block-max-pooling the op's OWN unpooled bf16 scores must
+    equal the op's pooled output. Both runs share the identical bf16 matmul accumulator, so the only
+    difference is the in-kernel reduce-MAX (+ col-0 extract + block-column write) -- which must reproduce
+    a plain torch max over the same bf16 values exactly. Isolates the fused pool from the bf16 q.kT error
+    that relaxes the fp32-reference comparison above."""
+    heads, dim, sq, t = 4, GLX_DIM, 128, 2048
+    chunk_start = 512
+    q, k, w = make_inputs(heads, dim, sq, t)
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=1024, head_group_size=0)
+    unpooled = run_indexer(q, k, w, chunk_start, device, program_config=cfg, apply_relu=False, num_groups=heads)
+    pooled = run_indexer(
+        q, k, w, chunk_start, device, program_config=cfg, apply_relu=False, num_groups=heads, block_size=BLOCK_POOL_BS
+    )
+    ref = block_max_pool_ref(unpooled.float(), BLOCK_POOL_BS)  # torch max over the op's own [1,G,Sq,T] scores
+    masked = ref == float("-inf")
+    assert torch.equal(pooled <= torch.finfo(torch.bfloat16).min, masked)
+    # bf16 max is exact selection of identical values -> the visible block maxes must match bit-for-bit.
+    assert torch.equal(pooled[~masked].float(), ref[~masked])
+
+
+@pytest.mark.parametrize(
+    "block_size, k_chunk_size, t, reason",
+    [
+        (96, 1024, 2048, "block_size not a multiple of TILE_WIDTH"),
+        (128, 512, 2048, "k_chunk_size/block_size=4 not a multiple of 8 (16 B alignment)"),
+        (128, 1024, 2560, "k_chunk_size does not divide T (partial unit)"),
+    ],
+    ids=["bs_unaligned", "slice_unaligned", "partial_unit"],
+)
+def test_indexer_score_block_pool_validation(device, block_size, k_chunk_size, t, reason):
+    """The pooled-path constraints are rejected loudly rather than silently producing a misaligned write."""
+    heads, dim, sq = 4, GLX_DIM, 128
+    q, k, w = make_inputs(heads, dim, sq, t)
+    cfg = ttnn.IndexerScoreProgramConfig(q_chunk_size=64, k_chunk_size=k_chunk_size, head_group_size=0)
+    with pytest.raises(RuntimeError):
+        run_indexer(q, k, w, 512, device, program_config=cfg, apply_relu=False, num_groups=heads, block_size=block_size)
