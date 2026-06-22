@@ -218,9 +218,14 @@ jobs:
           # CIBW_AFTER_BUILD does not exist in cibuildwheel v2.23.2. Use repair-wheel-command
           # instead: it runs inside the container after compilation, supports {dest_dir}/{wheel}
           # substitution, and always fires even when CIBW_TEST_SKIP bypasses before_test.
+          # /project is a container-internal COPY (not bind-mount) — writes there are lost.
+          # /output is created by cibuildwheel AFTER repair returns, so we mkdir -p it first;
+          # cibuildwheel's own mkdir -p /output is idempotent. docker cp /output/. wheelhouse/
+          # then copies everything there — including ccache-wheel-stats.txt — to the host.
           CIBW_REPAIR_WHEEL_COMMAND_LINUX: >-
-            ccache -sv > /project/ccache-wheel-stats.txt 2>&1;
-            cat /project/ccache-wheel-stats.txt;
+            mkdir -p /output &&
+            ccache -sv > /output/ccache-wheel-stats.txt 2>&1;
+            cat /output/ccache-wheel-stats.txt;
             auditwheel repair -w {dest_dir} {wheel}
           CIBW_TEST_COMMAND: 'python -c "import ttnn"'
           CIBW_TEST_SKIP: ${{ inputs.build-type == 'ASan' && '*' || '' }}
@@ -229,9 +234,9 @@ jobs:
       - name: 📊 Publish ccache summary
         if: always()
         run: |
-          if [ -f ccache-wheel-stats.txt ]; then
+          if [ -f wheelhouse/ccache-wheel-stats.txt ]; then
             printf '\n## ccache (wheel build)\n```\n' >> "$GITHUB_STEP_SUMMARY"
-            cat ccache-wheel-stats.txt >> "$GITHUB_STEP_SUMMARY"
+            cat wheelhouse/ccache-wheel-stats.txt >> "$GITHUB_STEP_SUMMARY"
             printf '```\n' >> "$GITHUB_STEP_SUMMARY"
           fi
 
