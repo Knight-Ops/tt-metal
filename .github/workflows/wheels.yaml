@@ -215,10 +215,21 @@ jobs:
           # NO_PROXY (AWS Go SDK). CCACHE_REMOTE_ONLY=true keeps a helper that still can't
           # reach garage non-fatal, so the compile proceeds regardless.
           CIBW_BEFORE_BUILD: "mkdir -p /tmp/ccache && ccache -z && ccache -p"
-          CIBW_BEFORE_TEST: ccache -s
+          # Write stats to /project (cibuildwheel's bind-mount of the source tree) so
+          # the host can read them even when CIBW_TEST_SKIP skips before_test.
+          CIBW_AFTER_BUILD: "ccache -sv > /project/ccache-wheel-stats.txt 2>&1; cat /project/ccache-wheel-stats.txt"
           CIBW_TEST_COMMAND: 'python -c "import ttnn"'
           CIBW_TEST_SKIP: ${{ inputs.build-type == 'ASan' && '*' || '' }}
           CIBW_MANYLINUX_X86_64_IMAGE: ${{ inputs.docker-image || 'docker-image-unresolved!' }}
+
+      - name: 📊 Publish ccache summary
+        if: always()
+        run: |
+          if [ -f ccache-wheel-stats.txt ]; then
+            printf '\n## ccache (wheel build)\n```\n' >> "$GITHUB_STEP_SUMMARY"
+            cat ccache-wheel-stats.txt >> "$GITHUB_STEP_SUMMARY"
+            printf '```\n' >> "$GITHUB_STEP_SUMMARY"
+          fi
 
       - name: 📦 Pack CPM cache
         if: steps.cpm-cache.outputs.cache-hit != 'true'
