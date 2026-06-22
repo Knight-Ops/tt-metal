@@ -99,6 +99,9 @@ void kernel_main() {
     //   4: dispatched_metadata_addr    - DRAM base of the dispatched_metadata tensor; this kernel
     //                                    reads it locally so the sender no longer has to unicast
     //                                    per-batch metadata to this core
+    //   5: routed_expert_sem_addr      - absolute L1 address of the routed-expert global semaphore
+    //                                    used to overlap the routed expert with the combine.
+    //                                    0 => not provided (no overlap) => skip the wait.
     // (sender NOC coords, data_ready and start semaphores are now consumed by the
     //  writer_untilize kernel on the same core — they no longer belong here.)
     uint32_t rt_idx = 0;
@@ -107,6 +110,7 @@ void kernel_main() {
     uint32_t expert_start_idx = get_arg_val<uint32_t>(rt_idx++);
     uint32_t expert_end_idx = get_arg_val<uint32_t>(rt_idx++);
     uint32_t dispatched_metadata_addr = get_arg_val<uint32_t>(rt_idx++);
+    uint32_t routed_expert_sem_addr = get_arg_val<uint32_t>(rt_idx++);
 
     // ===== Step 1: Wait for the owning sender to multicast expert token counts + receive_buf_addr =====
     // Note: don't reset counter_ready_sem — writer_untilize on this same core also waits on it
@@ -152,6 +156,14 @@ void kernel_main() {
     }
 
     for (uint32_t local_expert = expert_start_idx; local_expert < expert_end_idx; local_expert++) {
+        // Overlap handshake with the routed expert: before processing this expert, wait until the
+        // routed-expert global semaphore reaches a value >= TODO.
+        if (routed_expert_sem_addr != 0) {
+            volatile tt_l1_ptr uint32_t* routed_expert_sem_ptr =
+                reinterpret_cast<volatile tt_l1_ptr uint32_t*>(routed_expert_sem_addr);
+            noc_semaphore_wait_min(routed_expert_sem_ptr, 0);
+        }
+
         uint32_t expert_tokens = local_expert_counts[local_expert];
         // Clamp to the dispatch buffer capacity to mirror reader_dispatch's overflow guard.
         // start_page_tiled is in tiles; convert via tile_height to compare with the row-count cap.
