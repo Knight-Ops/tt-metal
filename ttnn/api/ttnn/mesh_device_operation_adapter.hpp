@@ -175,7 +175,7 @@ struct MeshDeviceOperationAdapter {
     // empty at the start of every launch; a launch that skips hashing (cache disabled) finds it empty and
     // builds fresh. Only set for non-owned spec factories -- an owned factory builds the spec with the
     // owned tensors on the create path but without them on the hash path, so the two are not interchangeable.
-    inline static thread_local std::optional<ProgramArtifacts> s_hashed_artifacts{};
+    inline static thread_local std::optional<ProgramArtifacts> s_artifacts_from_hashing{};
 
 private:
     struct DirectDescriptorFactory {
@@ -771,11 +771,11 @@ public:
                         std::span<const tt::tt_metal::MeshTensor>(*op_owned_tensors));
                 } else {
                     // Reuse the spec built moments ago by compute_mesh_workload_hash for this same
-                    // dispatch instead of rebuilding it (the whole point of s_hashed_artifacts). Consumed
+                    // dispatch instead of rebuilding it (the whole point of s_artifacts_from_hashing). Consumed
                     // on use; falls back to a fresh build if hashing was skipped (e.g. cache disabled).
-                    if (s_hashed_artifacts.has_value()) {
-                        ProgramArtifacts reused = std::move(*s_hashed_artifacts);
-                        s_hashed_artifacts.reset();
+                    if (s_artifacts_from_hashing.has_value()) {
+                        ProgramArtifacts reused = std::move(*s_artifacts_from_hashing);
+                        s_artifacts_from_hashing.reset();
                         return reused;
                     }
                     return MetalV2Factory::create_program_artifacts(attrs, tensor_args, tensor_return_value);
@@ -865,7 +865,7 @@ public:
                     // Carry the just-built artifacts to the cache-miss create so it doesn't rebuild the
                     // spec (consumed there, or cleared on a cache hit). Only the spec was needed for the
                     // key; the run_params come along for free.
-                    s_hashed_artifacts = std::move(artifacts);
+                    s_artifacts_from_hashing = std::move(artifacts);
                     return key;
                 } else if constexpr (requires { DeviceOperation::compute_program_hash(attrs, tensor_args); }) {
                     return DeviceOperation::compute_program_hash(attrs, tensor_args);

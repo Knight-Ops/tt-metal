@@ -261,9 +261,9 @@ void handle_mesh_adapter_cache_hit(
 
     // A cache hit won't run create_mesh_workload, so the spec that compute_mesh_workload_hash may have
     // stashed for reuse goes unconsumed -- drop it so it can't be mistaken for a later op's spec.
-    // (Keeps the carry empty at the start of every launch; see s_hashed_artifacts.)
-    if constexpr (requires { mesh_device_operation_t::s_hashed_artifacts.reset(); }) {
-        mesh_device_operation_t::s_hashed_artifacts.reset();
+    // (Keeps the carry empty at the start of every launch; see s_artifacts_from_hashing.)
+    if constexpr (requires { mesh_device_operation_t::s_artifacts_from_hashing.reset(); }) {
+        mesh_device_operation_t::s_artifacts_from_hashing.reset();
     }
 
     auto& cached_program_factory = program_cache.get(program_hash);
