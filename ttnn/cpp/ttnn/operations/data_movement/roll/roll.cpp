@@ -1,4 +1,4 @@
-// SPDX-FileCopyrightText: © 2025 Tenstorrent USA, Inc.
+// SPDX-FileCopyrightText: © 2026 Tenstorrent USA, Inc.
 //
 // SPDX-License-Identifier: Apache-2.0
 
@@ -6,6 +6,9 @@
 #include "ttnn/operations/core/core.hpp"
 #include "ttnn/operations/data_movement/slice/slice.hpp"
 #include "ttnn/operations/data_movement/concat/concat.hpp"
+#include "ttnn/operations/data_movement/tilize/tilize.hpp"
+#include "ttnn/operations/data_movement/untilize/untilize.hpp"
+#include "ttnn/operations/data_movement/roll/device/roll_device_operation.hpp"
 #include "ttnn/tensor/tensor.hpp"
 #include "ttnn/operations/data_movement/reshape_view/reshape.hpp"
 
@@ -44,6 +47,53 @@ ttnn::Tensor roll(
 
     const ttnn::SmallVector<int> stride_vector(num_dims, 1);
 
+    // Sharded inputs use the native sharded roll device op, applied one dim at a time. A
+    // tilized roll is native only when shifts on the last two dims are tile-aligned (a
+    // whole-tile permutation); otherwise untilize/roll/tilize while staying sharded.
+    const bool is_sharded = input_tensor.is_sharded();
+    const bool is_tile = input_tensor.layout() == ttnn::TILE_LAYOUT;
+    const auto output_mem_config = input_tensor.memory_config();
+
+    if (is_sharded) {
+        bool native_ok = true;
+        if (is_tile) {
+            constexpr int tile_dim = 32;
+            for (size_t i = 0; i < adjusted_shifts.size(); ++i) {
+                int dim = input_dims[i];
+                if (dim < 0) {
+                    dim += num_dims;
+                }
+                if ((dim == num_dims - 1 || dim == num_dims - 2) && (adjusted_shifts[i] % tile_dim) != 0) {
+                    native_ok = false;
+                    break;
+                }
+            }
+        }
+
+        if (native_ok) {
+            for (size_t i = 0; i < adjusted_shifts.size(); ++i) {
+                int dim = input_dims[i];
+                if (dim < 0) {
+                    dim += num_dims;
+                }
+                // adjusted_shifts[i] is already normalized to [0, shape[dim]).
+                const int shift = adjusted_shifts[i];
+                if (shift == 0) {
+                    continue;
+                }
+                result = ttnn::prim::roll_sharded(
+                    result, static_cast<uint32_t>(shift), static_cast<int32_t>(dim), output_mem_config);
+            }
+            return result;
+        }
+
+        // Sub-tile rotation must move elements inside tiles: untilize, roll, tilize, all
+        // staying sharded in L1.
+        ttnn::Tensor rm = ttnn::untilize(input_tensor, output_mem_config);
+        ttnn::Tensor rolled = roll(rm, shifts, input_dims);
+        return ttnn::tilize(rolled, output_mem_config, input_tensor.dtype());
+    }
+
     for (size_t i = 0; i < adjusted_shifts.size(); ++i) {
         int dim = input_dims[i];
 
@@ -51,7 +101,8 @@ ttnn::Tensor roll(
             dim += num_dims;
         }
 
-        int shift = adjusted_shifts[i] % size[dim];
+        // adjusted_shifts[i] is already normalized to [0, shape[dim]).
+        const int shift = adjusted_shifts[i];
         if (shift == 0) {
             continue;
         }
@@ -79,6 +130,11 @@ ttnn::Tensor roll(
 }
 
 ttnn::Tensor roll(const ttnn::Tensor& input_tensor, const int shift) {
+    // The flatten reshape to [1, total_elements] does not preserve sharding.
+    TT_FATAL(
+        !input_tensor.is_sharded(),
+        "ttnn::roll without dims does not support sharded inputs. Convert to interleaved first.");
+
     ttnn::SmallVector<int> shifts = {shift};
     ttnn::SmallVector<int> dims = {1};  // Rolling will happen on dimension 1 after flattening
 
