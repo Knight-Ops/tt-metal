@@ -3,6 +3,7 @@
 
 import atexit
 import datetime
+import inspect
 import json
 import logging
 import os
@@ -677,30 +678,74 @@ def pytest_sessionstart(session):
 def _precompile_item(item):
     """Invoke one collected test's compile path without pytest fixture injection.
 
-    Catches Skipped (the expected outcome in PRODUCE mode) and all other
-    exceptions so that failures don't abort the pool — workers will retry
-    any variant that didn't compile via the existing per-variant FileLock.
+    Guards against non-parametrized items and tests that require fixture args
+    (both are left for workers to handle). Catches Skipped explicitly and logs
+    real compile failures instead of silently swallowing them.
     """
-    params = getattr(getattr(item, "callspec", None), "params", {})
+    # Non-parametrized items (unit tests, etc.) — don't accidentally execute them
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return
+
+    params = callspec.params
+
+    # Items that need fixture args not provided by @pytest.mark.parametrize — skip gracefully
+    try:
+        sig = inspect.signature(item.obj)
+    except (ValueError, TypeError):
+        return
+    required = {
+        name
+        for name, p in sig.parameters.items()
+        if p.default is inspect.Parameter.empty
+        and p.kind in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    if not required <= set(params):
+        return  # has unsatisfied fixture args; workers handle it via normal fixture injection
+
     try:
         item.obj(**params)
-    except Exception:
-        pass  # Skipped = success; anything else = workers will retry
+    except pytest.skip.Exception:
+        pass  # expected: build_elfs() ran, then pytest.skip() was called
+    except Exception as exc:
+        logger.warning("Pre-compile of {} raised: {}", item.nodeid, exc)
+    except BaseException:
+        raise  # KeyboardInterrupt, SystemExit — propagate out of the pool
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection(session):
+    """Force controller-side collection so pytest_collection_finish fires under xdist.
+
+    When running with -n, xdist's DSession.pytest_collection returns True (a firstresult
+    short-circuit), which prevents session.perform_collect() from being called on the
+    controller and therefore prevents pytest_collection_finish from firing there.
+    By calling perform_collect() here first (tryfirst), we populate session.items and
+    trigger pytest_collection_finish — where the pre-compile pass lives — before xdist
+    takes over and spawns workers.
+    """
+    if not session.config.getoption("--compile-producer", default=False):
+        return None
+    if hasattr(session.config, "workerinput"):
+        return None  # workers collect normally; don't double-collect
+    session.perform_collect()
+    return None  # return None so DSession.pytest_collection still runs and returns True
 
 
 @pytest.hookimpl(tryfirst=True)
 def pytest_collection_finish(session):
     """Master-only pre-compile pass: compile all variants before xdist workers start.
 
-    Runs every collected test function directly (bypassing fixture injection) so
-    that build_elfs() runs and sets the done_marker for each unique variant.
-    Workers then find the markers on their first check and skip instantly,
-    eliminating the sequential compile→skip bottleneck inside each worker.
+    Triggered by the perform_collect() call in pytest_collection above. Runs each
+    collected test function directly (bypassing fixture injection) so that build_elfs()
+    fires and sets the done_marker for every unique variant. Workers then hit the
+    done_marker fast path and skip instantly, eliminating the sequential
+    compile→skip bottleneck inside each worker.
     """
     if not session.config.getoption("--compile-producer", default=False):
         return
     if hasattr(session.config, "workerinput"):
-        return  # xdist workers skip; master handles pre-compile
+        return  # xdist workers — don't re-run the pass
 
     n = len(session.items)
     if n == 0:
