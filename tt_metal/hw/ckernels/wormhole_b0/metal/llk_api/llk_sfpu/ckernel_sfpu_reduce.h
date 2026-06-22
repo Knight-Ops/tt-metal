@@ -1223,11 +1223,10 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
     // on two's-complement values. Int32 MAX/MIN keep plain INT32 (sign-magnitude): SFPSWAP(VEC_MIN_MAX)
     // is a float/sign-magnitude comparator and orders sign-magnitude integers correctly, whereas
     // two's-complement negatives would be mis-ordered.
-    constexpr InstrModLoadStore INSTRUCTION_MODE =
-        (format == DataFormat::Int32 && (pool_type == PoolType::SUM || pool_type == PoolType::AVG))
-            ? InstrModLoadStore::INT32_2S_COMP
-        : (format == DataFormat::Float16_b) ? InstrModLoadStore::DEFAULT
-                                            : GetSfpLoadStoreInstrMod<format, is_fp32_dest_accum_en>();
+    constexpr InstrModLoadStore INSTRUCTION_MODE = (format == DataFormat::Int32) ? InstrModLoadStore::INT32_2S_COMP
+                                                   : (format == DataFormat::Float16_b)
+                                                       ? InstrModLoadStore::DEFAULT
+                                                       : GetSfpLoadStoreInstrMod<format, is_fp32_dest_accum_en>();
 
     // Garbage high bits need to be cleared when loading UInt16 data from a 32-bit (fp32) dest word.
     constexpr bool clear_high_bits = (is_fp32_dest_accum_en && format == DataFormat::UInt16);
@@ -1297,10 +1296,13 @@ inline void calculate_reduce(std::uint32_t block_ct_dim = 1, std::uint32_t block
     // mis-ordered (max of negatives would return the most-negative value).
     constexpr bool int32_sum_avg =
         (format == DataFormat::Int32 && (pool_type == PoolType::SUM || pool_type == PoolType::AVG));
-    constexpr InstrModLoadStore INSTRUCTION_MODE = int32_sum_avg ? InstrModLoadStore::INT32_2S_COMP
-                                                   : (format == DataFormat::Float16_b)
-                                                       ? InstrModLoadStore::DEFAULT
-                                                       : GetSfpLoadStoreInstrMod<format, is_fp32_dest_accum_en>();
+    constexpr bool int32_col_max_min =
+        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN) &&
+         reduce_dim == ReduceDim::REDUCE_COL);
+    constexpr InstrModLoadStore INSTRUCTION_MODE =
+        (int32_sum_avg || int32_col_max_min) ? InstrModLoadStore::INT32_2S_COMP
+        : (format == DataFormat::Float16_b)  ? InstrModLoadStore::DEFAULT
+                                             : GetSfpLoadStoreInstrMod<format, is_fp32_dest_accum_en>();
 
     // Garbage high bits need to be cleared when loading UInt16 data from a 32-bit (fp32) dest word
     // (driven by INPUT format).

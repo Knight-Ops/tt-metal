@@ -1386,10 +1386,9 @@ inline void init_reduce(std::uint32_t block_ct_dim = 1) {
     // sign-magnitude<->two's-complement explicitly). Int32 MAX/MIN keep plain INT32 (sign-magnitude):
     // SFPSWAP(VEC_MIN_MAX) is a float/sign-magnitude comparator that orders sign-magnitude integers
     // correctly, whereas two's-complement negatives would be mis-ordered.
-    constexpr bool int32_sum_avg =
-        (format == DataFormat::Int32 && (pool_type == PoolType::SUM || pool_type == PoolType::AVG));
-    constexpr InstrModLoadStore INSTRUCTION_MODE =
-        int32_sum_avg ? InstrModLoadStore::INT32_2S_COMP : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
+    constexpr InstrModLoadStore INSTRUCTION_MODE = (format == DataFormat::Int32)
+                                                       ? InstrModLoadStore::INT32_2S_COMP
+                                                       : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
 
     // Garbage high bits needs to be cleared when loading UInt16 data
     constexpr bool clear_high_bits = (is_fp32_dest_acc_en && format == DataFormat::UInt16);
@@ -1454,13 +1453,15 @@ inline void calculate_reduce(std::uint32_t block_ct_dim = 1, std::uint32_t block
     // Determine InstrModLoadStore from llk_defs.
     // Int32 SUM/AVG use INT32_2S_COMP so SFPIADD operates on two's-complement values (on Blackhole the
     // load/store conversion is a no-op, so the reduce code casts sign-magnitude<->two's-complement
-    // explicitly). Int32 MAX/MIN (both dims) keep plain INT32 (sign-magnitude): SFPSWAP(VEC_MIN_MAX) is a
-    // float/sign-magnitude comparator that orders sign-magnitude integers correctly; two's-complement
-    // negatives are mis-ordered (min of negatives would return the least-negative value).
+    // explicitly).
     constexpr bool int32_sum_avg =
         (format == DataFormat::Int32 && (pool_type == PoolType::SUM || pool_type == PoolType::AVG));
-    constexpr InstrModLoadStore INSTRUCTION_MODE =
-        int32_sum_avg ? InstrModLoadStore::INT32_2S_COMP : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
+    constexpr bool int32_col_max_min =
+        (format == DataFormat::Int32 && (pool_type == PoolType::MAX || pool_type == PoolType::MIN) &&
+         reduce_dim == ReduceDim::REDUCE_COL);
+    constexpr InstrModLoadStore INSTRUCTION_MODE = (int32_sum_avg || int32_col_max_min)
+                                                       ? InstrModLoadStore::INT32_2S_COMP
+                                                       : GetSfpLoadStoreInstrMod<format, is_fp32_dest_acc_en>();
 
     // Garbage high bits needs to be cleared when loading UInt16 data (driven by INPUT format).
     constexpr bool clear_high_bits = (is_fp32_dest_acc_en && format == DataFormat::UInt16);
