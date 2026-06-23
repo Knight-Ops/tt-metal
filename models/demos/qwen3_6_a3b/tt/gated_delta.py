@@ -43,10 +43,17 @@ _PREP_DT = ttnn.bfloat16 if os.environ.get("QWEN36_DELTA_BF16_PREP") == "1" else
 _CHUNK = 64  # chunk_size, matches reference torch_chunk_gated_delta_rule default
 
 
+# Keep the tiny gated-delta DECODE intermediates L1-resident instead of round-tripping interleaved
+# DRAM: the decode path is many tiny dispatch-bound ops, so on-chip residency cuts the step ~16%
+# (measured, PCC-identical). Default on; QWEN36_GDN_L1=0 reverts to interleaved DRAM.
+_GDN_L1 = os.environ.get("QWEN36_GDN_L1", "1") != "0"
+_MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
+
+
 def _l2norm_scale_lastdim(x, scale=None, eps=1e-6):
-    sq = ttnn.sum(ttnn.multiply(x, x), dim=-1, keepdim=True)
-    y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(sq, eps)))
-    return ttnn.multiply(y, scale) if scale is not None else y
+    sq = ttnn.sum(ttnn.multiply(x, x, memory_config=_MC), dim=-1, keepdim=True, memory_config=_MC)
+    y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(sq, eps, memory_config=_MC), memory_config=_MC), memory_config=_MC)
+    return ttnn.multiply(y, scale, memory_config=_MC) if scale is not None else y
 
 
 class TtGatedDeltaNet(LightweightModule):
@@ -96,12 +103,14 @@ class TtGatedDeltaNet(LightweightModule):
             )
         else:
             pad = conv_state
-        xpad = ttnn.concat([pad, mixed], dim=0)  # [T+K-1, conv_dim]
+        xpad = ttnn.concat([pad, mixed], dim=0, memory_config=_MC)  # [T+K-1, conv_dim]
         if T == 1:
             # decode: xpad is exactly [K, conv_dim] and out[0] = sum_j xpad[j]*tap[j]. One elementwise
             # multiply against the stacked taps + one row-sum, vs K slices + K multiplies + (K-1) adds
             # (the 4-tap conv was the largest gated-delta decode cost — pure dispatch overhead).
-            acc = ttnn.sum(ttnn.multiply(xpad, self.conv_taps_stacked), dim=0, keepdim=True)  # [1, conv_dim]
+            acc = ttnn.sum(
+                ttnn.multiply(xpad, self.conv_taps_stacked, memory_config=_MC), dim=0, keepdim=True, memory_config=_MC
+            )  # [1, conv_dim]
         else:
             acc = None
             for j in range(self.conv_k):
@@ -109,7 +118,7 @@ class TtGatedDeltaNet(LightweightModule):
                 term = ttnn.multiply(xj, self.conv_taps[j])
                 acc = term if acc is None else ttnn.add(acc, term)
         new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim])
-        return ttnn.silu(acc), new_state
+        return ttnn.silu(acc, memory_config=_MC), new_state
 
     def _ensure_chunk_masks(self):
         """Constant [1,1,C,C] masks for the chunked prep — built once (chunk_size is fixed)."""
@@ -290,8 +299,12 @@ class TtGatedDeltaNet(LightweightModule):
         T = x.shape[2]
         hidden = x.shape[3]
         x2 = ttnn.reshape(x, [T, hidden])
+        # Decode (T==1) keeps the tiny intermediates L1-resident (QWEN36_GDN_L1): measured to cut the
+        # gated-delta step, since the decode path is many tiny dispatch-bound ops, not DRAM-bandwidth.
+        # Prefill (T>1) stays on the default (interleaved DRAM) to avoid L1 overflow at large T.
+        mc = _MC if T == 1 else None
 
-        mixed = ttnn.linear(x2, self.w_qkv)  # [T, conv_dim]
+        mixed = ttnn.linear(x2, self.w_qkv, memory_config=mc)  # [T, conv_dim]
         conv_state = cache.get("conv_state") if cache else None
         mixed, new_conv_state = self._conv_silu(mixed, conv_state)
         if cache is not None:
@@ -300,18 +313,18 @@ class TtGatedDeltaNet(LightweightModule):
             else:
                 cache["conv_state"] = new_conv_state
 
-        q = ttnn.slice(mixed, [0, 0], [T, self.key_dim])
-        k = ttnn.slice(mixed, [0, self.key_dim], [T, 2 * self.key_dim])
-        v = ttnn.slice(mixed, [0, 2 * self.key_dim], [T, self.conv_dim])
-        z = ttnn.linear(x2, self.w_z)  # [T, value_dim]
+        q = ttnn.slice(mixed, [0, 0], [T, self.key_dim], memory_config=mc)
+        k = ttnn.slice(mixed, [0, self.key_dim], [T, 2 * self.key_dim], memory_config=mc)
+        v = ttnn.slice(mixed, [0, 2 * self.key_dim], [T, self.conv_dim], memory_config=mc)
+        z = ttnn.linear(x2, self.w_z, memory_config=mc)  # [T, value_dim]
 
         # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). b|a from one fused matmul.
         V = self.num_v_heads
-        ba = ttnn.linear(x2, self.w_ba)  # [T, 2V]
-        beta = ttnn.sigmoid(ttnn.slice(ba, [0, 0], [T, V]))  # [T, V]
-        a = ttnn.slice(ba, [0, V], [T, 2 * V])  # [T, V]
-        g = ttnn.multiply(self.neg_expA, ttnn.softplus(ttnn.add(a, self.dt_bias)))  # [T, V]
-        g_exp = ttnn.exp(g)  # decay per step, [T, V]
+        ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
+        beta = ttnn.sigmoid(ttnn.slice(ba, [0, 0], [T, V], memory_config=mc), memory_config=mc)  # [T, V]
+        a = ttnn.slice(ba, [0, V], [T, 2 * V], memory_config=mc)  # [T, V]
+        g = ttnn.multiply(self.neg_expA, ttnn.softplus(ttnn.add(a, self.dt_bias)), memory_config=mc)  # [T, V]
+        g_exp = ttnn.exp(g, memory_config=mc)  # decay per step, [T, V]
 
         # reshape to [T, Hk, Dk]; l2norm over Dk; scale q; repeat_interleave k,q heads to V
         Vh, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
@@ -351,12 +364,14 @@ class TtGatedDeltaNet(LightweightModule):
                 g_t = ttnn.reshape(ttnn.slice(g_exp, [t, 0], [t + 1, Vh]), [1, Vh, 1, 1])
                 b_t = ttnn.reshape(ttnn.slice(beta, [t, 0], [t + 1, Vh]), [1, Vh, 1, 1])
 
-                state = ttnn.multiply(state, g_t)
-                kv_mem = ttnn.matmul(k_row, state)  # [1,V,1,Dv]
-                delta = ttnn.multiply(ttnn.subtract(v_row, kv_mem), b_t)  # [1,V,1,Dv]
-                outer = ttnn.matmul(k_col, delta)  # [1,V,Dk,Dv]
-                state = ttnn.add(state, outer)
-                out_t = ttnn.matmul(q_row, state)  # [1,V,1,Dv]
+                state = ttnn.multiply(state, g_t, memory_config=mc)
+                kv_mem = ttnn.matmul(k_row, state, memory_config=mc)  # [1,V,1,Dv]
+                delta = ttnn.multiply(
+                    ttnn.subtract(v_row, kv_mem, memory_config=mc), b_t, memory_config=mc
+                )  # [1,V,1,Dv]
+                outer = ttnn.matmul(k_col, delta, memory_config=mc)  # [1,V,Dk,Dv]
+                state = ttnn.add(state, outer, memory_config=mc)
+                out_t = ttnn.matmul(q_row, state, memory_config=mc)  # [1,V,1,Dv]
                 outs.append(out_t)
             if cache is not None:
                 if state_buf is not None:
@@ -365,10 +380,10 @@ class TtGatedDeltaNet(LightweightModule):
                     cache["recurrent_state"] = state
             core = ttnn.concat(outs, dim=2)  # [1, V, T, Dv]
 
-        core = ttnn.transpose(core, 1, 2)  # [1, T, V, Dv]
+        core = ttnn.transpose(core, 1, 2, memory_config=mc)  # [1, T, V, Dv]
         core = ttnn.reshape(core, [1, 1, T * Vh, Dv])
         z_r = ttnn.reshape(z, [1, 1, T * Vh, Dv])
         core = self.norm.forward(core, z_r)
         core = ttnn.reshape(core, [T, self.value_dim])
-        y = ttnn.linear(core, self.w_out)
+        y = ttnn.linear(core, self.w_out, memory_config=mc)
         return ttnn.reshape(y, [1, 1, T, hidden])
