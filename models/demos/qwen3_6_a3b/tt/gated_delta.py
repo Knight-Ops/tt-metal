@@ -12,6 +12,7 @@ This is still a sequential scan (O(seq)); the further optimization is a fused ch
 kernel (parallel over the sequence). The recurrent form here is mathematically identical to the
 chunked form (verified) and is the natural reference for that kernel.
 """
+
 from __future__ import annotations
 
 import os
@@ -41,6 +42,9 @@ _DELTA_IPLUSL = os.environ.get("QWEN36_DELTA_IPLUSL", "1") == "1"
 # QWEN36_DELTA_IPLUSL=0 doubling-product inverse, which is precision-sensitive.)
 _PREP_DT = ttnn.bfloat16 if os.environ.get("QWEN36_DELTA_BF16_PREP") == "1" else ttnn.float32
 _CHUNK = 64  # chunk_size, matches reference torch_chunk_gated_delta_rule default
+# Run the per-chunk prep ONCE batched over all chunks (state-independent) instead of Nc sequential
+# rounds — see _forward_prefill_chunked. DEFAULT on; QWEN36_DELTA_BATCH_PREP=0 reverts (A/B fallback).
+_BATCH_PREP = os.environ.get("QWEN36_DELTA_BATCH_PREP", "1") != "0"
 
 
 # Keep the tiny gated-delta DECODE intermediates L1-resident instead of round-tripping interleaved
@@ -251,16 +255,57 @@ class TtGatedDeltaNet(LightweightModule):
             S = pool["S0"]
         else:
             S = ttnn.zeros([Vh * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
-        outs = []
-        for ci in range(Tp // C):
-            s0 = ci * C
-            qc = ttnn.slice(qb, [0, 0, s0, 0], [1, Vh, s0 + C, Dk])
-            kc = ttnn.slice(kb, [0, 0, s0, 0], [1, Vh, s0 + C, Dk])
-            vc = ttnn.slice(vb, [0, 0, s0, 0], [1, Vh, s0 + C, Dv])
-            gc = ttnn.slice(gb, [0, 0, s0], [1, Vh, s0 + C])
-            bc = ttnn.slice(betab, [0, 0, s0], [1, Vh, s0 + C])
+
+        Nc = Tp // C
+        # The per-chunk prep (cumsum/decay/β-scaling/inverse T/w/kcd) does NOT depend on the recurrent
+        # state S (only the ttl _chunk_state kernel consumes S), so all Nc chunks' prep is independent
+        # and runs in ONE batched set of ops over the stacked [1, Nc*Vh, C, *] axis instead of Nc
+        # sequential rounds (cutting prep dispatches ~Nc× and folding the fp32 matmuls into one launch
+        # over the larger batch). The kernel loop below still runs sequentially to carry S. The masks
+        # are [1,1,C,C] and broadcast over Nc*Vh unchanged. QWEN36_DELTA_BATCH_PREP=0 reverts to the
+        # per-chunk prep (kept as an A/B fallback). Nc==1 is the per-chunk path either way.
+        if _BATCH_PREP and Nc > 1:
+
+            def _chunks_on_b(x, D):  # [1,Vh,Tp,D] -> [1, Nc*Vh, C, D] chunk-major (concat of slices)
+                cs = [ttnn.slice(x, [0, 0, ci * C, 0], [1, Vh, ci * C + C, D]) for ci in range(Nc)]
+                return ttnn.concat(cs, dim=1)
+
+            def _chunks_on_b3(x):  # [1,Vh,Tp] -> [1, Nc*Vh, C] chunk-major
+                cs = [ttnn.slice(x, [0, 0, ci * C], [1, Vh, ci * C + C]) for ci in range(Nc)]
+                return ttnn.concat(cs, dim=1)
+
             with prof.phase(self.mesh_device, "delta.prep"):
-                terms = self._chunk_prep(qc, kc, vc, bc, gc, masks)
+                terms = self._chunk_prep(
+                    _chunks_on_b(qb, Dk),
+                    _chunks_on_b(kb, Dk),
+                    _chunks_on_b(vb, Dv),
+                    _chunks_on_b3(betab),
+                    _chunks_on_b3(gb),
+                    masks,
+                )
+
+            def chunk_terms(ci):  # extract chunk ci's [1,Vh,*,*] views from the batched [1,Nc*Vh,*,*]
+                return {
+                    k: ttnn.slice(t, [0, ci * Vh, 0, 0], [1, ci * Vh + Vh, t.shape[2], t.shape[3]])
+                    for k, t in terms.items()
+                }
+
+        else:
+            chunk_terms = None  # per-chunk prep inside the loop
+
+        outs = []
+        for ci in range(Nc):
+            if chunk_terms is not None:
+                tc = chunk_terms(ci)
+            else:
+                s0 = ci * C
+                qc = ttnn.slice(qb, [0, 0, s0, 0], [1, Vh, s0 + C, Dk])
+                kc = ttnn.slice(kb, [0, 0, s0, 0], [1, Vh, s0 + C, Dk])
+                vc = ttnn.slice(vb, [0, 0, s0, 0], [1, Vh, s0 + C, Dv])
+                gc = ttnn.slice(gb, [0, 0, s0], [1, Vh, s0 + C])
+                bc = ttnn.slice(betab, [0, 0, s0], [1, Vh, s0 + C])
+                with prof.phase(self.mesh_device, "delta.prep"):
+                    tc = self._chunk_prep(qc, kc, vc, bc, gc, masks)
             if pool is not None:  # kernel-written output buffers: pre-allocated (no in-graph zeros)
                 out, Snew = pool["out"][ci], pool["Snew"][ci]
             else:
@@ -268,14 +313,14 @@ class TtGatedDeltaNet(LightweightModule):
                 Snew = ttnn.zeros([Vh * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
             with prof.phase(self.mesh_device, "delta.kernel"):
                 chunk_state_tt(
-                    hm(terms["q"]),
-                    hm(terms["kt"]),
-                    hm(terms["w"]),
-                    hm(terms["kcd"]),
-                    hm(terms["decay"]),
-                    hm(terms["qg"]),
-                    hm(terms["kgt"]),
-                    hm(terms["glast"]),
+                    hm(tc["q"]),
+                    hm(tc["kt"]),
+                    hm(tc["w"]),
+                    hm(tc["kcd"]),
+                    hm(tc["decay"]),
+                    hm(tc["qg"]),
+                    hm(tc["kgt"]),
+                    hm(tc["glast"]),
                     S,
                     out,
                     Snew,

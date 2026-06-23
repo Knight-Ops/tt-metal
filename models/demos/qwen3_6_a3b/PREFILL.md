@@ -94,6 +94,16 @@ the matmuls are essentially at roofline.
 6. **MoE large-T chunking** (`_DENSE_TMAX=256`) — the tuned matmul holds each core's full `[T,N]` output
    in L1, overflowing past T≈320; chunk over T in ≤256 blocks (same fast config per chunk). Restores
    arbitrary length; validated T=256/384/512/768.
+7. **Batched gated-delta chunk-prep** (`tt/gated_delta.py` `_forward_prefill_chunked`, default on;
+   `QWEN36_DELTA_BATCH_PREP=0` reverts) — the per-chunk delta-rule prep (cumsum/decay/β-scaling/inverse
+   T/w/kcd, ~25 ttnn ops) does NOT depend on the recurrent state S, so all Nc chunks' prep now runs in
+   ONE batched set of ops over the stacked `[1, Nc·Vh, C, *]` axis (masks `[1,1,C,C]` broadcast over
+   Nc·Vh unchanged) instead of Nc sequential rounds; the ttl `_chunk_state` kernel loop still runs
+   per-chunk to carry S. **PCC-identical** (bit-identical to the per-chunk path, both 0.99966–0.99967 vs
+   reference at Nc=2/3). Measured same-session 40L A/B: **eager seq-256 1391→1078 ms (−22%, 184→237
+   tok/s)**; eager seq-128 ~neutral (fewer chunks); **traced ~neutral** (556 vs 558 ms — dispatch is
+   already amortized by replay and the batching doesn't reduce device-kernel work). It is a host-dispatch
+   win, so it helps the **eager and (eager) incremental/multi-turn** paths, not the traced replay.
 
 ---
 
@@ -133,12 +143,30 @@ KV writes) — in which case the paged cache is shared infrastructure and this d
 ### 4b. Cut the non-matmul overhead (the ~4× gap to roofline)
 The 579→~135 ms gap is elementwise/layout/dispatch on non-matmul ops. Per-op profiling (`prof_prefill.py`)
 itemizes it. Highest-value, all eager-and-traced wins:
-- **Gated-delta fp32 chunk-prep → fold into the ttl `_chunk_state` kernel** (cumsum/decay/β-scaling),
-  cutting dozens of tiny ops/chunk to ~1 launch. Biggest single item (delta prep is the largest
-  non-matmul phase). `QWEN36_DELTA_BF16_PREP=1` (bf16 prep) is implemented but measured ~neutral alone —
-  the win needs the op-count reduction, not just bf16.
-- **MoE `repeat` (~69 ms/40L)** — the `[E,T,H]` activation broadcast; **`tilize`/layout churn (~64 ms)**;
-  **`reduce`** via `fast_reduce_nc`.
+- **Gated-delta chunk-prep.** Two sub-levers:
+  - *Dispatch reduction (SHIPPED, §3.7).* Batching the prep across chunks (`QWEN36_DELTA_BATCH_PREP`) cut
+    the per-chunk launches ~Nc× → **eager seq-256 −22%**, but **traced neutral** (replay already hides
+    dispatch).
+  - *Device-work reduction (the remaining TRACED lever, not yet done).* To move the **traced** number,
+    the prep's actual compute (cumsum/decay/β-scaling/inverse) must be **folded into the ttl
+    `_chunk_state` kernel** so it is one fused launch instead of ~25 ttnn ops — this reduces device-kernel
+    time, which is what the traced path is bound by. This is the **largest remaining solo (no
+    decode-overlap) traced-prefill lever**, but a sizeable ttl-kernel effort (cf. HANDOFF §8/§9 authoring
+    constraints). `QWEN36_DELTA_BF16_PREP=1` (bf16 prep) is implemented but ~neutral alone.
+- **MoE `repeat` (~69 ms/40L)** — the `[E,T,H]` activation broadcast. **MEASURED INFEASIBLE to remove**
+  (2026-06-23): the only repeat-free option is in0-batch-broadcast, which requires switching the expert
+  matmul from the grid-tuned `MatmulMultiCoreReuseProgramConfig` to
+  `MatmulMultiCoreReuseMultiCast1DProgramConfig` (`mcast_in0=False`, `fuse_batch=False`). A standalone
+  microbench (`scratchpad/mm_microbench.py`) at the real dims (E=256, M=256, BFP4) showed the 1D in0-reuse
+  matmul is **5–6× SLOWER** than repeat+grid (gate_up 5.16→25.67 ms; down 2.35→14.49 ms; PCC OK) — the 1D
+  config serializes the E=256 expert batch while the grid config parallelizes experts across all 110
+  cores. The repeat's 256 MB write is far cheaper than that throughput loss, so the repeat **stays**. The
+  per-op profile confirms `repeat` (3.16 ms/layer) ≈ the single largest MoE op, but it is irreducible
+  here. `reduce` via `ttnn.experimental.fast_reduce_nc` was also benched — **neutral** (0.880 vs 0.889 ms
+  vs `ttnn.sum`, ratio 0.99×), no win. **The dense MoE matmul path is already near-roofline; no clean
+  MoE non-matmul win remains.**
+- **`tilize`/layout churn (~64 ms)** — not isolated as a separable phase in the per-op profile; folded
+  into the matmul/repeat device time above. No clean lever identified.
 
 ### 4c. Bucketing / attention at large T
 - Finer bucket granularity (vs powers of 2) trades startup/trace memory for less padding waste.
