@@ -364,14 +364,18 @@ class TtGatedDeltaNet(LightweightModule):
                 g_t = ttnn.reshape(ttnn.slice(g_exp, [t, 0], [t + 1, Vh]), [1, Vh, 1, 1])
                 b_t = ttnn.reshape(ttnn.slice(beta, [t, 0], [t + 1, Vh]), [1, Vh, 1, 1])
 
-                state = ttnn.multiply(state, g_t, memory_config=mc)
-                kv_mem = ttnn.matmul(k_row, state, memory_config=mc)  # [1,V,1,Dv]
-                delta = ttnn.multiply(
-                    ttnn.subtract(v_row, kv_mem, memory_config=mc), b_t, memory_config=mc
-                )  # [1,V,1,Dv]
-                outer = ttnn.matmul(k_col, delta, memory_config=mc)  # [1,V,Dk,Dv]
-                state = ttnn.add(state, outer, memory_config=mc)
-                out_t = ttnn.matmul(q_row, state, memory_config=mc)  # [1,V,1,Dv]
+                # NOTE: the recurrence state intermediates ([1,Vh,Dk,Dv] ≈ 1 MB each, several per
+                # layer) stay in DRAM, NOT L1. A captured decode trace pins every buffer it references
+                # for the trace's lifetime (no mid-trace free/reuse), so L1-resident state would
+                # accumulate across all 30 gated-delta layers and overflow L1 (~1.5 MB/core) — fine at
+                # 4 layers, wedges the device at 40. Only the SMALL prep/out intermediates (conv,
+                # l2norm, g/β, projections) are L1 (their 40-layer cumulative footprint is tiny).
+                state = ttnn.multiply(state, g_t)
+                kv_mem = ttnn.matmul(k_row, state)  # [1,V,1,Dv]
+                delta = ttnn.multiply(ttnn.subtract(v_row, kv_mem), b_t)  # [1,V,1,Dv]
+                outer = ttnn.matmul(k_col, delta)  # [1,V,Dk,Dv]
+                state = ttnn.add(state, outer)
+                out_t = ttnn.matmul(q_row, state)  # [1,V,1,Dv]
                 outs.append(out_t)
             if cache is not None:
                 if state_buf is not None:
