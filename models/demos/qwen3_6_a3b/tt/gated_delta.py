@@ -24,7 +24,7 @@ from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt.common import as_weight, to_tt
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
-from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt
+from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_tt
 
 # Fused chunked prefill: replace the sequential recurrent scan (O(T) dispatches) with the chunked
 # delta-rule — ttnn per-chunk prep batched over heads + the fused tt-lang _chunk_state kernel (one
@@ -52,6 +52,14 @@ _BATCH_PREP = os.environ.get("QWEN36_DELTA_BATCH_PREP", "1") != "0"
 # (measured, PCC-identical). Default on; QWEN36_GDN_L1=0 reverts to interleaved DRAM.
 _GDN_L1 = os.environ.get("QWEN36_GDN_L1", "1") != "0"
 _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
+
+# Fused single-step (T=1) DECODE kernel: collapse the whole per-head gated-delta decode step
+# (l2norm(q)*scale + l2norm(k) + gate/beta + rank-1 recurrence + gated RMSNorm) into ONE ttl launch
+# over all value heads, instead of ~30 tiny dispatch-bound ttnn ops. The 4 projections (w_qkv/w_z/
+# w_ba/w_out) + the conv stay in ttnn. DEFAULT on; QWEN36_GDN_FUSED=0 reverts to the recurrent scan.
+# The kernel compiles once per (n_v_heads, n_k_heads, head-dim) shape (~1 min, disk-cached).
+_GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") != "0"
+TILE = 32
 
 
 def _l2norm_scale_lastdim(x, scale=None, eps=1e-6):
@@ -112,6 +120,26 @@ class TtGatedDeltaNet(LightweightModule):
             -torch.exp(W("A_log").float()).reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16
         )
         self.dt_bias = to_tt(W("dt_bias").float().reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16)
+
+        # Fused-decode-kernel constants (built once). Per-head scalars (-exp(A_log), dt_bias) are
+        # carried as uniform [V*TILE, TILE] tiles (head h's whole tile = scalar_h); the gated-norm
+        # weight as [TILE, Dv] (replicated rows; same for all heads). Scratch (out/Snew) is lazy.
+        if _GDN_FUSED:
+            V, Dv = self.num_v_heads, self.head_v_dim
+
+            def _uniform(vals):  # torch [V] -> device [V*TILE, TILE] uniform per head
+                t = torch.zeros(V * TILE, TILE)
+                for h in range(V):
+                    t[h * TILE : (h + 1) * TILE, :] = float(vals[h])
+                return to_tt(t, mesh_device, dtype=ttnn.bfloat16)
+
+            self._fused_negA = _uniform(-torch.exp(W("A_log").float()).reshape(V))
+            self._fused_dtb = _uniform(W("dt_bias").float().reshape(V))
+            nw = W("norm").float().reshape(Dv)
+            self._fused_nweight = to_tt(
+                nw.reshape(1, Dv).expand(TILE, Dv).contiguous(), mesh_device, dtype=ttnn.bfloat16
+            )
+            self._fused_scratch = None  # (out_buf, Snew_buf), allocated on first decode
 
     def _conv_silu(self, mixed, conv_state=None):
         """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns (out[T,conv_dim], new_conv_state[K-1,conv_dim])."""
@@ -381,6 +409,13 @@ class TtGatedDeltaNet(LightweightModule):
         # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). b|a from one fused matmul.
         V = self.num_v_heads
         ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
+
+        # Fused single-step decode: one ttl launch for the whole step (prep + recurrence + gated-norm).
+        # q/k [1,key_dim], v/z [1,value_dim] feed the kernel directly (heads along columns); raw a/b are
+        # expanded to per-head uniform tiles; state stays head-major in the persistent cache.
+        if _GDN_FUSED and T == 1 and cache is not None:
+            return self._forward_decode_fused(q, k, v, z, ba, cache, hidden)
+
         beta = ttnn.sigmoid(ttnn.slice(ba, [0, 0], [T, V], memory_config=mc), memory_config=mc)  # [T, V]
         a = ttnn.slice(ba, [0, V], [T, 2 * V], memory_config=mc)  # [T, V]
         g = ttnn.multiply(self.neg_expA, ttnn.softplus(ttnn.add(a, self.dt_bias)), memory_config=mc)  # [T, V]
@@ -451,3 +486,50 @@ class TtGatedDeltaNet(LightweightModule):
         core = ttnn.reshape(core, [T, self.value_dim])
         y = ttnn.linear(core, self.w_out, memory_config=mc)
         return ttnn.reshape(y, [1, 1, T, hidden])
+
+    def _forward_decode_fused(self, q, k, v, z, ba, cache, hidden):
+        """Fused single-step (T=1) decode: one ttl launch (decode_step_tt) does l2norm(q)*scale +
+        l2norm(k) + gate/beta + the rank-1 recurrence + the gated RMSNorm, replacing the ~30-op scan
+        path above. q/k:[1,key_dim], v/z:[1,value_dim] (heads along columns, fed directly). State is
+        read from / written back to the PERSISTENT recurrent_state cache (head-major view), so the
+        write is in-place and trace-safe. Returns [1,1,1,hidden]."""
+        V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
+
+        # raw a|b -> per-head uniform [V*TILE, TILE] tiles. transpose [1,2V]->[2V,1] moves heads to
+        # rows; repeat fills each head's tile; slice splits b|a (one expansion for both, then split).
+        bat = ttnn.transpose(ba, 0, 1)  # [2V, 1]
+        bat = ttnn.repeat(ttnn.reshape(bat, [2 * V, 1, 1]), ttnn.Shape([1, TILE, TILE]))  # [2V, TILE, TILE]
+        bat = ttnn.reshape(bat, [2 * V * TILE, TILE])
+        braw_tile = ttnn.slice(bat, [0, 0], [V * TILE, TILE])  # b is the first V
+        araw_tile = ttnn.slice(bat, [V * TILE, 0], [2 * V * TILE, TILE])  # a is the second V
+
+        state_buf = cache["recurrent_state"]  # persistent [1,V,Dk,Dv]
+        S_in = ttnn.reshape(state_buf, [V * Dk, Dv])  # head-major view for the kernel
+        if self._fused_scratch is None:  # persistent scratch (allocated once; reused every step/trace)
+            self._fused_scratch = (
+                ttnn.zeros([1, self.value_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device),
+                ttnn.zeros([V * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device),
+            )
+        out_buf, snew_buf = self._fused_scratch
+
+        decode_step_tt(
+            q,
+            k,
+            v,
+            z,
+            araw_tile,
+            braw_tile,
+            self._fused_negA,
+            self._fused_dtb,
+            S_in,
+            self._fused_nweight,
+            out_buf,
+            snew_buf,
+            V,
+            self.num_k_heads,
+            self.qk_scale,
+            self.eps,
+        )
+        ttnn.copy(ttnn.reshape(snew_buf, [1, V, Dk, Dv]), state_buf)  # in-place state update (trace-safe)
+        y = ttnn.linear(out_buf, self.w_out, memory_config=_MC)  # [1, hidden]
+        return ttnn.reshape(y, [1, 1, 1, hidden])

@@ -42,6 +42,7 @@ stacked on the row (M) axis. k is passed pre-transposed as kt [D, C] so the kern
 matmuls. chunk_state(...) with S=0 also covers the chunk-0 (initial_state=0) case, subsuming
 _chunk_apply. Run: python tt/ttl_delta.py (reports PCCs).
 """
+
 import torch
 import ttl
 
@@ -276,7 +277,17 @@ def _get_chunk_state_op(n_heads):
             node_n, node_m = ttl.node(dims=2)
             h = node_n * gm + node_m
             rM, rK = h * ct, h * kt_t
-            with qd.reserve() as a, ktd.reserve() as b, wd.reserve() as c, kcdd.reserve() as d, dcd.reserve() as e, qgd.reserve() as f, kgtd.reserve() as g_, gld.reserve() as gl, Sd.reserve() as s:
+            with (
+                qd.reserve() as a,
+                ktd.reserve() as b,
+                wd.reserve() as c,
+                kcdd.reserve() as d,
+                dcd.reserve() as e,
+                qgd.reserve() as f,
+                kgtd.reserve() as g_,
+                gld.reserve() as gl,
+                Sd.reserve() as s,
+            ):
                 t0 = ttl.copy(q[rM : rM + ct, 0:kt_t], a)
                 t1 = ttl.copy(kt[rK : rK + kt_t, 0:ct], b)
                 t2 = ttl.copy(w[rM : rM + ct, 0:vt], c)
@@ -350,6 +361,236 @@ def chunk_state_tt(q, kt, w, kcd, decay, qg, kgt, glast, S, out, Snew, n_heads):
     Writes results into the preallocated `out` [n_heads*C, Dv] and `Snew` [n_heads*Dk, Dv]. No host
     round-trip — this is what the model prefill calls per chunk."""
     _get_chunk_state_op(n_heads)(q, kt, w, kcd, decay, qg, kgt, glast, S, out, Snew)
+
+
+# ============================================================================================
+# Fused single-step (T=1, decode) Gated-DeltaNet kernel.
+#
+# A C=1 simplification of the chunked kernel above that fuses the ENTIRE per-head/elementwise gated-
+# delta decode step into ONE launch over all value heads (8x4 grid for 32 heads at head-dim 128):
+# l2norm(q)*qk_scale + l2norm(k), the gate/beta (sigmoid + softplus-via-log/exp), the rank-1
+# recurrence, AND the gated RMSNorm. Only the 4 projections (w_qkv/w_z/w_ba/w_out) + the conv stay in
+# ttnn. Replaces ~30 tiny dispatch-bound ops with 1 kernel; keeps the recurrence state on-chip in CBs
+# (no per-op trace-pinned L1 tensor — so it does NOT accumulate across 40 layers like the ttnn scan's
+# L1-resident state would).
+#
+# I/O is COLUMN-SLAB: q/k are consumed as [1, key_dim] and v/z/out as [1, value_dim] — exactly the
+# compact projection layout (heads along the columns) — so there is NO input padding and the output
+# feeds w_out directly. Core h reads value-head h and key-head h//rep (folds repeat_interleave).
+# Per-head scalars (raw a/b; const -exp(A_log)/dt_bias) are passed as small uniform [nv*TILE,TILE]
+# tiles. State S/Snew are head-major [nv*Dk, Dv]. Validated to PCC >= 0.9999 vs the torch recurrence.
+#
+# ttl notes (hard-won): structural ops are ttl.block.* (fill/broadcast/transpose); elementwise math is
+# ttl.math.* (rsqrt/sigmoid/exp/log/silu). ttl.reduce can't collapse a multi-tile free axis, so the
+# sum-over-Dk for l2norm/rms uses a matmul against an on-core fill(1.0) ones-column. `block + float` is
+# unsupported (no __radd__) -> add eps via `+ ttl.block.fill(eps,...)`; `block * float` is fine. The
+# DFB budget is 32/op, so the sum/norm temps (sq_t/ss_t/cp_t/onesm) are reused across the q-l2norm,
+# k-l2norm, and core gated-norm phases (sequential, no overlap). bf16 DST (fp32_dest_acc_en=False).
+# ============================================================================================
+_GDN_EPS = 1e-6  # l2norm eps (matches reference)
+_decode_ops = {}
+
+
+def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
+    key = (n_v_heads, n_k_heads, scale, norm_eps)
+    if key in _decode_ops:
+        return _decode_ops[key]
+    gn, gm = _grid_dims(n_v_heads)
+    rep = n_v_heads // n_k_heads
+    EPS, NEPS = _GDN_EPS, norm_eps
+
+    @ttl.operation(grid=(gn, gm), fp32_dest_acc_en=False)
+    def _decode_step(
+        q: ttnn.Tensor,  # [1, key_dim]    raw q (heads along columns)
+        kr: ttnn.Tensor,  # [1, key_dim]    raw k
+        v: ttnn.Tensor,  # [1, value_dim]  (heads along columns)
+        z: ttnn.Tensor,  # [1, value_dim]  w_z projection (gate)
+        araw: ttnn.Tensor,  # [nv*TILE, TILE]  raw a (uniform per head)
+        braw: ttnn.Tensor,  # [nv*TILE, TILE]  raw b
+        negA: ttnn.Tensor,  # [nv*TILE, TILE]  -exp(A_log) const
+        dtb: ttnn.Tensor,  # [nv*TILE, TILE]  dt_bias const
+        S: ttnn.Tensor,  # [nv*Dk, Dv]
+        nweight: ttnn.Tensor,  # [TILE, Dv]  gated-norm weight (replicated rows; same all heads)
+        out: ttnn.Tensor,  # [1, value_dim]  final (normed+gated) output (heads along columns)
+        Snew: ttnn.Tensor,  # [nv*Dk, Dv]
+    ) -> None:
+        Dk, Dv = q.shape[1] // n_k_heads, v.shape[1] // n_v_heads
+        ct, kt_t, vt = 1, Dk // TILE, Dv // TILE
+        inv_dv = 1.0 / Dv
+
+        def mk(t, s):
+            return ttl.make_dataflow_buffer_like(t, shape=s, block_count=2)
+
+        qd, krd, vd, zd = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t)), mk(v, (ct, vt)), mk(z, (ct, vt))
+        ard, brd, nAd, dtd = mk(araw, (ct, 1)), mk(braw, (ct, 1)), mk(negA, (ct, 1)), mk(dtb, (ct, 1))
+        Sd = mk(S, (kt_t, vt))
+        nwd = mk(nweight, (ct, vt))
+        od, Snd = mk(out, (ct, vt)), mk(Snew, (kt_t, vt))
+        gbd, bbd = mk(S, (kt_t, vt)), mk(out, (ct, vt))
+        # shared sum/norm temps (reused for q-l2norm, k-l2norm, and core gated-norm — DFB budget)
+        sq_t, ss_t, cp_t, onesm = mk(q, (ct, kt_t)), mk(q, (ct, 1)), mk(q, (ct, kt_t)), mk(S, (kt_t, 1))
+        qn_d, kn_d = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t))  # persist: qn to end, kn to transpose
+        kn2, kcol = mk(kr, (ct, kt_t)), mk(S, (kt_t, ct))
+        Sg, Sg2, kv, dl, outer, st = (
+            mk(S, (kt_t, vt)),
+            mk(S, (kt_t, vt)),
+            mk(out, (ct, vt)),
+            mk(out, (ct, vt)),
+            mk(S, (kt_t, vt)),
+            mk(S, (kt_t, vt)),
+        )
+        core_d = mk(out, (ct, vt))
+
+        @ttl.datamovement()
+        def read():
+            node_n, node_m = ttl.node(dims=2)
+            h = node_n * gm + node_m
+            hk = h // rep
+            cq, cv, rMv, rKv = hk * kt_t, h * vt, h * ct, h * kt_t  # cq/cv: COLUMN slabs into [1,key/value_dim]
+            with (
+                qd.reserve() as a0,
+                krd.reserve() as a1,
+                vd.reserve() as a2,
+                zd.reserve() as az,
+                ard.reserve() as a3,
+                brd.reserve() as a4,
+                nAd.reserve() as a5,
+                dtd.reserve() as a6,
+                Sd.reserve() as a7,
+                nwd.reserve() as a11,
+            ):
+                t0 = ttl.copy(q[0:ct, cq : cq + kt_t], a0)
+                t1 = ttl.copy(kr[0:ct, cq : cq + kt_t], a1)
+                t2 = ttl.copy(v[0:ct, cv : cv + vt], a2)
+                tz = ttl.copy(z[0:ct, cv : cv + vt], az)
+                t3 = ttl.copy(araw[rMv : rMv + ct, 0:1], a3)
+                t4 = ttl.copy(braw[rMv : rMv + ct, 0:1], a4)
+                t5 = ttl.copy(negA[rMv : rMv + ct, 0:1], a5)
+                t6 = ttl.copy(dtb[rMv : rMv + ct, 0:1], a6)
+                t7 = ttl.copy(S[rKv : rKv + kt_t, 0:vt], a7)
+                t11 = ttl.copy(nweight[0:ct, 0:vt], a11)
+                t0.wait()
+                t1.wait()
+                t2.wait()
+                tz.wait()
+                t3.wait()
+                t4.wait()
+                t5.wait()
+                t6.wait()
+                t7.wait()
+                t11.wait()
+
+        @ttl.compute()
+        def compute():
+            # ---- gating: beta = sigmoid(b) ; g_exp = exp(negA * softplus(a + dt_bias)) ----
+            with brd.wait() as bb:
+                with bbd.reserve() as o:
+                    o.store(ttl.block.broadcast(ttl.math.sigmoid(bb), dims=[-1], shape=(ct, vt)))
+            with ard.wait() as ab, dtd.wait() as dtbk, nAd.wait() as nAk:
+                sp = ttl.math.log(ttl.math.exp(ab + dtbk) + ttl.block.fill(1.0, shape=(ct, 1)))
+                ge = ttl.math.exp(nAk * sp)
+                with gbd.reserve() as o:
+                    o.store(ttl.block.broadcast(ge, dims=[-2, -1], shape=(kt_t, vt)))
+            # ---- l2norm(q) * scale  (shared temps) ----
+            with onesm.reserve() as o:
+                o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+            with qd.wait() as qb:
+                with sq_t.reserve() as o:
+                    o.store(qb * qb)
+                with cp_t.reserve() as o:
+                    o.store(qb)
+            with sq_t.wait() as sqb, onesm.wait() as oc:
+                with ss_t.reserve() as o:
+                    o.store(sqb @ oc)
+            with ss_t.wait() as ssb, cp_t.wait() as qcb:
+                rq = ttl.block.broadcast(
+                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                )
+                with qn_d.reserve() as o:
+                    o.store((qcb * rq) * scale)
+            # ---- l2norm(k)  (reuse shared temps) ----
+            with onesm.reserve() as o:
+                o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+            with krd.wait() as kb:
+                with sq_t.reserve() as o:
+                    o.store(kb * kb)
+                with cp_t.reserve() as o:
+                    o.store(kb)
+            with sq_t.wait() as sqb, onesm.wait() as oc:
+                with ss_t.reserve() as o:
+                    o.store(sqb @ oc)
+            with ss_t.wait() as ssb, cp_t.wait() as kcb:
+                rk = ttl.block.broadcast(
+                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                )
+                with kn_d.reserve() as o:
+                    o.store(kcb * rk)
+            with kn_d.wait() as knb:
+                with kcol.reserve() as o:
+                    o.store(ttl.block.transpose(knb))
+                with kn2.reserve() as o:
+                    o.store(knb)
+            # ---- rank-1 recurrence ----
+            with Sd.wait() as Sb, gbd.wait() as gb:
+                with Sg.reserve() as o:
+                    o.store(Sb * gb)
+            with kn2.wait() as knb, Sg.wait() as Sgb:
+                with kv.reserve() as o:
+                    o.store(knb @ Sgb)
+                with Sg2.reserve() as o:
+                    o.store(Sgb)
+            with vd.wait() as vb, kv.wait() as kvb, bbd.wait() as betab:
+                with dl.reserve() as o:
+                    o.store((vb - kvb) * betab)
+            with kcol.wait() as kcolb, dl.wait() as dlb:
+                with outer.reserve() as o:
+                    o.store(kcolb @ dlb)
+            with Sg2.wait() as Sgb, outer.wait() as ob:
+                with st.reserve() as o:
+                    o.store(Sgb + ob)
+            with qn_d.wait() as qnb, st.wait() as stb:
+                with core_d.reserve() as o:
+                    o.store(qnb @ stb)
+                with Snd.reserve() as o:
+                    o.store(stb)
+            # ---- gated RMSNorm: out = (core * rsqrt(mean(core^2,Dv)+eps) * weight) * silu(z) ----
+            with onesm.reserve() as o:
+                o.store(ttl.block.fill(1.0, shape=(vt, 1)))
+            with core_d.wait() as cb:
+                with sq_t.reserve() as o:
+                    o.store(cb * cb)
+                with cp_t.reserve() as o:
+                    o.store(cb)
+            with sq_t.wait() as csqb, onesm.wait() as ocn:
+                with ss_t.reserve() as o:
+                    o.store(csqb @ ocn)
+            with ss_t.wait() as ssnb, cp_t.wait() as cb, nwd.wait() as nwb, zd.wait() as zb:
+                rms = ttl.block.broadcast(
+                    ttl.math.rsqrt(ssnb * inv_dv + ttl.block.fill(NEPS, shape=(ct, 1))), dims=[-1], shape=(ct, vt)
+                )
+                y = (cb * rms) * nwb
+                with od.reserve() as o:
+                    o.store(y * ttl.math.silu(zb))
+
+        @ttl.datamovement()
+        def write():
+            node_n, node_m = ttl.node(dims=2)
+            h = node_n * gm + node_m
+            cv, rKv = h * vt, h * kt_t
+            with od.wait() as ob:
+                ttl.copy(ob, out[0:ct, cv : cv + vt]).wait()  # COLUMN slab into [1, value_dim]
+            with Snd.wait() as snb:
+                ttl.copy(snb, Snew[rKv : rKv + kt_t, 0:vt]).wait()
+
+    _decode_ops[key] = _decode_step
+    return _decode_step
+
+
+def decode_step_tt(q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew, n_v_heads, n_k_heads, scale, norm_eps):
+    """ttnn-native entry for the fused single-step decode kernel. All args are device ttnn tensors:
+    q/kr [1,key_dim], v/z/out [1,value_dim] (heads along columns); araw/braw/negA/dtb [nv*TILE,TILE]
+    (uniform per head); S/Snew [nv*Dk,Dv] head-major; nweight [TILE,Dv]. Writes `out` and `Snew`."""
+    _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps)(q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew)
 
 
 def chunk_state(q, kt, w, kcd, decay, qg, kgt, glast, S, dev, n_heads=1):

@@ -8,6 +8,7 @@ via the streaming ``CheckpointLoader`` so host RAM never holds the full 72 GB ch
 Phase A: prefill only (no KV/state cache). Generation in the demo re-runs the growing sequence per
 token. KV/state caches + the fused delta-rule kernel come in Phase B.
 """
+
 from __future__ import annotations
 
 import os
@@ -87,7 +88,28 @@ class TtModel(LightweightModule):
 
     def _alloc_cache(self, layer):
         if layer.is_linear:
-            return {}  # gated-delta state filled on first use
+            # Persistent gated-delta state buffers. Pre-allocating (rather than deferring to first-use,
+            # which stores the transient prefill output as the cache) keeps the decode's in-place state
+            # writes pointed at a STABLE address. Required for trace capture: a reclaimed/reallocated
+            # transient buffer would force a host write on the in-place copy-into, which trace capture
+            # forbids (TT_FATAL "Writes are not supported during trace capture"). Without this, the
+            # eager-prefill→traced-decode path fataled only at high layer counts (memory pressure
+            # reclaims the ~1 MB-per-layer transients); the traced-prefill path already pre-allocated.
+            a = self.args
+            return {
+                "conv_state": ttnn.zeros(
+                    [a.conv_kernel_size - 1, a.lin_conv_dim],
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                ),
+                "recurrent_state": ttnn.zeros(
+                    [1, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim],
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                ),
+            }
         # fixed-shape KV cache for an attention layer: [1, n_kv, max_seq, head_dim]
         shape = [1, self.args.n_kv_heads, self.max_seq, self.args.head_dim]
         k = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
@@ -139,25 +161,9 @@ class TtModel(LightweightModule):
         # so allocate them ONCE and share across trace lengths.
         if getattr(self, "caches", None) is None or not getattr(self, "_pf_caches_ready", False):
             self.max_seq = self.args.max_seq_len
+            # _alloc_cache now pre-allocates PERSISTENT gated-delta conv/recurrent state (so the
+            # in-place decode writes hit a stable address — trace-safe; see _alloc_cache).
             self.caches = [self._alloc_cache(layer) for layer in self.layers]
-            # Pre-allocate the gated-delta state as PERSISTENT buffers. Otherwise the eager first-use
-            # path stores a slice/view of a transient tensor in the cache; by replay that buffer is
-            # reclaimed and the in-place copy-into triggers a host write (forbidden in trace capture).
-            a = self.args
-            for layer, cache in zip(self.layers, self.caches):
-                if layer.is_linear:
-                    cache["conv_state"] = ttnn.zeros(
-                        [a.conv_kernel_size - 1, a.lin_conv_dim],
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.mesh_device,
-                    )
-                    cache["recurrent_state"] = ttnn.zeros(
-                        [1, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim],
-                        dtype=ttnn.bfloat16,
-                        layout=ttnn.TILE_LAYOUT,
-                        device=self.mesh_device,
-                    )
             self._pf_caches_ready = True
         self._pf_ids[T] = to_tt(
             torch.zeros(1, T, dtype=torch.int32), self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT
