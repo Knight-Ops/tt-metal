@@ -27,6 +27,16 @@ class ModelArgs:
         self.ckpt_dir = ckpt_dir or os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
         self.config = Qwen35MoeConfig.from_hf_config(self.ckpt_dir)
 
+        # On-disk cache of converted (quantized + tilized) weights. The first build writes one
+        # .tensorbin per weight; later runs load them directly and skip the block-float quantization
+        # (the bulk of cold-load time). Root defaults to $TT_CACHE_PATH or <ckpt>/tt_weight_cache.
+        # QWEN36_WEIGHT_CACHE=0 disables it (always convert from the HF checkpoint).
+        if os.environ.get("QWEN36_WEIGHT_CACHE") == "0":
+            self.weight_cache_path = None
+        else:
+            root = os.environ.get("TT_CACHE_PATH") or os.path.join(self.ckpt_dir, "tt_weight_cache")
+            self.weight_cache_path = root
+
         # --- convenience aliases (architecture) ---
         c = self.config
         self.dim = c.hidden_size

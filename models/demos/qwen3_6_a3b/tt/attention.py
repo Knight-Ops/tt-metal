@@ -50,7 +50,18 @@ def apply_rope(x, cos, sin, rotary_dim):
 
 
 class TtAttention(LightweightModule):
-    def __init__(self, mesh_device, weights, n_heads, n_kv_heads, head_dim, rotary_dim, eps, dtype=ttnn.bfloat8_b):
+    def __init__(
+        self,
+        mesh_device,
+        weights,
+        n_heads,
+        n_kv_heads,
+        head_dim,
+        rotary_dim,
+        eps,
+        dtype=ttnn.bfloat8_b,
+        cache_path=None,
+    ):
         super().__init__()
         self.mesh_device = mesh_device
         self.n_heads = n_heads
@@ -58,18 +69,31 @@ class TtAttention(LightweightModule):
         self.head_dim = head_dim
         self.rotary_dim = rotary_dim
         self.scale = head_dim**-0.5
+        cn = (lambda role: f"{cache_path}/{role}") if cache_path else (lambda role: None)
 
-        # Split the fused q_proj weight (rows: per head [query(head_dim) | gate(head_dim)]).
-        wqg = weights["q_proj"].reshape(n_heads, 2 * head_dim, -1)
-        wq = wqg[:, :head_dim, :].reshape(n_heads * head_dim, -1).contiguous()
-        wgate = wqg[:, head_dim:, :].reshape(n_heads * head_dim, -1).contiguous()
-        self.wq = as_weight(wq, mesh_device, dtype=dtype)
-        self.wgate = as_weight(wgate, mesh_device, dtype=dtype)
-        self.wk = as_weight(weights["k_proj"], mesh_device, dtype=dtype)
-        self.wv = as_weight(weights["v_proj"], mesh_device, dtype=dtype)
-        self.wo = as_weight(weights["o_proj"], mesh_device, dtype=dtype)
-        self.q_norm = TtRMSNorm(mesh_device, weights["q_norm"], eps, add_unit_offset=True)
-        self.k_norm = TtRMSNorm(mesh_device, weights["k_norm"], eps, add_unit_offset=True)
+        # weights[*] may be lazy thunks (production loader) or plain tensors (module tests). W()
+        # materializes either; for cached weights it is only invoked on a cache miss.
+        def W(k):
+            v = weights[k]
+            return v() if callable(v) else v
+
+        # Split the fused q_proj weight (rows: per head [query(head_dim) | gate(head_dim)]) inside
+        # thunks so the read + split only run on a cache miss.
+        def _wq():
+            wqg = W("q_proj").reshape(n_heads, 2 * head_dim, -1)
+            return wqg[:, :head_dim, :].reshape(n_heads * head_dim, -1).contiguous()
+
+        def _wgate():
+            wqg = W("q_proj").reshape(n_heads, 2 * head_dim, -1)
+            return wqg[:, head_dim:, :].reshape(n_heads * head_dim, -1).contiguous()
+
+        self.wq = as_weight(_wq, mesh_device, dtype=dtype, cache_file_name=cn("wq"))
+        self.wgate = as_weight(_wgate, mesh_device, dtype=dtype, cache_file_name=cn("wgate"))
+        self.wk = as_weight(weights["k_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wk"))
+        self.wv = as_weight(weights["v_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wv"))
+        self.wo = as_weight(weights["o_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wo"))
+        self.q_norm = TtRMSNorm(mesh_device, W("q_norm"), eps, add_unit_offset=True)
+        self.k_norm = TtRMSNorm(mesh_device, W("k_norm"), eps, add_unit_offset=True)
         # Bounded K/V chunking so flash-decode L1 use stays within budget at long context
         # (default config overflows L1 past ~256 cache len). k_chunk_size=128 fits comfortably.
         self.sdpa_decode_pc = ttnn.SDPAProgramConfig(

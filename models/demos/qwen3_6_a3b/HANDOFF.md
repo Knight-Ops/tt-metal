@@ -83,8 +83,42 @@ QWEN36_LAYERS=4 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --
 ./python_env/bin/python models/demos/qwen3_6_a3b/tests/analyze_chunk_precision.py
 ```
 
+### Weight cache (fast model load) — IMPORTANT
+
+The converted (quantized + tilized) weights are cached to disk so they don't have to be re-derived
+from the 72 GB HF checkpoint on every load. **This is on by default.** Cold build ~800 s → warm load
+is a small fraction of that.
+
+```bash
+# Optional: pre-populate the cache once (e.g. overnight, or before benchmarking). NOT required —
+# a normal run populates it on its first pass too. Builds the model and exits.
+QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/generate_weight_cache.py
+
+# Cache elsewhere than <ckpt>/tt_weight_cache (e.g. fast local NVMe):
+TT_CACHE_PATH=/scratch/qwen36_cache QWEN36_LAYERS=40 \
+    ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --prompt "..." --gen 12 --trace
+```
+
+- **Location:** `$TT_CACHE_PATH` if set, else `<ckpt>/tt_weight_cache/`. One `.tensorbin` per big
+  weight (experts `gate_up_proj`/`down_proj`, attention + gated-delta projections, embed, lm_head);
+  tiny tensors (norms, RoPE, conv taps, `A_log`/`dt_bias`) are not cached (they convert instantly).
+  Full 40-layer cache is ~17–20 GB (BFP4 experts dominate).
+- **Two layers of speedup:** (1) reload skips the block-float **quantize + tilize** (the bulk of cold
+  load); (2) on a cache hit the corresponding **HF weight is never read** from the safetensors shards
+  (the loader's big-weight accessors are lazy thunks — see `load_checkpoints.py`), so the 72 GB read
+  is skipped too. Measured (2-layer, P150): cold 65 s → warm 9 s.
+- **Disabling / cache hygiene:**
+  - `QWEN36_WEIGHT_CACHE=0` turns caching off entirely (always convert from the HF checkpoint).
+  - Cache files are keyed by `name + dtype + layout` only (the dtype/layout are in the filename, so
+    flipping e.g. `QWEN36_LMHEAD_BF4` is safe). They are **NOT** keyed by checkpoint contents:
+    **delete the cache dir if you point at a different checkpoint**, or you'll load stale weights.
+  - A corrupt/unreadable cache file is non-fatal (ttnn logs a warning and falls back); if generation
+    degrades after an interrupted build, `rm -rf <cache dir>` and re-run.
+  - Any cache failure (unwritable dir, etc.) falls back to a normal from-scratch load with one warning.
+
 Demo env vars: `QWEN36_LAYERS` (default 40), `QWEN36_MAX_SEQ` (KV/state cache len, default 512 in
 ModelArgs; demo caps it; `sdpa_decode` tuned to bound L1 at any length), `QWEN36_CKPT`,
+`QWEN36_WEIGHT_CACHE=0` (disable the on-disk weight cache), `TT_CACHE_PATH` (weight-cache dir),
 `QWEN36_SPARSE_DECODE=1` (opt into the gather decode path; default is sparse_matmul),
 `QWEN36_DENSE_PREFILL=1` / `QWEN36_SPARSE_PREFILL=1` (MoE prefill path; dense is default),
 `QWEN36_FUSED_PREFILL=0` (fall back to the recurrent scan; fused chunked Gated-DeltaNet prefill is
@@ -121,8 +155,12 @@ Reference math vendored from HF `transformers/models/{qwen3_next,qwen3_5,qwen3_v
 reference/qwen3_5_moe.py     Standalone torch reference (text path). PCC=1.0 vs HF. The source of truth
                              for correctness. Contains torch_chunk_gated_delta_rule (the kernel ref).
 tt/model_config.py           ModelArgs: parses config.json; single-P150 BFP4; precision/flags.
-tt/common.py                 to_tt / from_tt / as_weight helpers (single-device replicate mesh).
+tt/common.py                 to_tt / from_tt / as_weight helpers (single-device replicate mesh). Accept a
+                             torch tensor OR a zero-arg callable (built only on a cache miss) + optional
+                             cache_file_name → on-disk .tensorbin weight cache via ttnn.as_tensor.
 tt/load_checkpoints.py       Streaming safetensors loader (lazy per-tensor; HF prefix model.language_model.).
+                             Big-weight builders return zero-arg THUNKS (lambda: self.get(name)) so a
+                             weight-cache hit skips the HF read; norm_weights/final_norm stay eager (tiny).
 tt/rms_norm.py               TtRMSNorm ((1+weight) folded) + TtRMSNormGated.
 tt/attention.py              Full attention: fused q/gate split, partial RoPE, qk-norm; KV cache +
                              sdpa_decode (tuned program config, k_chunk_size=128). forward / forward_prefill
@@ -197,7 +235,9 @@ linear-layer win to ~5.5×.) Coherent generation confirmed at 40 layers:
 unchanged (~7.76 tok/s/user). The ttl kernel compiles once per (n_heads, head-dim) shape (~1 min)
 then is disk-cached, so the first prefill in a fresh process is compile-dominated (warm up to amortize).
 
-Build/load ~800 s (~17.5 GB BFP4 to device).
+Build/load ~800 s cold (~17.5 GB BFP4 to device); the on-disk weight cache (default on) makes warm
+loads a small fraction of that — it skips both the block-float quantize/tilize and the HF read. See §3
+"Weight cache".
 
 UPDATE (2026-06-19): the "host-dispatch bound, trace the prefill" hypothesis was **measured and is
 wrong** — prefill is **device-COMPUTE-bound** (MoE ~62%, gated-delta ~35%; synced per-phase sum ≈ wall

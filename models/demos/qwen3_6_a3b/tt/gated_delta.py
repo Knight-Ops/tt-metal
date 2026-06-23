@@ -57,9 +57,17 @@ def _l2norm_scale_lastdim(x, scale=None, eps=1e-6):
 
 
 class TtGatedDeltaNet(LightweightModule):
-    def __init__(self, mesh_device, weights, cfg, dtype=ttnn.bfloat8_b):
+    def __init__(self, mesh_device, weights, cfg, dtype=ttnn.bfloat8_b, cache_path=None):
         super().__init__()
         self.mesh_device = mesh_device
+        cn = (lambda role: f"{cache_path}/{role}") if cache_path else (lambda role: None)
+
+        # weights[*] may be lazy thunks (production loader) or plain tensors (module tests). W()
+        # materializes either; for cached weights it is only invoked on a cache miss.
+        def W(k):
+            v = weights[k]
+            return v() if callable(v) else v
+
         self.num_k_heads = cfg.linear_num_key_heads
         self.num_v_heads = cfg.linear_num_value_heads
         self.head_k_dim = cfg.linear_key_head_dim
@@ -72,15 +80,22 @@ class TtGatedDeltaNet(LightweightModule):
         self.eps = cfg.rms_norm_eps
         self.qk_scale = self.head_k_dim**-0.5
 
-        self.w_qkv = as_weight(weights["in_proj_qkv"], mesh_device, dtype=dtype)
-        self.w_z = as_weight(weights["in_proj_z"], mesh_device, dtype=dtype)
+        # weights[*] are lazy thunks (see load_checkpoints): projections passed straight through to
+        # as_weight (read only on a cache miss); tiny conv/norm/A_log/dt_bias tensors read eagerly.
+        self.w_qkv = as_weight(weights["in_proj_qkv"], mesh_device, dtype=dtype, cache_file_name=cn("w_qkv"))
+        self.w_z = as_weight(weights["in_proj_z"], mesh_device, dtype=dtype, cache_file_name=cn("w_z"))
         # in_proj_b and in_proj_a both map hidden -> V; fuse into one [hidden, 2V] matmul (one launch
         # instead of two), split the output b|a in forward. Both weights are [V, hidden] (nn.Linear).
-        self.w_ba = as_weight(torch.cat([weights["in_proj_b"], weights["in_proj_a"]], dim=0), mesh_device, dtype=dtype)
-        self.w_out = as_weight(weights["out_proj"], mesh_device, dtype=dtype)
-        self.norm = TtRMSNormGated(mesh_device, weights["norm"], self.eps)
+        self.w_ba = as_weight(
+            lambda: torch.cat([W("in_proj_b"), W("in_proj_a")], dim=0),
+            mesh_device,
+            dtype=dtype,
+            cache_file_name=cn("w_ba"),
+        )
+        self.w_out = as_weight(weights["out_proj"], mesh_device, dtype=dtype, cache_file_name=cn("w_out"))
+        self.norm = TtRMSNormGated(mesh_device, W("norm"), self.eps)
 
-        cw = weights["conv1d"].reshape(self.conv_dim, self.conv_k)
+        cw = W("conv1d").reshape(self.conv_dim, self.conv_k)
         self.conv_taps = [
             to_tt(cw[:, j].reshape(1, self.conv_dim), mesh_device, dtype=ttnn.bfloat16) for j in range(self.conv_k)
         ]
@@ -90,9 +105,9 @@ class TtGatedDeltaNet(LightweightModule):
 
         # A_log, dt_bias as [1, V] device tensors for g = -exp(A_log)*softplus(a+dt_bias)
         self.neg_expA = to_tt(
-            -torch.exp(weights["A_log"].float()).reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16
+            -torch.exp(W("A_log").float()).reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16
         )
-        self.dt_bias = to_tt(weights["dt_bias"].float().reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16)
+        self.dt_bias = to_tt(W("dt_bias").float().reshape(1, self.num_v_heads), mesh_device, dtype=ttnn.bfloat16)
 
     def _conv_silu(self, mixed, conv_state=None):
         """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns (out[T,conv_dim], new_conv_state[K-1,conv_dim])."""

@@ -58,9 +58,21 @@ class TtMoE(LightweightModule):
         dtype=ttnn.bfloat16,
         sparse_decode=True,
         compute_kernel_config=None,
+        cache_path=None,
+        hidden=None,
+        inter=None,
+        se_inter=None,
     ):
         super().__init__()
         self.mesh_device = mesh_device
+        cn = (lambda role: f"{cache_path}/{role}") if cache_path else (lambda role: None)
+
+        # weights[*] may be lazy thunks (production loader) or plain tensors (module tests). W()
+        # materializes either; it is only invoked on a cache miss for the big expert weights.
+        def W(k):
+            v = weights[k]
+            return v() if callable(v) else v
+
         self.num_experts = num_experts
         self.top_k = top_k
         # sparse_decode=True uses the gather-top-k path (less compute, but a host readback per call,
@@ -80,7 +92,7 @@ class TtMoE(LightweightModule):
         self._grid = (g.x, g.y)  # full compute grid (Blackhole P150: 11x10)
 
         # router: logits = x @ gate_w^T  ; reference gate weight is [E, hidden]
-        self.gate_w = as_weight(weights["gate"], mesh_device, dtype=dtype)  # -> [hidden, E]
+        self.gate_w = as_weight(weights["gate"], mesh_device, dtype=dtype, cache_file_name=cn("gate"))  # -> [hidden, E]
 
         # Expert weights in sparse_matmul layout [1, E, in, out], used for BOTH dense prefill
         # (batched matmul, squeeze leading dim) and sparse_matmul decode. gate+up are kept FUSED
@@ -89,22 +101,35 @@ class TtMoE(LightweightModule):
         # (the dominant decode cost is per-launch sparse_matmul overhead, not weight bandwidth).
         # down transposed to [1, E, inter, hidden]. Total weight bytes unchanged (1x).
         E = num_experts
-        H = weights["gate_up_proj"].shape[2]
-        I = weights["gate_up_proj"].shape[1] // 2
+        # Prefer config dims (so a cache hit needn't read the weight just to learn its shape); fall
+        # back to a shape read for direct callers (tests) that don't pass them.
+        H = hidden if hidden is not None else W("gate_up_proj").shape[2]
+        I = inter if inter is not None else W("gate_up_proj").shape[1] // 2
         self.hidden, self.inter, self.expert_dtype = H, I, expert_dtype
-        gate_up = weights["gate_up_proj"].transpose(1, 2).reshape(1, E, H, 2 * I).contiguous()
-        down = weights["down_proj"].transpose(1, 2).reshape(1, E, I, H).contiguous()
-        self.gate_up_sp = to_tt(gate_up, mesh_device, dtype=expert_dtype)
-        self.down_sp = to_tt(down, mesh_device, dtype=expert_dtype)
+        self.gate_up_sp = to_tt(
+            lambda: W("gate_up_proj").transpose(1, 2).reshape(1, E, H, 2 * I).contiguous(),
+            mesh_device,
+            dtype=expert_dtype,
+            cache_file_name=cn("gate_up_proj"),
+        )
+        self.down_sp = to_tt(
+            lambda: W("down_proj").transpose(1, 2).reshape(1, E, I, H).contiguous(),
+            mesh_device,
+            dtype=expert_dtype,
+            cache_file_name=cn("down_proj"),
+        )
 
         # shared expert (MLP) + its gate. se_gate_proj/se_up_proj both map hidden -> se_inter; fuse
         # into one [hidden, 2*se_inter] matmul (one launch), split the output for the SwiGLU.
-        self.se_inter = weights["se_gate_proj"].shape[0]
+        self.se_inter = se_inter if se_inter is not None else W("se_gate_proj").shape[0]
         self.se_gate_up = as_weight(
-            torch.cat([weights["se_gate_proj"], weights["se_up_proj"]], dim=0), mesh_device, dtype=dtype
+            lambda: torch.cat([W("se_gate_proj"), W("se_up_proj")], dim=0),
+            mesh_device,
+            dtype=dtype,
+            cache_file_name=cn("se_gate_up"),
         )
-        self.se_down = as_weight(weights["se_down_proj"], mesh_device, dtype=dtype)
-        self.se_router = as_weight(weights["se_router"], mesh_device, dtype=dtype)  # [hidden, 1]
+        self.se_down = as_weight(weights["se_down_proj"], mesh_device, dtype=dtype, cache_file_name=cn("se_down"))
+        self.se_router = as_weight(weights["se_router"], mesh_device, dtype=dtype, cache_file_name=cn("se_router"))
 
     @staticmethod
     def _grid_for(Nt):

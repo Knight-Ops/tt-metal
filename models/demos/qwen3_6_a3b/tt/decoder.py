@@ -19,6 +19,8 @@ class TtDecoderLayer(LightweightModule):
         self.mesh_device = mesh_device
         self.layer_idx = layer_idx
         self.is_linear = args.is_linear_layer(layer_idx)
+        # Per-layer weight-cache prefix (None disables caching for this layer's big linear weights).
+        cache_path = f"{args.weight_cache_path}/layer_{layer_idx}" if args.weight_cache_path else None
 
         nw = loader.norm_weights(layer_idx)
         self.input_norm = TtRMSNorm(mesh_device, nw["input_layernorm"], args.norm_eps, add_unit_offset=True)
@@ -26,7 +28,11 @@ class TtDecoderLayer(LightweightModule):
 
         if self.is_linear:
             self.mixer = TtGatedDeltaNet(
-                mesh_device, loader.gated_delta_weights(layer_idx), cfg, dtype=args.linear_attn_weight_dtype
+                mesh_device,
+                loader.gated_delta_weights(layer_idx),
+                cfg,
+                dtype=args.linear_attn_weight_dtype,
+                cache_path=cache_path,
             )
         else:
             self.mixer = TtAttention(
@@ -38,6 +44,7 @@ class TtDecoderLayer(LightweightModule):
                 args.rotary_dim,
                 args.norm_eps,
                 dtype=args.attn_weight_dtype,
+                cache_path=cache_path,
             )
         self.moe = TtMoE(
             mesh_device,
@@ -48,6 +55,11 @@ class TtDecoderLayer(LightweightModule):
             dtype=args.activation_dtype,
             sparse_decode=args.sparse_moe_decode,
             compute_kernel_config=args.compute_kernel_lofi,
+            cache_path=cache_path,
+            # Config dims so a weight-cache hit needn't read expert weights to learn their shapes.
+            hidden=args.dim,
+            inter=args.moe_intermediate_size,
+            se_inter=args.shared_expert_intermediate_size,
         )
 
     def forward_prefill(self, x, cos, sin, cache):

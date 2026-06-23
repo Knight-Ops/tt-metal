@@ -3,17 +3,79 @@
 """Shared tt-nn helpers for the Qwen3.6-35B-A3B demo (single-device oriented)."""
 from __future__ import annotations
 
+import os
+
+from loguru import logger
+
 import ttnn
 
 DRAM = ttnn.DRAM_MEMORY_CONFIG
 L1 = ttnn.L1_MEMORY_CONFIG
 
+# Warn once (not per-tensor) if the on-disk weight cache can't be used and we fall back.
+_cache_fallback_warned = False
 
-def to_tt(torch_tensor, mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, memory_config=DRAM):
-    """Replicate a torch tensor onto the (single- or multi-) device mesh."""
+
+def _cache_exists(cache_file_name, dtype, layout) -> bool:
+    """Whether ttnn.as_tensor's cache file for this (name, dtype, layout) is already on disk. Mirrors
+    the ``_dtype_..._layout_....tensorbin`` suffix ttnn appends (ttnn/ttnn/operations/core.py)."""
+    path = f"{cache_file_name}_dtype_{dtype.name}_layout_{layout.name}.tensorbin"
+    return os.path.isfile(path)
+
+
+def _materialize(source):
+    """``source`` is a torch tensor or a zero-arg callable returning one. The callable form lets us
+    defer the (potentially multi-GB) HF read until we know the weight actually has to be read."""
+    return source() if callable(source) else source
+
+
+def to_tt(
+    source,
+    mesh_device,
+    dtype=ttnn.bfloat16,
+    layout=ttnn.TILE_LAYOUT,
+    memory_config=DRAM,
+    cache_file_name=None,
+):
+    """Replicate a torch tensor onto the (single- or multi-) device mesh.
+
+    ``source`` may be a torch tensor OR a zero-arg callable returning one. The callable is invoked
+    only when the weight must actually be read (no cache, or a cache miss), so a cache hit never
+    materializes the HF weight.
+
+    If ``cache_file_name`` is given, the converted (quantized + tilized) tensor is cached to disk via
+    ``ttnn.as_tensor``: the first build writes a ``.tensorbin``; later runs load it directly, skipping
+    the block-float quantization + tilize (the bulk of the ~800s/40-layer cold load) AND the HF read.
+    ttnn appends a ``_dtype_<dtype>_layout_<layout>.tensorbin`` suffix, so a dtype/layout change never
+    reuses a stale file. Falls back to a plain ``from_torch`` (with one warning) if caching fails."""
+    global _cache_fallback_warned
     mapper = ttnn.ReplicateTensorToMesh(mesh_device) if mesh_device is not None else None
+    if cache_file_name:
+        try:
+            if _cache_exists(cache_file_name, dtype, layout):
+                import torch
+
+                # Hit: as_tensor loads the .tensorbin and ignores this argument, so don't read the
+                # (multi-GB) HF weight just to hand it one.
+                src = torch.empty((), dtype=torch.bfloat16)
+            else:
+                src = _materialize(source)
+                os.makedirs(os.path.dirname(cache_file_name), exist_ok=True)
+            return ttnn.as_tensor(
+                src,
+                dtype=dtype,
+                layout=layout,
+                device=mesh_device,
+                memory_config=memory_config,
+                mesh_mapper=mapper,
+                cache_file_name=cache_file_name,
+            )
+        except Exception as e:  # noqa: BLE001 - any cache failure must not be fatal
+            if not _cache_fallback_warned:
+                logger.warning(f"weight cache unavailable ({e!r}); loading weights without cache")
+                _cache_fallback_warned = True
     return ttnn.from_torch(
-        torch_tensor,
+        _materialize(source),
         dtype=dtype,
         layout=layout,
         device=mesh_device,
@@ -35,6 +97,13 @@ def from_tt(tt_tensor, mesh_device=None):
     return ttnn.to_torch(tt_tensor)
 
 
-def as_weight(torch_weight, mesh_device, dtype=ttnn.bfloat16):
-    """Convert an nn.Linear weight (out, in) to a tt tensor laid out for ttnn.linear (in, out)."""
-    return to_tt(torch_weight.t().contiguous(), mesh_device, dtype=dtype, layout=ttnn.TILE_LAYOUT)
+def as_weight(source, mesh_device, dtype=ttnn.bfloat16, cache_file_name=None):
+    """Convert an nn.Linear weight (out, in) to a tt tensor laid out for ttnn.linear (in, out).
+
+    ``source`` is a torch weight or a zero-arg callable returning one; the read + transpose run only
+    on a cache miss (a hit loads the cached .tensorbin and never touches the HF weight)."""
+
+    def build():
+        return _materialize(source).t().contiguous()
+
+    return to_tt(build, mesh_device, dtype=dtype, layout=ttnn.TILE_LAYOUT, cache_file_name=cache_file_name)

@@ -18,7 +18,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt.attention import precompute_rope
-from models.demos.qwen3_6_a3b.tt.common import from_tt, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt
 from models.demos.qwen3_6_a3b.tt.decoder import TtDecoderLayer
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
@@ -30,7 +30,16 @@ class TtModel(LightweightModule):
         self.args = args
         self.n_layers = num_layers if num_layers is not None else args.n_layers
 
-        self.embed_weight = to_tt(loader.embed_tokens(), mesh_device, dtype=ttnn.bfloat16, layout=ttnn.ROW_MAJOR_LAYOUT)
+        cp = args.weight_cache_path
+        # loader.embed_tokens()/lm_head() return lazy thunks (the big-weight read is deferred so a
+        # weight-cache hit skips it); final_norm() returns the tiny tensor directly.
+        self.embed_weight = to_tt(
+            loader.embed_tokens(),
+            mesh_device,
+            dtype=ttnn.bfloat16,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+            cache_file_name=f"{cp}/embed_tokens" if cp else None,
+        )
         self.layers = []
         for i in range(self.n_layers):
             self.layers.append(TtDecoderLayer(mesh_device, args, loader, i))
@@ -39,7 +48,14 @@ class TtModel(LightweightModule):
         # lever is fewer weight bytes: BFP4 ~halves its read (~1.47 -> ~0.75 ms). Accuracy-gated; set
         # QWEN36_LMHEAD_BF4=0 to fall back to BFP8 if greedy generation degrades.
         lm_dtype = ttnn.bfloat8_b if os.environ.get("QWEN36_LMHEAD_BF4") == "0" else ttnn.bfloat4_b
-        self.lm_head_w = to_tt(loader.lm_head().t().contiguous(), mesh_device, dtype=lm_dtype)
+        # as_weight transposes (out,in)->(in,out) lazily inside the thunk, so a cache hit skips both
+        # the HF read and the transpose.
+        self.lm_head_w = as_weight(
+            loader.lm_head(),
+            mesh_device,
+            dtype=lm_dtype,
+            cache_file_name=f"{cp}/lm_head" if cp else None,
+        )
         # On-device RoPE tables: cos/sin for every position, indexed by position with ttnn.embedding
         # during decode (no per-token host recompute). Row-major so they act as embedding weights.
         self.cos_table, self.sin_table = self._build_rope_tables()
