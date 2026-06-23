@@ -25,14 +25,15 @@ Scope here is **text-only** (no vision tower, no MTP head).
 ```
 reference/qwen3_5_moe.py   standalone torch reference (text path); PCC=1.0 vs HuggingFace
 tt/model_config.py         ModelArgs (parses HF config.json; single-P150 BFP4)
-tt/common.py               to_tt / from_tt / as_weight helpers
+tt/common.py               to_tt / from_tt / as_weight helpers (+ on-disk .tensorbin weight cache)
 tt/rms_norm.py             TtRMSNorm (1+weight) + TtRMSNormGated
 tt/attention.py            full attention (fused q/gate, partial RoPE, qk-norm, KV cache)
 tt/gated_delta.py          Gated DeltaNet (on-device recurrent scan + conv/recurrent state cache)
 tt/moe.py                  MoE (dense prefill + gather-top-k sparse decode + shared expert)
-tt/load_checkpoints.py     streaming safetensors loader (lazy per-tensor)
+tt/load_checkpoints.py     streaming safetensors loader (lazy per-tensor; big weights as thunks)
 tt/decoder.py, tt/model.py decoder layer + full hybrid model (prefill + cached decode)
 demo/demo.py               runnable text demo + perf harness
+demo/generate_weight_cache.py  optional one-time weight-cache populate
 tests/                     reference smoke + cross-validation + on-device PCC per module + e2e
 ```
 
@@ -41,11 +42,11 @@ tests/                     reference smoke + cross-validation + on-device PCC pe
 Weights are expected at `~/models/qwen36` (override with `QWEN36_CKPT`). Use the tt-metal venv.
 
 ```bash
-# full 40-layer text demo + perf
-QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --seq 64 --gen 16
+# full 40-layer text demo + perf (--trace = fast on-device decode path)
+QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --seq 64 --gen 16 --trace
 
 # reduced layers for quick iteration
-QWEN36_LAYERS=4  ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --prompt "Hello" --gen 8
+QWEN36_LAYERS=4  ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --prompt "Hello" --gen 8 --trace
 
 # tests (on-device PCC gates)
 ./python_env/bin/python -m pytest models/demos/qwen3_6_a3b/tests/ -p no:cacheprovider
@@ -53,6 +54,45 @@ QWEN36_LAYERS=4  ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py -
 
 The reference cross-validation (`tests/cross_validate_reference.py`) needs `transformers>=5.2`
 and is run with a SEPARATE venv, never the tt-metal python_env.
+
+### Weight cache (fast model load)
+
+The converted (quantized + tilized) weights are cached to disk as `.tensorbin` files so they are
+not re-derived from the 72 GB HF checkpoint on every load. **It is on by default** — the first run
+populates the cache; later runs reuse it. Measured (40 layers, single P150): cold build **~916 s →
+warm load ~120 s**, and warm-vs-cold logits are PCC-identical.
+
+```bash
+# Optional: pre-populate the cache once (a normal demo/test run also fills it on its first pass).
+QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/generate_weight_cache.py
+
+# Cache to a specific dir (e.g. fast local NVMe) instead of <ckpt>/tt_weight_cache:
+TT_CACHE_PATH=/scratch/qwen36_cache QWEN36_LAYERS=40 \
+    ./python_env/bin/python models/demos/qwen3_6_a3b/demo/demo.py --prompt "Hi" --gen 8 --trace
+```
+
+- **Location:** `$TT_CACHE_PATH` if set, else `<ckpt>/tt_weight_cache/` (~20 GB for 40 layers).
+  Big weights (experts, attention + gated-delta projections, embed, lm_head) are cached; tiny
+  tensors (norms, RoPE, conv taps) convert instantly and are not. On a cache hit the corresponding
+  HF weight is **not read at all**, so the 72 GB safetensors read is skipped too.
+- **Disable / hygiene:** `QWEN36_WEIGHT_CACHE=0` turns it off. Cache files are keyed by name + dtype
+  + layout (so flipping e.g. `QWEN36_LMHEAD_BF4` is safe) but **not** by checkpoint contents —
+  `rm -rf <cache dir>` if you point at a different checkpoint. Any cache failure falls back to a
+  normal from-scratch load with one warning.
+
+### Useful env vars
+
+| var | default | effect |
+|-----|---------|--------|
+| `QWEN36_CKPT` | `~/models/qwen36` | checkpoint dir |
+| `QWEN36_LAYERS` | 40 | number of decoder layers to build |
+| `QWEN36_MAX_SEQ` | 512 | KV/state cache length |
+| `TT_CACHE_PATH` | `<ckpt>/tt_weight_cache` | weight-cache dir |
+| `QWEN36_WEIGHT_CACHE` | 1 | `0` disables the on-disk weight cache |
+| `QWEN36_FUSED_PREFILL` | 1 | `0` falls back to the sequential recurrent scan |
+| `QWEN36_DELTA_IPLUSL` | 1 | `0` uses the fp32 doubling-product inverse |
+| `QWEN36_SPARSE_DECODE` | 0 | `1` uses the gather-top-k decode path (host sync) |
+| `QWEN36_LMHEAD_BF4` | 1 | `0` keeps lm_head in BFP8 |
 
 ## Correctness
 
@@ -64,9 +104,7 @@ dev box — 15 GB RAM, no GPU — so end-to-end correctness rests on per-module 
 
 ## Performance status
 
-Full 40-layer run on a single P150 (text-only, BFP4 experts), measured:
-
-Full 40-layer decode, single P150 (BFP4 experts), measured progression:
+Full 40-layer decode on a single P150 (text-only, BFP4 experts), measured progression:
 
 | path | decode (tok/s/user) |
 |------|---------------------|
@@ -94,14 +132,14 @@ The decode is overhead/dispatch-bound, not weight-bandwidth-bound, so the next l
 reduction (a true 8-of-256 expert-weight gather to avoid the 256-slot scan; a fused Gated-DeltaNet
 decode step) rather than DRAM-sharded matmuls.
 
-**Prefill: fused chunked Gated-DeltaNet kernel (`QWEN36_FUSED_PREFILL=1`).** The sequential recurrent
-scan for the 30 linear layers is replaced by the chunked delta-rule — ttnn per-chunk prep batched over
-all 32 heads + a fused tt-lang `_chunk_state` kernel that runs all heads in one launch (8×4 grid,
-head-dim 128) + `[Dk×Dv]` state carry across chunks. Warm prefill (4-layer, seq 256, same kernel dims
-as 40 layers): **14.1 → 164.7 tok/s (~11.7×)**; matches the chunked reference (PCC ≥ 0.9995), decode is
-unaffected, and 40-layer generation stays coherent. `QWEN36_DELTA_IPLUSL=1` uses the cheap `T≈I+L`
-inverse (vs the fp32 doubling product). The kernel compiles once per shape (~70 s, then disk-cached).
-MoE prefill still uses the dense (all-expert) path.
+**Prefill: fused chunked Gated-DeltaNet kernel (default on; `QWEN36_FUSED_PREFILL=0` disables).** The
+sequential recurrent scan for the 30 linear layers is replaced by the chunked delta-rule — ttnn
+per-chunk prep batched over all 32 heads + a fused tt-lang `_chunk_state` kernel that runs all heads in
+one launch (8×4 grid, head-dim 128) + `[Dk×Dv]` state carry across chunks. Warm prefill: **40-layer seq
+256, 26.4 → 149 tok/s (~5.65×)**; 4-layer microbench ~11.7× (same kernel dims). Matches the chunked
+reference (PCC ≥ 0.9995), decode is unaffected, and 40-layer generation stays coherent. The cheap
+`T≈I+L` inverse is the default (`QWEN36_DELTA_IPLUSL=0` selects the fp32 doubling product). The kernel
+compiles once per shape (~70 s, then disk-cached). MoE prefill still uses the dense (all-expert) path.
 
 Implemented (Phase B), all PCC-gated:
 - On-device Gated-DeltaNet recurrent scan (rank-1 update = batched matmuls) + conv/recurrent state cache.
@@ -114,7 +152,7 @@ Implemented (Phase B), all PCC-gated:
 tensor position, page_table=None), replacing the old O(max_seq) masked write.
 
 Remaining levers (prefill-focused):
-1. **Fused chunked Gated-DeltaNet kernel — DONE (`QWEN36_FUSED_PREFILL=1`, see above).** The chunked
+1. **Fused chunked Gated-DeltaNet kernel — DONE (default on; see above).** The chunked
    delta-rule (`@ttl.operation` `_chunk_state`: intra-chunk `q·kᵀ·decay`, the `(I−L)⁻¹` solve via a
    log-depth blocked inverse, intra/inter contributions, `[Dk×Dv]` state carry) is built in tt-lang
    and integrated into `tt/gated_delta.py` prefill, multi-head over an 8×4 grid at head-dim 128.
