@@ -39,6 +39,14 @@ tests/                     reference smoke + cross-validation + on-device PCC pe
 
 ## Running
 
+> **Blackhole firmware ≥ 19.5.0 required.** On older firmware (observed on bundle **18.8.0**,
+> eth-fw 1.4.2) the flash `scaled_dot_product_attention_decode` op **deadlocks** — the model builds
+> and prefills, then the first decode step hangs forever with the device idle (two Tensix cores stuck
+> in a circular-buffer wait). Upgrading to **19.6.0** (eth-fw ≥ 1.8.1) resolves it. Update with
+> `tt-flash ≥ 3.6.0`: `tt-flash flash fw_pack-19.6.0.fwbundle` (from `tenstorrent/tt-firmware`), then
+> reset. Standalone repro: `tests/repro_sdpa_decode_hang.py` (hangs on affected FW, passes after the
+> upgrade). Check your version with `tt-smi -s`.
+
 Weights are expected at `~/models/qwen36` (override with `QWEN36_CKPT`). Use the tt-metal venv.
 
 ```bash
