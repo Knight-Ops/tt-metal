@@ -80,6 +80,75 @@ TT_CACHE_PATH=/scratch/qwen36_cache QWEN36_LAYERS=40 \
   `rm -rf <cache dir>` if you point at a different checkpoint. Any cache failure falls back to a
   normal from-scratch load with one warning.
 
+### Serving (OpenAI-compatible test server)
+
+`demo/server.py` is a lightweight FastAPI server that exposes the model over the
+OpenAI HTTP API for interactive testing. It is single-batch and **greedy** (decode
+bakes the argmax on-device), so `temperature` / `top_p` / `seed` are accepted for
+compatibility but ignored. Since the model is autoregressive it supports real
+token-by-token SSE streaming (`"stream": true`), unlike the gemma4 diffusion server.
+
+Runtime deps (`fastapi`, `uvicorn`, `loguru`) are already present in the tt-metal
+python_env; nothing extra to install.
+
+```bash
+# launch (opens the 1x1 mesh directly, like demo.py); trace path on by default
+QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/server.py
+
+# smoke endpoints
+curl localhost:8000/health
+curl localhost:8000/v1/models
+
+# non-streaming chat
+curl -s localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"The capital of France is"}],"max_tokens":16}'
+
+# streaming chat (SSE deltas, ends with `data: [DONE]`)
+curl -N localhost:8000/v1/chat/completions -H 'content-type: application/json' \
+  -d '{"messages":[{"role":"user","content":"Tell me a joke"}],"max_tokens":32,"stream":true}'
+
+# raw completion
+curl -s localhost:8000/v1/completions -H 'content-type: application/json' \
+  -d '{"prompt":"Once upon a time","max_tokens":16}'
+```
+
+Generation stops at an EOS id, at `max_tokens`, or before the cache overflows
+`QWEN36_MAX_SEQ` (an over-long prompt returns HTTP 400). Set `QWEN36_SERVER_TRACE=0`
+to use the eager decode path (no per-request trace capture).
+
+### vLLM / tt-inference-server status
+
+`demo/generator_vllm.py` is a **scaffold** of the vLLM `Qwen36ForCausalLM` wrapper
+that tt-inference-server would load. It imports cleanly under a vLLM environment and
+makes the contract explicit, but its forward / kv-cache methods raise
+`NotImplementedError`. The test server above is enough for interactive use; full
+vLLM serving is blocked on the barriers below (the same list lives in the scaffold's
+docstring, keyed to the method that needs each one closed):
+
+1. **Batched / multi-user.** `TtModel` is batch-1 (input `[1, T]`); vLLM drives
+   `max_num_seqs > 1`. A batch dimension must be threaded through prefill + decode.
+2. **Paged KV cache.** Attention layers use a contiguous `[1, n_kv, max_seq, hd]`
+   cache updated at a scalar position (`paged_update_cache`); vLLM owns a paged cache
+   and passes per-layer `page_table` / block tables the model must consume.
+3. **Linear-attention has no KV-cache spec (biggest blocker).** `config.layer_types`
+   contains `linear_attention` (Gated DeltaNet — recurrent state, not attention KV).
+   The hybrid base's `get_kv_cache_spec` only accepts `sliding_attention` /
+   `full_attention` and raises on `linear_attention`; these layers need a recurrent
+   ("Mamba-style") state spec that the TT vLLM plugin must support. Confirm plugin
+   support before committing to the rest.
+4. **Sampling.** Decode bakes greedy argmax on-device and returns only the next token
+   id; vLLM expects host-side sampling from logits (or a verified on-device-sample
+   contract). A logits-returning decode path is needed.
+5. **Generator-base mismatch.** Stock wrappers delegate to `prefill_forward_text` /
+   `decode_forward` on a `tt_transformers.Transformer`; `TtModel` implements neither,
+   so the bridge must be written against this model.
+
+Once those are closed, register `TTQwen3_5MoeForConditionalGeneration` →
+`models.demos.qwen3_6_a3b.demo.generator_vllm:Qwen36ForCausalLM` in the tt-vllm-plugin
+`ModelRegistry`, and add an `ImplSpec` + Blackhole/P150 `ModelSpec`
+(`InferenceEngine.VLLM`, `override_tt_config={"optimizations": "performance"}`) in the
+tt-inference-server workflows.
+
 ### Useful env vars
 
 | var | default | effect |
@@ -87,6 +156,9 @@ TT_CACHE_PATH=/scratch/qwen36_cache QWEN36_LAYERS=40 \
 | `QWEN36_CKPT` | `~/models/qwen36` | checkpoint dir |
 | `QWEN36_LAYERS` | 40 | number of decoder layers to build |
 | `QWEN36_MAX_SEQ` | 512 | KV/state cache length |
+| `QWEN36_SERVER_HOST` | `0.0.0.0` | server bind host (`server.py`) |
+| `QWEN36_SERVER_PORT` | 8000 | server port (`server.py`) |
+| `QWEN36_SERVER_TRACE` | 1 | `0` uses the eager decode path (no trace capture) |
 | `TT_CACHE_PATH` | `<ckpt>/tt_weight_cache` | weight-cache dir |
 | `QWEN36_WEIGHT_CACHE` | 1 | `0` disables the on-disk weight cache |
 | `QWEN36_FUSED_PREFILL` | 1 | `0` falls back to the sequential recurrent scan |
