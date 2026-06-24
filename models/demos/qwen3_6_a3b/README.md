@@ -83,13 +83,19 @@ TT_CACHE_PATH=/scratch/qwen36_cache QWEN36_LAYERS=40 \
 ### Serving (OpenAI-compatible test server)
 
 `demo/server.py` is a lightweight FastAPI server that exposes the model over the
-OpenAI HTTP API for interactive testing. It is single-batch and **greedy** (decode
-bakes the argmax on-device), so `temperature` / `top_p` / `seed` are accepted for
-compatibility but ignored. Since the model is autoregressive it supports real
-token-by-token SSE streaming (`"stream": true`), unlike the gemma4 diffusion server.
+OpenAI HTTP API for interactive testing. It is single-batch. Sampling is honored
+**on device**: `temperature` (with `top_k` / `top_p` / `seed`) drives a chunked
+`ttnn.topk` + `ttnn.sampling` decode tail (no host-side logit readback, fully
+in-trace, ~0.5 ms/token over greedy); `temperature == 0` selects greedy argmax.
+Per OpenAI semantics the `temperature` default is `1.0`, so requests that omit it
+sample at full temperature — pass `"temperature": 0` for deterministic greedy. The
+first token (from prefill) is always greedy argmax; decode tokens are sampled.
+Since the model is autoregressive it supports real token-by-token SSE streaming
+(`"stream": true`), unlike the gemma4 diffusion server.
 
 Runtime deps (`fastapi`, `uvicorn`, `loguru`) are already present in the tt-metal
-python_env; nothing extra to install.
+python_env; nothing extra to install. See [`SAMPLING.md`](SAMPLING.md) for the full
+sampling reference (on-device design, supported params, and the perf breakdown).
 
 ```bash
 # launch (opens the 1x1 mesh directly, like demo.py); trace path on by default
@@ -196,7 +202,12 @@ Decode path = on-device Gated-DeltaNet recurrent scan + state cache, fixed-shape
 whole step is **self-contained on device**: on-device greedy `argmax` (only the next token id comes
 back, not the 248k-vocab logits), RoPE indexed from a device table, position advanced with
 `ttnn.plus_one`, and an O(1) `paged_update_cache` KV write — all captured as one trace and replayed
-per token (host does only `execute_trace` + a 1-element readback).
+per token (host does only `execute_trace` + a 1-element readback). Temperature/top-k/top-p sampling
+(`demo.py --temperature`, or the server's `temperature` field) swaps the `argmax` for a chunked
+`ttnn.topk` + `ttnn.sampling` tail — still fully on device, in-trace, with the RNG seed advanced by
+`ttnn.plus_one` so each replayed step draws fresh randomness (deterministic per seed); ~0.5 ms/token
+over greedy. topk is chunked into power-of-2 (≤32768) vocab pieces because a single topk over the
+full 248k vocab is single-core (~38 ms) while each power-of-2 chunk runs multicore (~0.2 ms).
 
 Profiling the 110 ms/token (real dims, per layer-type): **MoE ≈65% (dispatch-bound — the two
 sparse_matmuls each scan all 256 expert slots), Gated-DeltaNet ≈24%, lm_head ≈8%, attention ≈4%.**

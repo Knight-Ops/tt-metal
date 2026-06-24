@@ -30,16 +30,16 @@ from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_tt
 # delta-rule — ttnn per-chunk prep batched over heads + the fused tt-lang _chunk_state kernel (one
 # launch over all heads per chunk). This is the DEFAULT (5.4-5.7x faster prefill at 40 layers, warm);
 # set QWEN36_FUSED_PREFILL=0 to fall back to the sequential scan. Decode (T=1) always uses the scan.
-# Inverse: T≈I+L by default (fastest, realistic L is tiny -> matches the fp32 doubling product within
-# PCC); set QWEN36_DELTA_IPLUSL=0 for the fp32 doubling-product inverse. First fused prefill compiles
-# the ttl kernel once (~1 min, cached on disk thereafter).
+# Intra-chunk inverse (I-L)^-1: numerically-stable recursive block inversion by default (see
+# _chunk_prep). QWEN36_DELTA_IPLUSL=1 selects the fast T≈I+L approximation (INACCURATE for this
+# model's strong-decay heads -> gibberish; A/B only). The old doubling product is removed (it explodes
+# on real L). First fused prefill compiles the ttl kernel once (~1 min, cached on disk thereafter).
 _FUSED_PREFILL = os.environ.get("QWEN36_FUSED_PREFILL", "1") == "1"
-_DELTA_IPLUSL = os.environ.get("QWEN36_DELTA_IPLUSL", "1") == "1"
+_DELTA_IPLUSL = os.environ.get("QWEN36_DELTA_IPLUSL") == "1"
 # Run the per-chunk prep in bf16 instead of fp32: the prefill is dispatch-bound and the fp32 path adds
-# ~124 typecast ops/forward (up to fp32, back to bf16) plus 2x data movement. The kernel already runs
-# bf16 and the I+L inverse (default) needs no fp32. OFF by default until a 40-layer coherence check
-# confirms cumsum/exp precision; QWEN36_DELTA_BF16_PREP=1 enables. (Keep fp32 if using the opt-in
-# QWEN36_DELTA_IPLUSL=0 doubling-product inverse, which is precision-sensitive.)
+# ~124 typecast ops/forward (up to fp32, back to bf16) plus 2x data movement. OFF by default: the
+# stable recursive inverse + cumsum/exp are precision-sensitive (bf16 prep regresses 40-layer
+# coherence). QWEN36_DELTA_BF16_PREP=1 enables (perf experiments only).
 _PREP_DT = ttnn.bfloat16 if os.environ.get("QWEN36_DELTA_BF16_PREP") == "1" else ttnn.float32
 _CHUNK = 64  # chunk_size, matches reference torch_chunk_gated_delta_rule default
 # Run the per-chunk prep ONCE batched over all chunks (state-independent) instead of Nc sequential
@@ -60,6 +60,25 @@ _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
 # The kernel compiles once per (n_v_heads, n_k_heads, head-dim) shape (~1 min, disk-cached).
 _GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") != "0"
 TILE = 32
+
+# Numerically-stable chunked PREFILL (default on). Two independent issues made the original chunked
+# prefill emit gibberish for prompts >1 chunk on this model's strong-decay heads (g down to ~-92/step,
+# g_cum to ~-5888), while the recurrent scan stayed correct:
+#   (1) The intra-chunk inverse (I-L)^-1. The T≈I+L approximation is wrong when L is O(1), and the
+#       fp32 doubling product (I+L)(I+L^2)...(I+L^32), though exact for nilpotent L, EXPLODES in finite
+#       precision (intermediate L^k have huge singular values that must telescope but don't): we
+#       measured 1e6-1e11 inverses where the true inverse is ~1.0. Fixed unconditionally in _chunk_prep
+#       via stable recursive block inversion (bounded, matches reference; 12 batched matmuls).
+#   (2) The bf16 ttl chunk_state kernel itself: even with a correct inverse, the bf16 chunk-recurrence
+#       (v_new/out/Snew matmuls) accumulates too much error over 30 layers (confirmed still gibberish).
+#       Fix: run the per-chunk recurrence in ttnn at HiFi4 + fp32 accumulation (near-fp32, matching the
+#       reference) — _chunk_state_ttnn. Keeps the chunked parallelism (fast, O(seq/chunk)) and is
+#       numerically correct. The (incoherent) bf16 ttl kernel path stays behind
+#       QWEN36_DELTA_STABLE_PREFILL=0 for perf experiments only.
+_STABLE_PREFILL = os.environ.get("QWEN36_DELTA_STABLE_PREFILL", "1") != "0"
+_HIFI4 = ttnn.WormholeComputeKernelConfig(
+    math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
+)
 
 
 def _l2norm_scale_lastdim(x, scale=None, eps=1e-6):
@@ -150,7 +169,9 @@ class TtGatedDeltaNet(LightweightModule):
             )
         else:
             pad = conv_state
-        xpad = ttnn.concat([pad, mixed], dim=0, memory_config=_MC)  # [T+K-1, conv_dim]
+        # L1 only for the tiny T==1 decode concat; prefill (large T) stays in DRAM (an L1 [T+K-1,
+        # conv_dim] concat is ~33 MB at T=2048 and overflows L1 — the _MC residency is a decode-only win).
+        xpad = ttnn.concat([pad, mixed], dim=0, memory_config=(_MC if T == 1 else None))  # [T+K-1, conv_dim]
         if T == 1:
             # decode: xpad is exactly [K, conv_dim] and out[0] = sum_j xpad[j]*tap[j]. One elementwise
             # multiply against the stacked taps + one row-sum, vs K slices + K multiplies + (K-1) adds
@@ -182,10 +203,30 @@ class TtGatedDeltaNet(LightweightModule):
                 memory_config=ttnn.DRAM_MEMORY_CONFIG,
             )
 
+        # Per-level masks for the numerically-stable recursive block inversion of (I-L) (see _chunk_prep).
+        # Level k (block size s=2^k, half h): BL selects the lower-left h-block of each s-block (the new
+        # off-diagonal corner), A/D the upper-left / lower-right h-diagonal-blocks. log2(C) levels.
+        idx = torch.arange(C)
+        inv_levels = []
+        k = 1
+        while (1 << k) <= C:
+            s = 1 << k
+            h = s >> 1
+            blk = idx // s
+            off = idx % s
+            lower = off >= h
+            same = blk[:, None] == blk[None, :]
+            BL = (lower[:, None] & (~lower)[None, :]) & same
+            A = ((~lower)[:, None] & (~lower)[None, :]) & same
+            D = (lower[:, None] & lower[None, :]) & same
+            inv_levels.append(dict(BL=up(BL.float()), A=up(A.float()), D=up(D.float())))
+            k += 1
+
         self._chunk_masks = dict(
             tril_incl=up(torch.tril(torch.ones(C, C))),  # cumsum/decay causal incl-diag
             strict_lower=up(torch.tril(torch.ones(C, C), diagonal=-1)),  # L strictly-lower mask
             eye=up(torch.eye(C)),  # I for (I-L)^-1
+            inv_levels=inv_levels,
         )
         return self._chunk_masks
 
@@ -208,24 +249,67 @@ class TtGatedDeltaNet(LightweightModule):
         vbeta = ttnn.multiply(v, beta_col)
         kbeta = ttnn.multiply(k, beta_col)
         kT = ttnn.transpose(k, -2, -1)  # [1,Vh,D,C]
-        L = ttnn.multiply(ttnn.multiply(ttnn.multiply(ttnn.matmul(kbeta, kT), decay), strict_lower), -1.0)
+        # prep matmuls (esp. the inverse) always at HiFi4 + fp32 accum: Tensix matmul inputs are bf16,
+        # so default (low) fidelity caps accuracy at ~0.999 vs fp32 — compounding to gibberish over 30
+        # layers. HiFi4 (multi-pass ~fp32) closes that gap. The recursive inverse below is bounded, but
+        # its bf16-input matmuls still need fp32 accumulation to stay accurate.
+        ck = _HIFI4
+        L = ttnn.multiply(
+            ttnn.multiply(ttnn.multiply(ttnn.matmul(kbeta, kT, compute_kernel_config=ck), decay), strict_lower), -1.0
+        )
         if _DELTA_IPLUSL:
-            T = ttnn.add(eye, L)  # T ≈ I+L (L tiny)
+            T = ttnn.add(eye, L)  # T ≈ I+L (fast escape; only valid when L tiny; wrong for real data)
         else:
-            acc = ttnn.add(eye, L)
-            p = L  # fp32 doubling product
-            for _ in range(5):  # C=64 -> L^64=0, 5 squarings
-                p = ttnn.matmul(p, p)
-                acc = ttnn.matmul(acc, ttnn.add(eye, p))
-            T = acc
+            # (I-L)^-1 via numerically-stable recursive block inversion (block Gaussian elimination).
+            # The doubling product (I+L)(I+L^2)...(I+L^32) is mathematically exact for nilpotent L but
+            # numerically EXPLODES on real data: the intermediate L^k have huge entries (large singular
+            # values, despite eigenvalues=0) that must telescope but don't in finite precision -> 1e6-1e11
+            # blow-up while the true inverse is ~1.0. The recursive block form never forms L^k: it merges
+            # h-block inverses pairwise via corner = -D^-1 (M_B) A^-1, staying bounded (max|T|~1.0). All
+            # ops are full-CxC (tile-aligned) batched matmuls + fixed mask multiplies; log2(C) levels.
+            M = ttnn.subtract(eye, L)  # I - L (unit lower-tri)
+            T = ttnn.repeat(
+                eye, ttnn.Shape([1, M.shape[1], 1, 1])
+            )  # identity, batched over heads (matmul needs matching batch)
+            for lv in masks["inv_levels"]:
+                Dp = ttnn.multiply(T, lv["D"])  # lower-right h-block inverses
+                Ap = ttnn.multiply(T, lv["A"])  # upper-left h-block inverses
+                Bp = ttnn.multiply(M, lv["BL"])  # original lower-left h-blocks of M
+                corner = ttnn.multiply(
+                    ttnn.matmul(ttnn.matmul(Dp, Bp, compute_kernel_config=ck), Ap, compute_kernel_config=ck),
+                    lv["BL"],
+                )
+                T = ttnn.add(T, ttnn.multiply(corner, -1.0))
         qg = ttnn.multiply(q, egc_col)
-        w = ttnn.matmul(T, vbeta)
-        kcd = ttnn.matmul(T, ttnn.multiply(kbeta, egc_col))
+        w = ttnn.matmul(T, vbeta, compute_kernel_config=ck)
+        kcd = ttnn.matmul(T, ttnn.multiply(kbeta, egc_col), compute_kernel_config=ck)
         glast_col = ttnn.reshape(ttnn.slice(g_cum, [0, 0, C - 1], [1, Vh, C]), [1, Vh, 1, 1])
         kg = ttnn.multiply(k, ttnn.exp(ttnn.subtract(glast_col, gc_row)))  # per-row decay
         kgt = ttnn.transpose(kg, -2, -1)  # [1,Vh,D,C]
         glast = ttnn.repeat(ttnn.exp(glast_col), ttnn.Shape([1, 1, D, D]))  # [1,Vh,D,D] (kernel: S*glast)
         return dict(q=q, kt=kT, w=w, kcd=kcd, decay=decay, qg=qg, kgt=kgt, glast=glast)
+
+    def _chunk_state_ttnn(self, tc, S):
+        """Numerically-stable (HiFi4 / fp32) ttnn implementation of one chunk's delta-rule recurrence,
+        replacing the bf16 ttl _chunk_state kernel for prefill. Mirrors the kernel math exactly:
+          v_new = w − kcd·S ;  out = qg·S + ((q·kᵀ)⊙decay)·v_new ;  Snew = S·glast + kgtᵀ·v_new.
+        tc: per-chunk prep terms [1,Vh,*,*] (fp32). S: [1,Vh,Dk,Dv] (fp32). Returns (out [1,Vh,C,Dv],
+        Snew [1,Vh,Dk,Dv]), fp32. All matmuls are batched over the head axis at HiFi4 + fp32 accum, so
+        the chunked path matches the fp32 reference (the bf16 kernel only reached ~0.996/layer)."""
+        ck = _HIFI4
+        v_new = ttnn.subtract(tc["w"], ttnn.matmul(tc["kcd"], S, compute_kernel_config=ck))  # [1,Vh,C,Dv]
+        aintra = ttnn.multiply(
+            ttnn.matmul(tc["q"], tc["kt"], compute_kernel_config=ck), tc["decay"]
+        )  # [1,Vh,C,C], causal via decay
+        out = ttnn.add(
+            ttnn.matmul(tc["qg"], S, compute_kernel_config=ck),  # cross-chunk: qg·S
+            ttnn.matmul(aintra, v_new, compute_kernel_config=ck),  # intra-chunk
+        )  # [1,Vh,C,Dv]
+        Snew = ttnn.add(
+            ttnn.multiply(S, tc["glast"]),  # decayed incoming state
+            ttnn.matmul(tc["kgt"], v_new, compute_kernel_config=ck),  # this chunk's update
+        )  # [1,Vh,Dk,Dv]
+        return out, Snew
 
     def _forward_prefill_chunked(self, q, k, v, g, beta, pool=None, init_state=None):
         """Chunked delta-rule prefill. q,k,v:[T,Vh,D]; g,beta:[T,Vh] (g=log decay). Returns
@@ -284,6 +368,12 @@ class TtGatedDeltaNet(LightweightModule):
         else:
             S = ttnn.zeros([Vh * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
 
+        # Numerically-stable ttnn-fp32 chunk-state (eager path only; the traced/pool path keeps the ttl
+        # kernel). State carried as [1,Vh,Dk,Dv] in fp32 for accuracy (see _chunk_state_ttnn).
+        use_stable = _STABLE_PREFILL and pool is None
+        if use_stable:
+            S = ttnn.typecast(ttnn.reshape(S, [1, Vh, Dk, Dv]), _PREP_DT)
+
         Nc = Tp // C
         # The per-chunk prep (cumsum/decay/β-scaling/inverse T/w/kcd) does NOT depend on the recurrent
         # state S (only the ttl _chunk_state kernel consumes S), so all Nc chunks' prep is independent
@@ -334,6 +424,11 @@ class TtGatedDeltaNet(LightweightModule):
                 bc = ttnn.slice(betab, [0, 0, s0], [1, Vh, s0 + C])
                 with prof.phase(self.mesh_device, "delta.prep"):
                     tc = self._chunk_prep(qc, kc, vc, bc, gc, masks)
+            if use_stable:  # ttnn fp32 chunk-state (numerically correct); S stays [1,Vh,Dk,Dv]
+                with prof.phase(self.mesh_device, "delta.kernel"):
+                    out4, S = self._chunk_state_ttnn(tc, S)
+                outs.append(out4)
+                continue
             if pool is not None:  # kernel-written output buffers: pre-allocated (no in-graph zeros)
                 out, Snew = pool["out"][ci], pool["Snew"][ci]
             else:
@@ -359,6 +454,10 @@ class TtGatedDeltaNet(LightweightModule):
         core = ttnn.concat(outs, dim=2)  # [1,Vh,Tp,Dv]
         if pad:
             core = ttnn.slice(core, [0, 0, 0, 0], [1, Vh, T, Dv])
+        if use_stable:  # back to bf16 head-major state + bf16 core (the path's interface)
+            S = ttnn.typecast(ttnn.reshape(S, [Vh * Dk, Dv]), ttnn.bfloat16)
+            if core.dtype != ttnn.bfloat16:
+                core = ttnn.typecast(core, ttnn.bfloat16)
         return core, S
 
     def build_trace_pool(self, T):

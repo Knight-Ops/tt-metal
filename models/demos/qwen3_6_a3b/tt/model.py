@@ -60,6 +60,9 @@ class TtModel(LightweightModule):
         # On-device RoPE tables: cos/sin for every position, indexed by position with ttnn.embedding
         # during decode (no per-token host recompute). Row-major so they act as embedding weights.
         self.cos_table, self.sin_table = self._build_rope_tables()
+        # Token selection is greedy (on-device argmax) by default. enable_sampling() swaps in the
+        # on-device temperature/top-k/top-p sampler; None here means "greedy, zero added cost".
+        self.sampling = None
 
     def _build_rope_tables(self):
         """[max_seq_len, rotary_dim] cos/sin tables (default RoPE), as ROW_MAJOR embedding weights."""
@@ -116,9 +119,22 @@ class TtModel(LightweightModule):
         v = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
         return [k, v]
 
+    # Long prompts are prefilled in chunks via prefill_long (single-shot can't hold full-sequence
+    # activations/attention past ~1-2K). forward() routes there above this length; QWEN36_PREFILL_CHUNK
+    # sets the chunk size. The threshold stays above the chunk so the per-chunk single-shot calls don't recurse.
+    _PREFILL_CHUNK = int(os.environ.get("QWEN36_PREFILL_CHUNK", "512"))
+    _LONG_PREFILL_THRESHOLD = int(os.environ.get("QWEN36_LONG_PREFILL_THRESHOLD", "2048"))
+
     def forward(self, input_ids: torch.Tensor):
-        """Prefill. input_ids: torch [1, T]. Allocates per-layer caches; returns last-token logits
-        [1, 1, vocab]."""
+        """Prefill. input_ids: torch [1, T]. Returns last-token logits [1,1,vocab]. Long prompts
+        (T > threshold) are streamed in chunks via prefill_long; short prompts go single-shot."""
+        if input_ids.shape[1] > self._LONG_PREFILL_THRESHOLD:
+            return self.prefill_long(input_ids)
+        return self._prefill_single(input_ids)
+
+    def _prefill_single(self, input_ids: torch.Tensor):
+        """Single-shot prefill (bounded to short prompts: materializes the full [T,*] activations).
+        Allocates per-layer caches and sets self.pos."""
         T = input_ids.shape[1]
         self.max_seq = self.args.max_seq_len
         self.caches = [self._alloc_cache(layer) for layer in self.layers]
@@ -134,6 +150,30 @@ class TtModel(LightweightModule):
             out = self._head(x, T)
         prof.report()
         return out
+
+    def prefill_long(self, input_ids: torch.Tensor, chunk: int | None = None):
+        """Streamed (chunked) prefill for long prompts — supports the model's full context (up to
+        max_seq_len, e.g. 256K) with memory bounded by the chunk size, not the prompt length. Ingests
+        the prompt in `chunk`-token blocks: the first block via _prefill_single (allocates caches), the
+        rest via forward_incremental (gated-delta carries its O(1) recurrent+conv state; attention fills
+        the KV cache and attends the new block over the accumulated context with chunked SDPA). Leaves
+        caches + self.pos correct for start_decode. Returns the last block's logits [1,1,vocab].
+
+        chunk (default QWEN36_PREFILL_CHUNK=512) must be a multiple of 128 (fill_cache/SDPA alignment);
+        with a multiple of 128 the running offset P is always a multiple of both chunk and k_chunk_size=64,
+        satisfying chunked_scaled_dot_product_attention's chunk_start_idx alignment. MVP: T must be a
+        multiple of chunk (no ragged final block / no padding yet — see plan Phase 1 step 4)."""
+        M = chunk or self._PREFILL_CHUNK
+        T = input_ids.shape[1]
+        assert M % 128 == 0, f"prefill chunk {M} must be a multiple of 128"
+        assert T <= self.args.max_seq_len, f"prompt {T} exceeds max_seq_len {self.args.max_seq_len}"
+        assert T % M == 0, f"MVP: prompt length {T} must be a multiple of chunk {M} (ragged not yet supported)"
+        if T <= M:
+            return self._prefill_single(input_ids)
+        logits = self._prefill_single(input_ids[:, :M])  # first block: allocates caches, self.pos=M
+        for P in range(M, T, M):
+            logits = self.forward_incremental(input_ids[:, P : P + M])  # carries state; self.pos -> P+M
+        return logits
 
     # ---- Traced prefill (additive; mirrors capture_decode_trace). Prefill is ~54% host-dispatch over
     # ~11k tiny ops; replaying a captured graph removes that per-op launch latency. Shape-static, so we
@@ -264,6 +304,64 @@ class TtModel(LightweightModule):
         self.pos = P + M
         return self._head(x, M)
 
+    # Sampling tail constants. ttnn.topk is only multicore (~0.2 ms) for power-of-2 widths <= 32768;
+    # over the full 248k vocab it falls back to single-core (~38 ms). So we chunk the vocab into
+    # SAMP_CHUNK-wide power-of-2 pieces, topk each, then merge. ttnn.sampling is fixed to 32 users.
+    SAMP_CHUNK = 32768
+    SAMP_K = 32  # max_top_k (device limit); also ttnn.sampling's cap
+    SAMP_USERS = 32
+    SAMP_NEG = -1.0e4  # pad fill for the last chunk; below any real logit, so never selected
+
+    def enable_sampling(
+        self, temperature: float, top_k: int = 0, top_p: float = 1.0, seed: int = 0, presence_penalty: float = 0.0
+    ):
+        """Switch token selection from greedy argmax to on-device temperature/top-k/top-p sampling.
+
+        ``temperature == 0`` restores greedy (the default, fastest path: plain ttnn.argmax). Otherwise
+        the decode tail runs chunked ``ttnn.topk`` + ``ttnn.sampling`` fully on device and in-trace
+        (see ``_select_token``), adding ~0.5 ms/token. With ``presence_penalty > 0`` a vocab-sized
+        presence mask (tokens generated so far) is subtracted from the logits before topk
+        (``logits -= presence_penalty * mask``); the mask is scattered/accumulated on device each step,
+        adding ~0.5 ms/token. Call BEFORE start_decode / trace capture so the chosen tail is recorded.
+
+        ttnn.sampling's ``temp`` is 1/T and ``k`` must be in (0, 32]; we clamp accordingly.
+        """
+        if temperature == 0:
+            self.sampling = None  # greedy
+            return
+        self.sampling = True
+        V, CW, K, B = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self.SAMP_USERS
+        nc = (V + CW - 1) // CW  # number of power-of-2 chunks (last is logit-padded to CW)
+        self._presence_penalty = max(presence_penalty, 0.0)
+
+        def _t(vals, dtype, layout=ttnn.ROW_MAJOR_LAYOUT):
+            return ttnn.from_torch(vals, device=self.mesh_device, dtype=dtype, layout=layout)
+
+        # Static (param-independent) buffers, built once.
+        if getattr(self, "_samp_nc", None) != nc:
+            self._samp_nc = nc
+            # per-chunk global-index offset (chunk i -> +i*CW), broadcast across the K kept indices
+            off = (torch.arange(nc, dtype=torch.int32).view(1, 1, nc, 1).expand(1, 1, nc, K).contiguous()) * CW
+            self._samp_offsets = _t(off, ttnn.int32, ttnn.TILE_LAYOUT)
+            # 0..CW-1 indices for topk, replicated per chunk row
+            li = torch.arange(CW, dtype=torch.int32).view(1, 1, 1, CW).expand(1, 1, nc, CW).contiguous()
+            self._samp_local_idx = _t(li, ttnn.uint16, ttnn.TILE_LAYOUT)
+            self._samp_uids = _t(torch.arange(B, dtype=torch.int32), ttnn.uint32)
+            self.t_tok32 = _t(torch.zeros(1, 1, 1, B, dtype=torch.int32), ttnn.uint32)  # rank-4 sampling output
+            # 0..V-1 vocab indices, used to one-hot the sampled token into the presence mask (see below)
+            self._samp_iota = _t(torch.arange(V, dtype=torch.int32).view(1, 1, 1, V), ttnn.int32, ttnn.TILE_LAYOUT)
+
+        k = top_k if 0 < top_k <= K else K  # k in (0, 32]; <=0 ("all") or >32 -> 32
+        p = min(max(top_p, 0.0), 1.0)
+        self.t_k = _t(torch.full((B,), k, dtype=torch.int32), ttnn.uint32)
+        self.t_p = _t(torch.full((B,), p), ttnn.bfloat16)
+        self.t_temp = _t(torch.full((B,), 1.0 / temperature), ttnn.bfloat16)  # ttnn.sampling scales by 1/T
+        # Per-step RNG seed, advanced on device each decode step (plus_one) so a static trace still
+        # draws fresh randomness every replay; deterministic for a fixed starting `seed`.
+        self.t_seed = _t(torch.full((B,), seed, dtype=torch.int32), ttnn.uint32)
+        # Presence mask over the vocab (generated tokens), reset per request, accumulated on device.
+        self.t_presence = _t(torch.zeros(1, 1, 1, V), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+
     def start_decode(self, first_token_id: int):
         """Seed the device-resident decode state from the prefill's first token. After this, drive
         generation with decode_step_eager() (compiles) and/or decode_step_traced()."""
@@ -304,15 +402,52 @@ class TtModel(LightweightModule):
             x = layer.forward_decode(x, cos, sin, cache, self.t_curpos)
         x = self.final_norm.forward(x)
         x = ttnn.reshape(x, [1, self.args.dim])
-        logits = ttnn.linear(x, self.lm_head_w)  # device [1, vocab]
-        # Greedy argmax. The default single-core argmax over the 248k vocab is ~8.4 ms (the lm_head
-        # matmul itself is only ~1.5 ms); the multicore argmax needs a ROW_MAJOR input and runs in
-        # ~0.06 ms, so converting layout first (~0.1 ms) cuts the head stage ~9.9 -> ~1.6 ms/token.
-        logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
-        tok = ttnn.argmax(logits, dim=-1, keepdim=False, use_multicore=True)  # greedy, [1] uint32
-        ttnn.copy(ttnn.to_layout(tok, ttnn.ROW_MAJOR_LAYOUT), self.t_tok)  # next token, in place
+        self._select_token(x)  # lm_head -> argmax (greedy) or topk+sampling; writes self.t_tok
         ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
         ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
+
+    def _select_token(self, x):
+        """Run lm_head on the post-norm hidden state and write the next token id into self.t_tok.
+
+        Greedy (self.sampling is None) is the default and unchanged: the single-core argmax over the
+        248k vocab is ~8.4 ms (the lm_head matmul itself is only ~1.5 ms); the multicore argmax needs
+        a ROW_MAJOR input and runs in ~0.06 ms, so converting layout first (~0.1 ms) cuts the head
+        stage ~9.9 -> ~1.6 ms/token.
+
+        Sampling replaces the argmax tail with chunked on-device topk + ttnn.sampling. topk over the
+        full 248k vocab is single-core (~38 ms); chunking into power-of-2 (<=32768) pieces keeps every
+        topk multicore (~0.2 ms). The expensive lm_head + topk stay 1-row; only the tiny merged
+        candidate set (nc*32 values) is replicated to the 32 users ttnn.sampling requires, and we read
+        the token from row 0. The seed is advanced on device so a captured trace still varies per step."""
+        if self.sampling is None:  # greedy
+            logits = ttnn.linear(x, self.lm_head_w)  # device [1, vocab]
+            logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+            tok = ttnn.argmax(logits, dim=-1, keepdim=False, use_multicore=True)  # [1] uint32
+            ttnn.copy(ttnn.to_layout(tok, ttnn.ROW_MAJOR_LAYOUT), self.t_tok)  # next token, in place
+            return
+        V, CW, K, B, nc = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self.SAMP_USERS, self._samp_nc
+        logits = ttnn.linear(x, self.lm_head_w)  # [1, vocab]  (1-row: lm_head stays cheap)
+        logits = ttnn.reshape(logits, [1, 1, 1, V])
+        if self._presence_penalty > 0:  # discourage repeats: subtract penalty from already-seen tokens
+            logits = ttnn.sub(logits, ttnn.multiply(self.t_presence, self._presence_penalty))
+        logits = ttnn.pad(logits, [(0, 0), (0, 0), (0, 0), (0, nc * CW - V)], value=self.SAMP_NEG)
+        chunks = ttnn.reshape(logits, [1, 1, nc, CW])  # power-of-2 width per row -> multicore topk
+        vals, idxs = ttnn.topk(chunks, k=K, dim=-1, sorted=False, indices_tensor=self._samp_local_idx)
+        gidx = ttnn.add(ttnn.typecast(idxs, ttnn.int32), self._samp_offsets, dtype=ttnn.int32)  # global ids
+        cand_v = ttnn.repeat(ttnn.reshape(vals, [1, 1, 1, nc * K]), ttnn.Shape([1, 1, B, 1]))  # [1,1,32,nc*K]
+        cand_i = ttnn.repeat(ttnn.reshape(gidx, [1, 1, 1, nc * K]), ttnn.Shape([1, 1, B, 1]))
+        cand_i = ttnn.untilize(ttnn.to_memory_config(cand_i, ttnn.DRAM_MEMORY_CONFIG), use_multicore=True)  # RM int32
+        ttnn.manual_seed(seeds=self.t_seed, user_ids=self._samp_uids)
+        ttnn.sampling(cand_v, cand_i, k=self.t_k, p=self.t_p, temp=self.t_temp, output_tensor=self.t_tok32)
+        idx4 = ttnn.reshape(ttnn.slice(self.t_tok32, [0, 0, 0, 0], [1, 1, 1, 1]), [1, 1, 1, 1])  # sampled token
+        ttnn.copy(ttnn.reshape(idx4, [1]), self.t_tok)  # next token, in place
+        if self._presence_penalty > 0:  # mark the new token present: OR a one-hot into the mask.
+            # ``ttnn.scatter`` over the [1,1,1,vocab] mask is ~2 ms (it scans the 32x tile-padded
+            # vocab); an elementwise one-hot (eq vs the iota index buffer) + maximum is ~0.4 ms.
+            idx_t = ttnn.to_layout(ttnn.typecast(idx4, ttnn.int32), ttnn.TILE_LAYOUT)
+            onehot = ttnn.typecast(ttnn.eq(self._samp_iota, idx_t), ttnn.bfloat16)
+            ttnn.maximum(self.t_presence, onehot, output_tensor=self.t_presence)  # in-place OR
+        ttnn.plus_one(self.t_seed)  # fresh RNG next step (trace-safe; validated)
 
     def decode_step_eager(self):
         """Run one decode step eagerly (compiles kernels for trace capture). Returns the next token."""
@@ -327,7 +462,12 @@ class TtModel(LightweightModule):
                 ts += c
             else:  # gated-delta state dict
                 ts += [v for v in c.values()]
-        return ts + [self.t_tok, self.t_curpos, self.t_ropepos]  # generation state advances on device
+        ts += [self.t_tok, self.t_curpos, self.t_ropepos]  # generation state advances on device
+        if self.sampling is not None:
+            ts.append(self.t_seed)  # RNG seed advances each step; snapshot/restore around capture
+            if self._presence_penalty > 0:
+                ts.append(self.t_presence)  # presence mask accumulates each step
+        return ts
 
     def capture_decode_trace(self):
         """Record the self-contained decode graph as a trace. PRECONDITION: at least one

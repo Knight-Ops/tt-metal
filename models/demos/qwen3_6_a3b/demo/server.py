@@ -13,10 +13,15 @@ Unlike the diffusion server, Qwen3.6 is autoregressive, so token-by-token SSE
 streaming is supported (``"stream": true``). The response is OpenAI-shaped and
 additionally carries ``tokens_per_second`` and ``generation_seconds``.
 
-Generation is single-batch and greedy: decode bakes the argmax on-device and only
-returns the next token id (no host-side logits), so ``temperature`` / ``top_p`` are
-accepted for API compatibility but ignored. This is a testing server; for
-multi-user / sampling serving see ``generator_vllm.py`` and the README.
+Generation is single-batch. Sampling is honored on device: ``temperature`` (with
+``top_k`` / ``top_p`` / ``presence_penalty``) drives an on-device topk + ttnn.sampling
+decode tail (no host-side logit readback); ``temperature == 0`` selects greedy argmax.
+The request defaults are Qwen3's recommended "thinking mode" config (temperature 1.0,
+top_k 20, top_p 0.95, presence_penalty 1.5); ``min_p`` / ``repetition_penalty`` are
+accepted but not implemented (their recommended 0.0 / 1.0 are no-ops). Since the default
+temperature is 1.0, requests that omit it sample — pass ``"temperature": 0`` for greedy.
+The first token (from prefill) is always greedy argmax; decode tokens are sampled.
+This is a testing server; for multi-user serving see ``generator_vllm.py``.
 
 Launch (tt-metal python_env), standalone — opens the 1x1 mesh directly like demo.py:
     QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/demo/server.py
@@ -55,13 +60,20 @@ class ChatMessage(BaseModel):
     content: Optional[Union[str, List[Dict[str, Any]]]] = None
 
 
+# Defaults below are Qwen3's recommended "thinking mode" generation config. Of these, temperature,
+# top_k, top_p and presence_penalty are applied on device; min_p and repetition_penalty are accepted
+# for API compatibility but not implemented (their recommended values 0.0 / 1.0 are no-ops anyway).
 class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
-    temperature: float = 1.0  # accepted; decode is on-device greedy argmax (ignored)
-    top_p: float = 1.0  # accepted; ignored (greedy)
-    seed: Optional[int] = None  # accepted; ignored (greedy is deterministic)
+    temperature: float = 1.0  # 0 = greedy argmax; >0 = on-device temperature sampling
+    top_k: int = 20  # 0 (or >32) = 32, the device max
+    top_p: float = 0.95  # nucleus probability
+    min_p: float = 0.0  # accepted; not implemented (0.0 = no-op)
+    presence_penalty: float = 1.5  # subtract from logits of already-generated tokens (on device)
+    repetition_penalty: float = 1.0  # accepted; not implemented (1.0 = no-op)
+    seed: Optional[int] = None  # deterministic per seed; None -> 0
     stream: bool = False
 
 
@@ -70,7 +82,11 @@ class CompletionRequest(BaseModel):
     prompt: str
     max_tokens: Optional[int] = None
     temperature: float = 1.0
-    top_p: float = 1.0
+    top_k: int = 20
+    top_p: float = 0.95
+    min_p: float = 0.0
+    presence_penalty: float = 1.5
+    repetition_penalty: float = 1.0
     seed: Optional[int] = None
     stream: bool = False
 
@@ -140,12 +156,28 @@ class Qwen36Engine:
             ids = self.tokenizer.encode(text, return_tensors="pt").squeeze(0)
         return ids
 
-    def _generate_ids(self, ids: torch.Tensor, max_new: int) -> Iterator[int]:
-        """Core greedy generator: prefill then yield one token id per decode step.
+    def _generate_ids(
+        self,
+        ids: torch.Tensor,
+        max_new: int,
+        temperature: float = 0.0,
+        top_k: int = 0,
+        top_p: float = 1.0,
+        presence_penalty: float = 0.0,
+        min_p: float = 0.0,
+        repetition_penalty: float = 1.0,
+        seed: Optional[int] = None,
+    ) -> Iterator[int]:
+        """Core generator: prefill then yield one token id per decode step.
 
-        Mirrors demo.py's loop. Stops on an EOS id, on ``max_new``, or when the KV /
-        state cache would overflow ``max_seq``. Holds no lock itself — callers serialize.
+        ``temperature == 0`` is greedy argmax (on device); ``> 0`` enables the on-device
+        temperature/top-k/top-p (+ presence_penalty) sampling tail. ``min_p`` and
+        ``repetition_penalty`` are accepted but not implemented (no-ops at their default
+        0.0 / 1.0). Mirrors demo.py's loop. Stops on an EOS id, on ``max_new``, or when the
+        KV / state cache would overflow ``max_seq``. Holds no lock itself — callers serialize.
         """
+        if min_p > 0 or repetition_penalty != 1.0:
+            logger.warning(f"min_p={min_p} / repetition_penalty={repetition_penalty} are not implemented; ignoring.")
         ids = ids.reshape(1, -1)
         prompt_len = int(ids.shape[1])
         if prompt_len >= self.max_seq:
@@ -158,8 +190,12 @@ class Qwen36Engine:
         if budget <= 0:
             return
 
+        # Select greedy vs sampling for this request's decode steps (must precede start_decode
+        # so the captured trace records the right tail). temperature==0 -> greedy.
+        self.model.enable_sampling(temperature, top_k, top_p, seed or 0, presence_penalty)
+
         logits = self.model.forward(ids)  # prefill -> [1, 1, vocab] host logits
-        next_id = int(logits[0, -1].argmax())  # greedy first token
+        next_id = int(logits[0, -1].argmax())  # first token is greedy argmax
         self.model.start_decode(next_id)
 
         traced = False
@@ -176,24 +212,25 @@ class Qwen36Engine:
             else:
                 next_id = self.model.decode_step_eager()
 
-    def generate(self, ids: torch.Tensor, max_new: int):
+    def generate(self, ids: torch.Tensor, max_new: int, **sampling):
         """Drain ``_generate_ids`` into a full completion.
 
+        ``sampling`` = temperature/top_k/top_p/seed (forwarded to ``_generate_ids``).
         Returns (text, completion_tokens, gen_seconds, tokens_per_second).
         """
         t0 = time.time()
-        out_ids = list(self._generate_ids(ids, max_new))
+        out_ids = list(self._generate_ids(ids, max_new, **sampling))
         secs = time.time() - t0
         text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
         tok_s = len(out_ids) / secs if secs > 0 else 0.0
         return text, len(out_ids), secs, tok_s
 
-    def stream_text(self, ids: torch.Tensor, max_new: int) -> Iterator[str]:
+    def stream_text(self, ids: torch.Tensor, max_new: int, **sampling) -> Iterator[str]:
         """Yield incremental decoded text deltas (handles multi-byte tokens by
         re-decoding the running id list and emitting the new suffix)."""
         out_ids: List[int] = []
         prev = ""
-        for tid in self._generate_ids(ids, max_new):
+        for tid in self._generate_ids(ids, max_new, **sampling):
             out_ids.append(tid)
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
             if len(text) > len(prev):
@@ -232,25 +269,25 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _stream_chat(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str) -> Iterator[str]:
+def _stream_chat(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, **sampling) -> Iterator[str]:
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model}
     with eng.lock:
         # first chunk announces the assistant role
         yield _sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-        for piece in eng.stream_text(ids, max_new):
+        for piece in eng.stream_text(ids, max_new, **sampling):
             yield _sse({**base, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
     yield _sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
     yield "data: [DONE]\n\n"
 
 
-def _stream_completion(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str) -> Iterator[str]:
+def _stream_completion(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, **sampling) -> Iterator[str]:
     cid = f"cmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     base = {"id": cid, "object": "text_completion", "created": created, "model": model}
     with eng.lock:
-        for piece in eng.stream_text(ids, max_new):
+        for piece in eng.stream_text(ids, max_new, **sampling):
             yield _sse({**base, "choices": [{"index": 0, "text": piece, "finish_reason": None}]})
     yield _sse({**base, "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]})
     yield "data: [DONE]\n\n"
@@ -265,11 +302,20 @@ def chat_completions(req: ChatCompletionRequest):
     if int(ids.numel()) >= eng.max_seq:
         raise HTTPException(status_code=400, detail=f"prompt too long ({int(ids.numel())} >= {eng.max_seq})")
 
+    sampling = {
+        "temperature": req.temperature,
+        "top_k": req.top_k,
+        "top_p": req.top_p,
+        "presence_penalty": req.presence_penalty,
+        "min_p": req.min_p,
+        "repetition_penalty": req.repetition_penalty,
+        "seed": req.seed,
+    }
     if req.stream:
-        return StreamingResponse(_stream_chat(eng, ids, max_new, model), media_type="text/event-stream")
+        return StreamingResponse(_stream_chat(eng, ids, max_new, model, **sampling), media_type="text/event-stream")
 
     with eng.lock:
-        text, n_tok, secs, tok_s = eng.generate(ids, max_new)
+        text, n_tok, secs, tok_s = eng.generate(ids, max_new, **sampling)
     logger.info(f"[chat] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s")
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
@@ -292,11 +338,22 @@ def completions(req: CompletionRequest):
     if int(ids.numel()) >= eng.max_seq:
         raise HTTPException(status_code=400, detail=f"prompt too long ({int(ids.numel())} >= {eng.max_seq})")
 
+    sampling = {
+        "temperature": req.temperature,
+        "top_k": req.top_k,
+        "top_p": req.top_p,
+        "presence_penalty": req.presence_penalty,
+        "min_p": req.min_p,
+        "repetition_penalty": req.repetition_penalty,
+        "seed": req.seed,
+    }
     if req.stream:
-        return StreamingResponse(_stream_completion(eng, ids, max_new, model), media_type="text/event-stream")
+        return StreamingResponse(
+            _stream_completion(eng, ids, max_new, model, **sampling), media_type="text/event-stream"
+        )
 
     with eng.lock:
-        text, n_tok, secs, tok_s = eng.generate(ids, max_new)
+        text, n_tok, secs, tok_s = eng.generate(ids, max_new, **sampling)
     logger.info(f"[cmpl] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s")
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:12]}",
@@ -328,13 +385,16 @@ def main():
         engine = Qwen36Engine(mesh, ckpt, n_layers, max_seq, use_trace)
         app.state.engine = engine
 
-        # Warm up: first forward JIT-compiles every op (and captures the decode trace),
-        # so the first real request reports a representative tok/s.
-        logger.info("Warming up (one short generation)...")
+        # Warm up: first forward JIT-compiles every op (and captures the decode trace), so the first
+        # real request reports a representative tok/s. Warm BOTH the greedy and the sampling decode
+        # tails (their kernels differ) — the default request samples, so without this the first
+        # sampling request would pay the sampling-kernel compile (~seconds).
+        logger.info("Warming up (greedy + sampling)...")
         t0 = time.time()
         warm_ids = engine.tokenizer.encode("Hello", return_tensors="pt").squeeze(0)
-        _text, n_tok, secs, _tok_s = engine.generate(warm_ids, 4)
-        logger.info(f"Warmup done in {time.time() - t0:.1f}s ({n_tok} tok)")
+        engine.generate(warm_ids, 4)  # greedy tail
+        engine.generate(warm_ids, 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)  # sampling tail
+        logger.info(f"Warmup done in {time.time() - t0:.1f}s")
 
         logger.info(
             f"Serving Qwen3.6-A3B on http://{host}:{port}  "

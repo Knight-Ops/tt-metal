@@ -20,6 +20,7 @@ Run (real weights; ~800 s load at 40 layers, ~80 s at 4):
     QWEN36_LAYERS=4  ./python_env/bin/python models/demos/qwen3_6_a3b/tests/bench_decode.py --iters 300
 Env: QWEN36_LAYERS (default 40), QWEN36_CKPT, QWEN36_MAX_SEQ, QWEN36_LMHEAD_BF4, QWEN36_MOE_NNZ.
 """
+
 from __future__ import annotations
 
 import argparse
@@ -164,7 +165,7 @@ def bench_components(mesh_device, model, args, iters):
 
 
 # --------------------------------------------------------------------------- driver
-def run(mesh_device, n_layers, ckpt, max_seq, seq, iters):
+def run(mesh_device, n_layers, ckpt, max_seq, seq, iters, temperature=0.0, top_k=0, top_p=1.0, presence_penalty=0.0):
     model, args = build_model(mesh_device, n_layers, ckpt, max_seq, seq)
 
     print(f"\n[bench_decode] REAL weights, {n_layers}-layer model, {iters} traced replays\n")
@@ -172,6 +173,23 @@ def run(mesh_device, n_layers, ckpt, max_seq, seq, iters):
     print(f"  === DEFINITIVE full-model decode ({n_layers} layers) ===")
     print(f"  execute_trace (pure device) : {dev_ms:7.2f} ms/token  -> {1000/dev_ms:5.1f} tok/s")
     print(f"  decode_step (incl. readback): {full_ms:7.2f} ms/token  -> {1000/full_ms:5.1f} tok/s/user  <- demo metric")
+
+    if temperature > 0:
+        # Swap the greedy argmax tail for the on-device topk+sampling tail and re-time. Same model,
+        # so the delta vs the greedy number above is purely the sampling head cost.
+        model.enable_sampling(temperature, top_k, top_p, seed=0, presence_penalty=presence_penalty)
+        model.decode_step_eager()  # compile the sampling kernels before capture
+        s_dev_ms, s_full_ms = bench_full_model(mesh_device, model, iters)
+        print(
+            f"\n  === SAMPLING full-model decode (temp={temperature} top_k={top_k or 32} "
+            f"top_p={top_p} presence_penalty={presence_penalty}) ==="
+        )
+        print(f"  execute_trace (pure device) : {s_dev_ms:7.2f} ms/token  -> {1000/s_dev_ms:5.1f} tok/s")
+        print(f"  decode_step (incl. readback): {s_full_ms:7.2f} ms/token  -> {1000/s_full_ms:5.1f} tok/s/user")
+        print(
+            f"  sampling overhead vs greedy : {s_full_ms - full_ms:+7.2f} ms/token "
+            f"({(s_full_ms / full_ms - 1) * 100:+.1f}%)"
+        )
 
     c = bench_components(mesh_device, model, args, iters)
     rows = [
@@ -200,13 +218,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=200)
     ap.add_argument("--seq", type=int, default=8, help="prefill prompt length")
+    ap.add_argument("--temperature", type=float, default=0.0, help=">0 also benches the sampling tail vs greedy")
+    ap.add_argument("--top-k", type=int, default=0, help="top-k for the sampling bench (0/>32 = 32)")
+    ap.add_argument("--top-p", type=float, default=1.0, help="top-p for the sampling bench")
+    ap.add_argument("--presence-penalty", type=float, default=0.0, help="presence penalty for the sampling bench")
     a = ap.parse_args()
     ckpt = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
     n_layers = int(os.environ.get("QWEN36_LAYERS", "40"))
     max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "512"))
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), trace_region_size=200_000_000)
     try:
-        run(mesh, n_layers, ckpt, max_seq, a.seq, a.iters)
+        run(mesh, n_layers, ckpt, max_seq, a.seq, a.iters, a.temperature, a.top_k, a.top_p, a.presence_penalty)
     finally:
         ttnn.close_mesh_device(mesh)
 
