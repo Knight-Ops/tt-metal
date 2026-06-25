@@ -21,6 +21,15 @@ top_k 20, top_p 0.95, presence_penalty 1.5); ``min_p`` / ``repetition_penalty`` 
 accepted but not implemented (their recommended 0.0 / 1.0 are no-ops). Since the default
 temperature is 1.0, requests that omit it sample — pass ``"temperature": 0`` for greedy.
 The first token (from prefill) is always greedy argmax; decode tokens are sampled.
+
+Tool/function calling is supported via Qwen3's native XML format. Pass OpenAI-style ``tools``
+(and optional ``tool_choice``) on ``/v1/chat/completions``; the model's ``<tool_call>`` blocks
+are parsed back into OpenAI ``message.tool_calls`` (with ``finish_reason == "tool_calls"``),
+and assistant ``tool_calls`` / ``role:"tool"`` results in the request history are rendered back
+into the prompt. ``tool_choice`` honors "auto" (default), "none", and a specific
+{"type":"function","function":{"name":...}}; "required" is best-effort (the format is not
+grammar-forced). Because thinking mode is on, chat responses split the model's reasoning into a
+separate ``reasoning_content`` field and return only the post-</think> text as ``content``.
 This is a testing server; for multi-user serving see ``generator_vllm.py``.
 
 Launch (tt-metal python_env), standalone — opens the 1x1 mesh directly like demo.py:
@@ -32,6 +41,7 @@ QWEN36_SERVER_TRACE (1 = capture a decode trace per request for the fast path).
 
 import json
 import os
+import re
 import threading
 import time
 import uuid
@@ -58,6 +68,9 @@ MODEL_ID = "qwen3.6-a3b"
 class ChatMessage(BaseModel):
     role: str
     content: Optional[Union[str, List[Dict[str, Any]]]] = None
+    name: Optional[str] = None  # tool messages: the function name that produced this result
+    tool_call_id: Optional[str] = None  # tool messages: id of the call this result answers
+    tool_calls: Optional[List[Dict[str, Any]]] = None  # assistant messages: prior tool calls (history)
 
 
 # Defaults below are Qwen3's recommended "thinking mode" generation config. Of these, temperature,
@@ -75,6 +88,14 @@ class ChatCompletionRequest(BaseModel):
     repetition_penalty: float = 1.0  # accepted; not implemented (1.0 = no-op)
     seed: Optional[int] = None  # deterministic per seed; None -> 0
     stream: bool = False
+    stop: Optional[Union[str, List[str]]] = None  # up to N stop strings; output truncated before the match
+    # Tool/function calling (Qwen3 native XML format). ``tools`` is the OpenAI list of
+    # {"type":"function","function":{name,description,parameters}}. ``tool_choice`` accepts
+    # "auto" (default), "none" (tools hidden from the model), "required" (best-effort: the model
+    # is told tools exist but the format is not grammar-forced), or {"type":"function",
+    # "function":{"name":...}} to narrow the offered tools to a single function.
+    tools: Optional[List[Dict[str, Any]]] = None
+    tool_choice: Optional[Union[str, Dict[str, Any]]] = None
 
 
 class CompletionRequest(BaseModel):
@@ -89,6 +110,7 @@ class CompletionRequest(BaseModel):
     repetition_penalty: float = 1.0
     seed: Optional[int] = None
     stream: bool = False
+    stop: Optional[Union[str, List[str]]] = None  # up to N stop strings; output truncated before the match
 
 
 def _flatten(content) -> str:
@@ -97,6 +119,192 @@ def _flatten(content) -> str:
     if isinstance(content, str):
         return content
     return "".join(p.get("text", "") for p in content if isinstance(p, dict))
+
+
+# ── Tool-call (de)serialization (Qwen3 native XML format) ──────────────────────
+#
+# Qwen3 emits tool calls as XML, NOT Hermes JSON:
+#     <tool_call>
+#     <function=NAME>
+#     <parameter=PNAME>
+#     VALUE          (raw text for string params; JSON for everything else)
+#     </parameter>
+#     ...
+#     </function>
+#     </tool_call>
+# Thinking mode is on (the prompt ends with "<think>\n"), so generation is:
+#     <reasoning...></think>\n\n<visible text and/or one-or-more <tool_call> blocks>
+# None of <think>/<tool_call>/<function=>/<parameter=> are special tokens, so they survive
+# decode(skip_special_tokens=True) and can be parsed straight from the decoded text.
+
+THINK_END = "</think>"
+TOOL_OPEN = "<tool_call>"
+_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
+_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)\s*</function>", re.DOTALL)
+_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
+
+
+def _coerce_arg(value: str, ptype: Optional[str]):
+    """Recover a parameter's Python value. The template renders string params raw and all
+    other types via tojson, so for non-string params we JSON-parse; on any failure (or an
+    unknown/declared-string type) we keep the raw text."""
+    if ptype == "string":
+        return value
+    try:
+        return json.loads(value)
+    except Exception:
+        return value
+
+
+def _arg_types(tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any]]:
+    """Map function name -> {param name -> declared JSON type} from the request's tools, used
+    to coerce parsed parameter values back to their schema type."""
+    types: Dict[str, Dict[str, Any]] = {}
+    for t in tools or []:
+        fn = t.get("function", t)
+        name = fn.get("name")
+        props = (fn.get("parameters") or {}).get("properties") or {}
+        if name:
+            types[name] = {k: (v or {}).get("type") for k, v in props.items()}
+    return types
+
+
+def _parse_tool_calls(body: str, tools: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
+    """Parse every <tool_call> block in ``body`` into OpenAI tool_calls dicts (arguments as a
+    JSON string, per the OpenAI wire format)."""
+    types = _arg_types(tools)
+    calls: List[Dict[str, Any]] = []
+    for block in _TOOL_CALL_RE.findall(body):
+        m = _FUNCTION_RE.search(block)
+        if not m:
+            continue
+        fname = m.group(1).strip()
+        ptypes = types.get(fname, {})
+        args = {name.strip(): _coerce_arg(val, ptypes.get(name.strip())) for name, val in _PARAM_RE.findall(m.group(2))}
+        calls.append(
+            {
+                "id": f"call_{uuid.uuid4().hex[:24]}",
+                "type": "function",
+                "function": {"name": fname, "arguments": json.dumps(args, ensure_ascii=False)},
+            }
+        )
+    return calls
+
+
+def _norm_stop(stop) -> List[str]:
+    """Normalize the OpenAI ``stop`` field (str | list[str] | None) to a list of non-empty strings."""
+    if stop is None:
+        return []
+    if isinstance(stop, str):
+        return [stop] if stop else []
+    return [s for s in stop if isinstance(s, str) and s]
+
+
+def _earliest_stop(text: str, stops: List[str]) -> Optional[int]:
+    """Index of the earliest occurrence of any stop string in ``text``, or None."""
+    cut: Optional[int] = None
+    for s in stops:
+        i = text.find(s)
+        if i != -1 and (cut is None or i < cut):
+            cut = i
+    return cut
+
+
+def _split_think(text: str):
+    """Split generated text into (reasoning, body) at the closing </think> marker. If absent
+    (model produced no thinking), everything is body."""
+    if THINK_END in text:
+        reasoning, body = text.split(THINK_END, 1)
+        return reasoning.strip(), body.lstrip("\n")
+    return "", text
+
+
+def _parse_chat_output(text: str, tools: Optional[List[Dict[str, Any]]] = None):
+    """Full parse of a completed generation -> (reasoning, visible_content, tool_calls)."""
+    reasoning, body = _split_think(text)
+    tool_calls = _parse_tool_calls(body, tools)
+    content = _TOOL_CALL_RE.sub("", body).strip()
+    return reasoning, content, tool_calls
+
+
+def _normalize_history_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
+    """Convert an OpenAI tool_call from request history into the shape Qwen's chat template
+    expects. The template iterates ``arguments | items`` (a mapping), but OpenAI sends
+    ``arguments`` as a JSON string, so parse it back to a dict."""
+    fn = tc.get("function", tc)
+    args = fn.get("arguments")
+    if isinstance(args, str):
+        try:
+            args = json.loads(args) if args.strip() else {}
+        except Exception:
+            args = {}
+    elif not isinstance(args, dict):
+        args = {}
+    return {"function": {"name": fn.get("name"), "arguments": args}}
+
+
+class _ChatStreamParser:
+    """Incrementally classifies streamed generation as reasoning vs visible content while
+    holding back any tail that could be the start of the ``</think>`` boundary or a
+    ``<tool_call>`` block, so neither leaks into the streamed content. Tool-call XML is parsed
+    once at finish()."""
+
+    def __init__(self, tools: Optional[List[Dict[str, Any]]] = None):
+        self._tools = tools
+        self._full = ""
+        self._think_closed = False
+        self._body_at = 0  # index in _full where the post-</think> body starts
+        self._reason_emit = 0  # chars of reasoning already emitted
+        self._content_emit = 0  # absolute index in _full of content already emitted
+        self._content_started = False
+
+    def _content_delta(self, abs_end: int, events: list):
+        if abs_end <= self._content_emit:
+            return
+        chunk = self._full[self._content_emit : abs_end]
+        self._content_emit = abs_end
+        if not self._content_started:
+            chunk = chunk.lstrip("\n")  # drop the "\n\n" the template puts after </think>
+            if not chunk:
+                return
+            self._content_started = True
+        events.append(("content", chunk))
+
+    def push(self, full: str):
+        """Feed the full decoded text so far; return a list of (kind, delta) events where kind
+        is 'reasoning' or 'content'."""
+        self._full = full
+        events: list = []
+        if not self._think_closed:
+            i = full.find(THINK_END)
+            if i == -1:
+                # still inside reasoning; hold back a tail that might be a partial "</think>"
+                safe = max(0, len(full) - (len(THINK_END) - 1))
+                if safe > self._reason_emit:
+                    events.append(("reasoning", full[self._reason_emit : safe]))
+                    self._reason_emit = safe
+                return events
+            if i > self._reason_emit:
+                events.append(("reasoning", full[self._reason_emit : i]))
+            self._think_closed = True
+            self._body_at = i + len(THINK_END)
+            self._content_emit = self._body_at
+        # body: emit content up to the first <tool_call>, holding back a partial-tag tail
+        j = full.find(TOOL_OPEN, self._body_at)
+        end = j if j != -1 else max(self._body_at, len(full) - (len(TOOL_OPEN) - 1))
+        self._content_delta(end, events)
+        return events
+
+    def finish(self):
+        """Flush any remaining content (up to the first tool call) and parse tool calls.
+        Returns (content_tail, tool_calls)."""
+        body_at = self._body_at if self._think_closed else 0
+        body = self._full[body_at:]
+        j = body.find(TOOL_OPEN)
+        events: list = []
+        self._content_delta(body_at + (j if j != -1 else len(body)), events)
+        content_tail = events[0][1] if events else ""
+        return content_tail, _parse_tool_calls(body, self._tools)
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -159,10 +367,32 @@ class Qwen36Engine:
             pass
         return ids
 
-    def ids_from_messages(self, messages: List[ChatMessage]) -> torch.Tensor:
+    @staticmethod
+    def _select_tools(tools, tool_choice):
+        """Resolve the tools list to actually offer the model given tool_choice. "none" hides
+        all tools; a {"type":"function","function":{"name":...}} choice narrows to that one;
+        otherwise ("auto"/"required"/None) all tools are offered."""
+        if not tools or tool_choice == "none":
+            return None
+        if isinstance(tool_choice, dict):
+            name = (tool_choice.get("function") or {}).get("name")
+            if name:
+                sel = [t for t in tools if (t.get("function", t)).get("name") == name]
+                return sel or tools
+        return tools
+
+    @staticmethod
+    def _to_template_msg(m: ChatMessage) -> Dict[str, Any]:
+        d: Dict[str, Any] = {"role": m.role, "content": _flatten(m.content)}
+        if m.role == "assistant" and m.tool_calls:
+            d["tool_calls"] = [_normalize_history_tool_call(tc) for tc in m.tool_calls]
+        return d
+
+    def ids_from_messages(self, messages: List[ChatMessage], tools=None, tool_choice=None) -> torch.Tensor:
         if self.tokenizer.chat_template:
             out = self.tokenizer.apply_chat_template(
-                [{"role": m.role, "content": _flatten(m.content)} for m in messages],
+                [self._to_template_msg(m) for m in messages],
+                tools=self._select_tools(tools, tool_choice),
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
@@ -202,6 +432,10 @@ class Qwen36Engine:
                 f"prompt length {prompt_len} >= max_seq_len {self.max_seq}; "
                 "raise QWEN36_MAX_SEQ or shorten the prompt"
             )
+        # Finish reason for this generation, refined as we go: "length" unless we hit an EOS id
+        # ("stop") or, in the text layer, a user stop string ("stop"). Read by callers after the
+        # generator is exhausted (generation is serialized under self.lock).
+        self._finish_reason = "length"
         # leave room: prefill consumes prompt_len positions, each decode step consumes one
         budget = min(max_new, self.max_seq - prompt_len - 1)
         if budget <= 0:
@@ -226,6 +460,7 @@ class Qwen36Engine:
         traced = False
         for step in range(budget):
             if next_id in self.eos_ids:
+                self._finish_reason = "stop"
                 return
             yield next_id
             if self.use_trace and not traced:
@@ -237,30 +472,58 @@ class Qwen36Engine:
             else:
                 next_id = self.model.decode_step_eager()
 
-    def generate(self, ids: torch.Tensor, max_new: int, **sampling):
-        """Drain ``_generate_ids`` into a full completion.
+    def _generate_text(self, ids: torch.Tensor, max_new: int, stop=None, **sampling) -> Iterator[str]:
+        """Drive ``_generate_ids`` and yield the cumulative decoded text after each step.
 
-        ``sampling`` = temperature/top_k/top_p/seed (forwarded to ``_generate_ids``).
-        Returns (text, completion_tokens, gen_seconds, tokens_per_second).
-        """
-        t0 = time.time()
-        out_ids = list(self._generate_ids(ids, max_new, **sampling))
-        secs = time.time() - t0
-        text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
-        tok_s = len(out_ids) / secs if secs > 0 else 0.0
-        return text, len(out_ids), secs, tok_s
-
-    def stream_text(self, ids: torch.Tensor, max_new: int, **sampling) -> Iterator[str]:
-        """Yield incremental decoded text deltas (handles multi-byte tokens by
-        re-decoding the running id list and emitting the new suffix)."""
+        Applies user ``stop`` strings: if one appears, the text is truncated just before it,
+        the generation ends, and ``self._finish_reason`` becomes "stop". While streaming, a tail
+        of up to ``maxlen(stop) - 1`` chars is withheld so a stop string spanning a token
+        boundary is never emitted; the final yield flushes it. Also tracks ``self._n_generated``
+        (tokens produced). ``self._finish_reason`` is otherwise set by ``_generate_ids``
+        ("stop" on EOS, "length" on the token budget)."""
+        stops = _norm_stop(stop)
+        hold = max((len(s) for s in stops), default=1) - 1  # withheld tail guards boundary-spanning stops
         out_ids: List[int] = []
-        prev = ""
+        self._n_generated = 0
+        text = ""
         for tid in self._generate_ids(ids, max_new, **sampling):
             out_ids.append(tid)
+            self._n_generated = len(out_ids)
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
-            if len(text) > len(prev):
-                yield text[len(prev) :]
-                prev = text
+            if stops:
+                cut = _earliest_stop(text, stops)
+                if cut is not None:
+                    self._finish_reason = "stop"
+                    yield text[:cut]
+                    return
+                yield text[: max(0, len(text) - hold)]  # hold back a possible partial stop string
+            else:
+                yield text
+        yield text  # flush any withheld tail (no-op when nothing was held back)
+
+    def generate(self, ids: torch.Tensor, max_new: int, stop=None, **sampling):
+        """Drain ``_generate_text`` into a full completion.
+
+        ``sampling`` = temperature/top_k/top_p/seed (forwarded to ``_generate_ids``).
+        Returns (text, completion_tokens, gen_seconds, tokens_per_second, finish_reason).
+        """
+        t0 = time.time()
+        text = ""
+        for text in self._generate_text(ids, max_new, stop=stop, **sampling):
+            pass
+        secs = time.time() - t0
+        n_tok = self._n_generated
+        tok_s = n_tok / secs if secs > 0 else 0.0
+        return text, n_tok, secs, tok_s, self._finish_reason
+
+    def stream_text(self, ids: torch.Tensor, max_new: int, stop=None, **sampling) -> Iterator[str]:
+        """Yield incremental decoded text deltas (handles multi-byte tokens and stop strings by
+        re-decoding the running id list and emitting only the new suffix)."""
+        prev = ""
+        for full in self._generate_text(ids, max_new, stop=stop, **sampling):
+            if len(full) > len(prev):
+                yield full[len(prev) :]
+                prev = full
 
 
 # ── HTTP app ──────────────────────────────────────────────────────────────────
@@ -294,34 +557,53 @@ def _sse(payload: dict) -> str:
     return f"data: {json.dumps(payload)}\n\n"
 
 
-def _stream_chat(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, **sampling) -> Iterator[str]:
+def _stream_chat(
+    eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, tools=None, stop=None, **sampling
+) -> Iterator[str]:
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     base = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": model}
+
+    def chunk(delta, finish=None):
+        return _sse({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
+
+    parser = _ChatStreamParser(tools)
     with eng.lock:
         # first chunk announces the assistant role
-        yield _sse({**base, "choices": [{"index": 0, "delta": {"role": "assistant"}, "finish_reason": None}]})
-        for piece in eng.stream_text(ids, max_new, **sampling):
-            yield _sse({**base, "choices": [{"index": 0, "delta": {"content": piece}, "finish_reason": None}]})
-    yield _sse({**base, "choices": [{"index": 0, "delta": {}, "finish_reason": "stop"}]})
+        yield chunk({"role": "assistant"})
+        for full in eng._generate_text(ids, max_new, stop=stop, **sampling):
+            for kind, delta in parser.push(full):
+                yield chunk({"reasoning_content": delta} if kind == "reasoning" else {"content": delta})
+        content_tail, tool_calls = parser.finish()
+        if content_tail:
+            yield chunk({"content": content_tail})
+        for idx, tc in enumerate(tool_calls):
+            yield chunk(
+                {"tool_calls": [{"index": idx, "id": tc["id"], "type": "function", "function": tc["function"]}]}
+            )
+        finish = "tool_calls" if tool_calls else eng._finish_reason
+    yield chunk({}, finish)
     yield "data: [DONE]\n\n"
 
 
-def _stream_completion(eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, **sampling) -> Iterator[str]:
+def _stream_completion(
+    eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, stop=None, **sampling
+) -> Iterator[str]:
     cid = f"cmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
     base = {"id": cid, "object": "text_completion", "created": created, "model": model}
     with eng.lock:
-        for piece in eng.stream_text(ids, max_new, **sampling):
+        for piece in eng.stream_text(ids, max_new, stop=stop, **sampling):
             yield _sse({**base, "choices": [{"index": 0, "text": piece, "finish_reason": None}]})
-    yield _sse({**base, "choices": [{"index": 0, "text": "", "finish_reason": "stop"}]})
+        finish = eng._finish_reason
+    yield _sse({**base, "choices": [{"index": 0, "text": "", "finish_reason": finish}]})
     yield "data: [DONE]\n\n"
 
 
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
     eng: Qwen36Engine = app.state.engine
-    ids = eng.ids_from_messages(req.messages)
+    ids = eng.ids_from_messages(req.messages, tools=req.tools, tool_choice=req.tool_choice)
     max_new = _default_max_new(eng, req.max_tokens)
     model = req.model or MODEL_ID
     if int(ids.numel()) >= eng.max_seq:
@@ -336,18 +618,34 @@ def chat_completions(req: ChatCompletionRequest):
         "repetition_penalty": req.repetition_penalty,
         "seed": req.seed,
     }
+    stop = _norm_stop(req.stop)
     if req.stream:
-        return StreamingResponse(_stream_chat(eng, ids, max_new, model, **sampling), media_type="text/event-stream")
+        return StreamingResponse(
+            _stream_chat(eng, ids, max_new, model, tools=req.tools, stop=stop, **sampling),
+            media_type="text/event-stream",
+        )
 
     with eng.lock:
-        text, n_tok, secs, tok_s = eng.generate(ids, max_new, **sampling)
-    logger.info(f"[chat] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s")
+        text, n_tok, secs, tok_s, finish = eng.generate(ids, max_new, stop=stop, **sampling)
+    # Split the raw generation into reasoning / visible content / tool calls (the tool/think
+    # markers are plain text, so they survive decode and are parsed here).
+    reasoning, content, tool_calls = _parse_chat_output(text, req.tools)
+    message: Dict[str, Any] = {"role": "assistant", "content": content or None}
+    if reasoning:
+        message["reasoning_content"] = reasoning
+    if tool_calls:
+        message["tool_calls"] = tool_calls
+        finish = "tool_calls"
+    logger.info(
+        f"[chat] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s"
+        + (f" ({len(tool_calls)} tool call(s))" if tool_calls else "")
+    )
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "message": {"role": "assistant", "content": text}, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "message": message, "finish_reason": finish}],
         "usage": _usage(int(ids.numel()), n_tok),
         "tokens_per_second": round(tok_s, 2),
         "generation_seconds": round(secs, 3),
@@ -372,20 +670,21 @@ def completions(req: CompletionRequest):
         "repetition_penalty": req.repetition_penalty,
         "seed": req.seed,
     }
+    stop = _norm_stop(req.stop)
     if req.stream:
         return StreamingResponse(
-            _stream_completion(eng, ids, max_new, model, **sampling), media_type="text/event-stream"
+            _stream_completion(eng, ids, max_new, model, stop=stop, **sampling), media_type="text/event-stream"
         )
 
     with eng.lock:
-        text, n_tok, secs, tok_s = eng.generate(ids, max_new, **sampling)
+        text, n_tok, secs, tok_s, finish = eng.generate(ids, max_new, stop=stop, **sampling)
     logger.info(f"[cmpl] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s")
     return {
         "id": f"cmpl-{uuid.uuid4().hex[:12]}",
         "object": "text_completion",
         "created": int(time.time()),
         "model": model,
-        "choices": [{"index": 0, "text": text, "finish_reason": "stop"}],
+        "choices": [{"index": 0, "text": text, "finish_reason": finish}],
         "usage": _usage(int(ids.numel()), n_tok),
         "tokens_per_second": round(tok_s, 2),
         "generation_seconds": round(secs, 3),
