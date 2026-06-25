@@ -90,17 +90,22 @@ class TtDecoderLayer(LightweightModule):
         h = self.post_norm.forward(x)
         return ttnn.add(x, self.moe.forward(h))
 
-    def forward_prefill_incremental(self, x, cos, sin, cache, page_table, P):
+    def forward_prefill_incremental(self, x, cos, sin, cache, page_table, P, valid_len=None, q_chunk=None):
         """Incremental prefill of new tokens continuing from the cache (offset P). Gated-delta starts
         its recurrent state from the cached state (and conv from the cached conv tail); attention
-        attends the new tokens over the accumulated KV cache. MoE is per-token (unchanged)."""
+        attends the new tokens over the accumulated KV cache. MoE is per-token (unchanged).
+
+        valid_len (ragged final block): the real leading-token count. Gated-delta processes only those
+        (state stays correct); attention runs the full padded block (causal + the caller reads only the
+        real last token, and decode never reads the padded KV rows past self.pos). q_chunk: chunked-SDPA
+        q_chunk_size override for the ragged block (so P stays a multiple of it)."""
         h = self.input_norm.forward(x)
         if self.is_linear:
             m = self.mixer
             init = ttnn.reshape(cache["recurrent_state"], [m.num_v_heads * m.head_k_dim, m.head_v_dim])
-            h = m.forward(h, cache=cache, init_state=init)
+            h = m.forward(h, cache=cache, init_state=init, valid_len=valid_len)
         else:
-            h = self.mixer.forward_prefill_incremental(h, cos, sin, cache, page_table, P)
+            h = self.mixer.forward_prefill_incremental(h, cos, sin, cache, page_table, P, q_chunk=q_chunk)
         x = ttnn.add(x, h)
         h = self.post_norm.forward(x)
         return ttnn.add(x, self.moe.forward(h))

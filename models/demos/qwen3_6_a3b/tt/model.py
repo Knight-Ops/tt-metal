@@ -63,6 +63,10 @@ class TtModel(LightweightModule):
         # Token selection is greedy (on-device argmax) by default. enable_sampling() swaps in the
         # on-device temperature/top-k/top-p sampler; None here means "greedy, zero added cost".
         self.sampling = None
+        # Captured decode trace (one at a time). Re-captured per request; the PRIOR trace is released
+        # first (capture_decode_trace) so traces never accumulate — that accumulation, together with
+        # per-request cache reallocation, was the leak that OOMed the server.
+        self.trace_id = None
 
     def _build_rope_tables(self):
         """[max_seq_len, rotary_dim] cos/sin tables (default RoPE), as ROW_MAJOR embedding weights."""
@@ -119,6 +123,16 @@ class TtModel(LightweightModule):
         v = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
         return [k, v]
 
+    def _reset_linear_state(self):
+        """Zero the gated-delta conv left-pad in place so a REUSED cache behaves like a freshly
+        allocated one for a fresh (non-continuation) prefill. Only conv_state needs it: the fused
+        prefill starts the recurrent state at S=0 internally and overwrites recurrent_state
+        (gated_delta.py), and the KV cache is filled 0..T-1 and read only up to self.pos. In-place
+        (no allocation), so it is safe to call while a captured trace is live."""
+        for c in self.caches:
+            if isinstance(c, dict) and "conv_state" in c:
+                ttnn.multiply(c["conv_state"], 0.0, output_tensor=c["conv_state"])
+
     # Long prompts are prefilled in chunks via prefill_long (single-shot can't hold full-sequence
     # activations/attention past ~1-2K). forward() routes there above this length; QWEN36_PREFILL_CHUNK
     # sets the chunk size. The threshold stays above the chunk so the per-chunk single-shot calls don't recurse.
@@ -137,7 +151,14 @@ class TtModel(LightweightModule):
         Allocates per-layer caches and sets self.pos."""
         T = input_ids.shape[1]
         self.max_seq = self.args.max_seq_len
-        self.caches = [self._alloc_cache(layer) for layer in self.layers]
+        # Allocate per-layer caches ONCE and reuse them across prefills (the same _pf_caches_ready
+        # guard the traced-prefill path uses). Reallocating per request was the OOM: the decode
+        # trace pins the caches it references, so the old ones could never be freed.
+        if getattr(self, "caches", None) is None or not getattr(self, "_pf_caches_ready", False):
+            self.caches = [self._alloc_cache(layer) for layer in self.layers]
+            self._pf_caches_ready = True
+        else:
+            self._reset_linear_state()  # fresh prefill: clear the gated-delta conv left-pad
         self.pos = T
         prof.reset()
         with prof.phase(self.mesh_device, "embed"):
@@ -161,18 +182,23 @@ class TtModel(LightweightModule):
 
         chunk (default QWEN36_PREFILL_CHUNK=512) must be a multiple of 128 (fill_cache/SDPA alignment);
         with a multiple of 128 the running offset P is always a multiple of both chunk and k_chunk_size=64,
-        satisfying chunked_scaled_dot_product_attention's chunk_start_idx alignment. MVP: T must be a
-        multiple of chunk (no ragged final block / no padding yet — see plan Phase 1 step 4)."""
+        satisfying chunked_scaled_dot_product_attention's chunk_start_idx alignment. T need NOT be a
+        multiple of chunk: the leftover final block (T mod chunk) is ingested as a ragged
+        forward_incremental block (right-padded to a 128-multiple internally for attention; gated-delta
+        processes only the real tokens via valid_len). Every offset P passed to a block is still a
+        multiple of chunk, so the chunk-start alignment holds."""
         M = chunk or self._PREFILL_CHUNK
         T = input_ids.shape[1]
         assert M % 128 == 0, f"prefill chunk {M} must be a multiple of 128"
         assert T <= self.args.max_seq_len, f"prompt {T} exceeds max_seq_len {self.args.max_seq_len}"
-        assert T % M == 0, f"MVP: prompt length {T} must be a multiple of chunk {M} (ragged not yet supported)"
         if T <= M:
             return self._prefill_single(input_ids)
         logits = self._prefill_single(input_ids[:, :M])  # first block: allocates caches, self.pos=M
-        for P in range(M, T, M):
+        n_full = (T // M) * M  # tokens covered by whole M-token chunks
+        for P in range(M, n_full, M):
             logits = self.forward_incremental(input_ids[:, P : P + M])  # carries state; self.pos -> P+M
+        if T > n_full:  # ragged final block (T mod M tokens); forward_incremental pads it internally
+            logits = self.forward_incremental(input_ids[:, n_full:T], ragged=True)
         return logits
 
     # ---- Traced prefill (additive; mirrors capture_decode_trace). Prefill is ~54% host-dispatch over
@@ -285,24 +311,47 @@ class TtModel(LightweightModule):
         self.pos = T
         return self._head(self._pf_out[B], T)  # head slices the REAL last token (T-1), not the bucket
 
-    def forward_incremental(self, input_ids: torch.Tensor):
-        """Incremental (from-cache) prefill for multi-turn / long context: ingest M NEW tokens
-        continuing from the existing caches (self.pos = current context length P), instead of
-        re-prefilling the whole P+M context. Requires a prior forward()/forward_incremental() to have
-        populated the caches. M and P must be multiples of 128 (chunked-SDPA + fill_cache alignment).
-        Updates the caches + self.pos; returns the last NEW token's logits [1,1,vocab]. Eager."""
+    def forward_incremental(self, input_ids: torch.Tensor, ragged: bool = False):
+        """Incremental (from-cache) prefill of M NEW tokens continuing from the existing caches
+        (self.pos = current context length P), instead of re-prefilling the whole P+M context.
+        Requires a prior forward()/forward_incremental() to have populated the caches. P and M must be
+        multiples of 128 (chunked-SDPA + fill_cache alignment). Updates caches + self.pos; returns the
+        last NEW token's logits [1,1,vocab]. Eager.
+
+        ragged=True (the final block of a long prompt, size M not 128-aligned): the block is right-
+        padded to a multiple of 128 so attention's fill_cache/SDPA stay aligned, gated-delta is told
+        the real length (valid_len) so it updates state over real tokens only, and chunked-SDPA uses
+        q_chunk_size=128 (P is a multiple of the chunk => of 128, so P % q_chunk_size == 0 holds; the
+        block width M_pad is also a multiple of 128). self.pos advances by the REAL M and the head
+        reads the real last token, so the padded KV rows (past self.pos) are never read."""
         M = input_ids.shape[1]
         P = self.pos
+        if ragged:
+            M_pad = ((M + 127) // 128) * 128  # minimal 128-multiple padding (bounds extra KV rows)
+            valid = M if M_pad != M else None  # tell gated-delta the real length when we padded
+            q_chunk = 128  # q_chunk_size that divides P (multiple of the chunk) and M_pad
+            assert P + M_pad <= self.max_seq, (
+                f"ragged block overflows the KV cache: P({P}) + padded_M({M_pad}) > max_seq({self.max_seq}); "
+                f"raise QWEN36_MAX_SEQ to a multiple of 128 >= {((P + M + 127) // 128) * 128}"
+            )
+            if M_pad != M:
+                padded = torch.zeros(1, M_pad, dtype=input_ids.dtype)
+                padded[0, :M] = input_ids[0]
+                input_ids = padded
+        else:
+            M_pad, valid, q_chunk = M, None, None  # full chunk: already aligned, unchanged path
         if not hasattr(self, "_inc_page_table"):  # trivial single-block page table (built once)
             self._inc_page_table = to_tt(
                 torch.zeros(1, 32, dtype=torch.int32), self.mesh_device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT
             )
-        x = self._embed(input_ids, M)
-        cos, sin = precompute_rope(M, self.args.rotary_dim, self.args.rope_theta, self.mesh_device, start_pos=P)
+        x = self._embed(input_ids, M_pad)
+        cos, sin = precompute_rope(M_pad, self.args.rotary_dim, self.args.rope_theta, self.mesh_device, start_pos=P)
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_prefill_incremental(x, cos, sin, cache, self._inc_page_table, P)
-        self.pos = P + M
-        return self._head(x, M)
+            x = layer.forward_prefill_incremental(
+                x, cos, sin, cache, self._inc_page_table, P, valid_len=valid, q_chunk=q_chunk
+            )
+        self.pos = P + M  # advance by the REAL token count (not the padded width)
+        return self._head(x, M)  # slice the real last token (index M-1)
 
     # Sampling tail constants. ttnn.topk is only multicore (~0.2 ms) for power-of-2 widths <= 32768;
     # over the full 248k vocab it falls back to single-core (~38 ms). So we chunk the vocab into
@@ -473,7 +522,14 @@ class TtModel(LightweightModule):
         """Record the self-contained decode graph as a trace. PRECONDITION: at least one
         decode_step_eager() has run so all kernels are compiled (capture must not JIT). The decode
         state (caches + token + positions) is snapshotted and restored so recording the dummy step
-        doesn't perturb generation. After this, drive every real step through decode_step_traced()."""
+        doesn't perturb generation. After this, drive every real step through decode_step_traced().
+
+        Releases any PRIOR decode trace first: traces are captured per request, and without the
+        release the device's trace region accumulates one trace per request (and pins the buffers
+        each references) — that, with per-request cache reallocation, was the OOM. Persistent caches
+        (reused across requests) + this release keep device memory flat."""
+        if self.trace_id is not None:
+            ttnn.release_trace(self.mesh_device, self.trace_id)
         snap = [ttnn.clone(t) for t in self._state_tensors()]
         self.trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         self._decode_graph()

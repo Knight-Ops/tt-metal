@@ -150,20 +150,26 @@ class TtAttention(LightweightModule):
         attn = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         return self._out(attn, gate, S)
 
-    def forward_prefill_incremental(self, x, cos, sin, kv_cache, page_table, chunk_start):
+    def forward_prefill_incremental(self, x, cos, sin, kv_cache, page_table, chunk_start, q_chunk=None):
         """Incremental prefill: ingest the new tokens (x: [1,1,M,hidden]) at absolute offset
         chunk_start (P) and attend over the ACCUMULATED KV cache [0:P+M]. cos/sin are RoPE at offset P.
         The flat cache [1,n_kv,max_seq,head_dim] is used directly as a single-block paged cache
-        (max_blocks=1, block_s=max_seq) with a trivial page_table. P (and M) must be chunk-aligned (128).
-        Eager (int chunk_start); the traced variant needs paged_fill_cache + chunk_start_idx_tensor."""
+        (max_blocks=1, block_s=max_seq) with a trivial page_table.
+        Eager (int chunk_start); the traced variant needs paged_fill_cache + chunk_start_idx_tensor.
+
+        chunked-SDPA requires chunk_start (P) to be a multiple of q_chunk_size. For full chunks
+        q_chunk_size defaults to M (P is a multiple of the chunk size). For a RAGGED final block the
+        caller passes q_chunk (=128): P is always a multiple of the chunk (=> of 128) and M is padded
+        to a multiple of 128, so both alignment constraints hold."""
         M = x.shape[2]
+        qc = q_chunk or M
         q, k, v, gate = self._qkv(x, cos, sin)
         ttnn.fill_cache(kv_cache[0], k, 0, update_idx=chunk_start)  # write new K/V at rows P..P+M-1
         ttnn.fill_cache(kv_cache[1], v, 0, update_idx=chunk_start)
         # k_chunk_size=64 bounds chunked-SDPA L1 at long context (head_dim=256 is large); also lets the
-        # offset P be a multiple of 64 (vs 128). q_chunk_size=M (the new-token block, chunk-aligned).
+        # offset P be a multiple of 64 (vs 128). q_chunk_size=qc (M for full chunks; 128 for ragged).
         pc = ttnn.SDPAProgramConfig(
-            compute_with_storage_grid_size=ttnn.CoreCoord(8, 8), exp_approx_mode=False, q_chunk_size=M, k_chunk_size=64
+            compute_with_storage_grid_size=ttnn.CoreCoord(8, 8), exp_approx_mode=False, q_chunk_size=qc, k_chunk_size=64
         )
         attn = ttnn.transformer.chunked_scaled_dot_product_attention(
             q, kv_cache[0], kv_cache[1], page_table, chunk_start_idx=chunk_start, scale=self.scale, program_config=pc

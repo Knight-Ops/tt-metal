@@ -112,6 +112,12 @@ class Qwen36Engine:
         self.mesh_device = mesh_device
         self.max_seq = max_seq
         self.use_trace = use_trace
+        # Decode tracing (captured once, replayed per request) is the OOM fix and is on with use_trace.
+        # Prefill tracing is a separate, EXPERIMENTAL opt-in (QWEN36_SERVER_PREFILL_TRACE=1): the
+        # bucketed traced-prefill path is faster and allocation-free, but currently wedges the device
+        # at larger buckets (e.g. 256) — under investigation. Default off: the server uses reliable
+        # eager prefill (which reuses the persistent caches, so it does NOT leak/OOM either).
+        self.use_prefill_trace = use_trace and os.environ.get("QWEN36_SERVER_PREFILL_TRACE", "0") == "1"
 
         self.tokenizer = AutoTokenizer.from_pretrained(ckpt)
         self.eos_ids = self._resolve_eos_ids(ckpt)
@@ -123,6 +129,17 @@ class Qwen36Engine:
         self.model = TtModel(mesh_device, args, loader, num_layers=n_layers)
         logger.info(f"Qwen3.6 model built in {time.time() - t0:.1f}s")
         self.lock = threading.Lock()
+
+    def warmup(self):
+        """Warm up both decode tails (their kernels differ): the first forward JIT-compiles every op
+        and captures the decode trace, so the first real request reports representative tok/s. The
+        default request samples, so without warming the sampling tail the first sampling request
+        would pay the sampling-kernel compile (~seconds). Each generate() captures (and releases the
+        prior) decode trace; persistent caches + that release keep device memory flat across
+        requests (the OOM fix)."""
+        warm_ids = self.tokenizer.encode("Hello", return_tensors="pt").squeeze(0)
+        self.generate(warm_ids, 4)  # greedy tail
+        self.generate(warm_ids, 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)  # sampling tail
 
     def _resolve_eos_ids(self, ckpt: str) -> set:
         ids = set()
@@ -194,10 +211,18 @@ class Qwen36Engine:
         # so the captured trace records the right tail). temperature==0 -> greedy.
         self.model.enable_sampling(temperature, top_k, top_p, seed or 0, presence_penalty)
 
-        logits = self.model.forward(ids)  # prefill -> [1, 1, vocab] host logits
+        # Prefill: eager by default (reuses persistent caches -> no leak); bucketed traced replay
+        # only when the experimental QWEN36_SERVER_PREFILL_TRACE flag is set.
+        if self.use_prefill_trace:
+            logits = self.model.forward_prefill_traced(ids)  # prefill -> [1, 1, vocab] host logits
+        else:
+            logits = self.model.forward(ids)
         next_id = int(logits[0, -1].argmax())  # first token is greedy argmax
         self.model.start_decode(next_id)
 
+        # Capture the decode trace on this request's first step, then replay it for the rest. The
+        # capture RELEASES the prior request's trace (see capture_decode_trace) so traces don't
+        # accumulate; combined with persistent caches, device memory stays flat (no OOM).
         traced = False
         for step in range(budget):
             if next_id in self.eos_ids:
@@ -385,15 +410,14 @@ def main():
         engine = Qwen36Engine(mesh, ckpt, n_layers, max_seq, use_trace)
         app.state.engine = engine
 
-        # Warm up: first forward JIT-compiles every op (and captures the decode trace), so the first
-        # real request reports a representative tok/s. Warm BOTH the greedy and the sampling decode
-        # tails (their kernels differ) — the default request samples, so without this the first
-        # sampling request would pay the sampling-kernel compile (~seconds).
+        # Warm up both decode tails (greedy + sampling) so the first real request reports
+        # representative tok/s. Each request (re)captures its decode trace and RELEASES the prior one,
+        # and the per-layer caches are allocated once and reused — so device memory stays flat and the
+        # server no longer OOMs after a few requests. (A single benign allocator.cpp:110 "active
+        # trace" notice may still print once per thread; it is cosmetic — see capture_decode_trace.)
         logger.info("Warming up (greedy + sampling)...")
         t0 = time.time()
-        warm_ids = engine.tokenizer.encode("Hello", return_tensors="pt").squeeze(0)
-        engine.generate(warm_ids, 4)  # greedy tail
-        engine.generate(warm_ids, 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)  # sampling tail
+        engine.warmup()
         logger.info(f"Warmup done in {time.time() - t0:.1f}s")
 
         logger.info(

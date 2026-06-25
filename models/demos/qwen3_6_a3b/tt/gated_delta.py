@@ -478,13 +478,23 @@ class TtGatedDeltaNet(LightweightModule):
             "valid": ttnn.zeros([1, 1, T], dtype=_PREP_DT, layout=ttnn.TILE_LAYOUT, device=self.mesh_device),
         }
 
-    def forward(self, x, cache=None, pool=None, init_state=None):
+    def forward(self, x, cache=None, pool=None, init_state=None, valid_len=None):
         """x: [1,1,T,hidden]. If cache (dict with conv_state/recurrent_state) given, continues from it.
         Returns [1,1,T,hidden]; updates cache in place when provided. pool: pre-allocated trace buffers
         (traced prefill only). init_state: head-major [Vh*Dk,Dv] starting recurrent state for incremental
-        prefill (continue a prior context); conv likewise continues from the cached conv_state."""
-        T = x.shape[2]
+        prefill (continue a prior context); conv likewise continues from the cached conv_state.
+
+        valid_len: for a RAGGED incremental block, the number of real LEADING tokens (the remaining
+        rows are right-padding the caller added so attention gets a tile-aligned block). Gated-delta
+        handles any length natively, so we drop the padding here and process only the real rows — this
+        keeps conv_state/recurrent_state updated over real tokens only — then right-pad the output back
+        so the residual stream stays width T_full."""
+        T_full = x.shape[2]
         hidden = x.shape[3]
+        ragged = valid_len is not None and valid_len < T_full
+        if ragged:
+            x = ttnn.slice(x, [0, 0, 0, 0], [1, 1, valid_len, hidden])  # keep only the real tokens
+        T = x.shape[2]
         x2 = ttnn.reshape(x, [T, hidden])
         # Decode (T==1) keeps the tiny intermediates L1-resident (QWEN36_GDN_L1): measured to cut the
         # gated-delta step, since the decode path is many tiny dispatch-bound ops, not DRAM-bandwidth.
@@ -584,7 +594,10 @@ class TtGatedDeltaNet(LightweightModule):
         core = self.norm.forward(core, z_r)
         core = ttnn.reshape(core, [T, self.value_dim])
         y = ttnn.linear(core, self.w_out, memory_config=mc)
-        return ttnn.reshape(y, [1, 1, T, hidden])
+        y = ttnn.reshape(y, [1, 1, T, hidden])
+        if ragged:  # restore the padded width (pad rows are unused downstream; head reads the real last)
+            y = ttnn.pad(y, [(0, 0), (0, 0), (0, T_full - T), (0, 0)], value=0.0)
+        return y
 
     def _forward_decode_fused(self, q, k, v, z, ba, cache, hidden):
         """Fused single-step (T=1) decode: one ttl launch (decode_step_tt) does l2norm(q)*scale +
