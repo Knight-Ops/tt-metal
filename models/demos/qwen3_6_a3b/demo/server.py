@@ -139,9 +139,22 @@ def _flatten(content) -> str:
 
 THINK_END = "</think>"
 TOOL_OPEN = "<tool_call>"
+FUNC_OPEN = "<function="
+FUNC_CLOSE = "</function>"
+PARAM_OPEN = "<parameter="
+PARAM_CLOSE = "</parameter>"
+TC_CLOSE = "</tool_call>"
+_VALUE_HOLDBACK = len("\n" + PARAM_CLOSE) - 1  # withhold this many chars so a forming close never leaks
 _TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
 _FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)\s*</function>", re.DOTALL)
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
+
+
+def _json_str_frag(s: str) -> str:
+    """JSON-escape a fragment of a string for placement between quotes. JSON string escaping is
+    per-character, so escaping fragments independently and concatenating equals escaping the
+    whole string — which is what lets us stream a string argument value as it is produced."""
+    return json.dumps(s, ensure_ascii=False)[1:-1]
 
 
 def _coerce_arg(value: str, ptype: Optional[str]):
@@ -244,19 +257,54 @@ def _normalize_history_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
 
 
 class _ChatStreamParser:
-    """Incrementally classifies streamed generation as reasoning vs visible content while
-    holding back any tail that could be the start of the ``</think>`` boundary or a
-    ``<tool_call>`` block, so neither leaks into the streamed content. Tool-call XML is parsed
-    once at finish()."""
+    """Incrementally turns Qwen3's streamed generation into OpenAI-shaped deltas:
+
+      reasoning text   -> ("reasoning", str)
+      visible text     -> ("content", str)
+      <tool_call> XML  -> ("tool", openai_tool_call_delta)
+
+    Crucially the tool call is emitted *as it is produced* (function name first, then the
+    arguments JSON built fragment-by-fragment) rather than buffered until generation ends — so a
+    client sees a large tool argument (e.g. a whole file written via a tool) stream live instead
+    of after minutes of silence. String-typed arguments stream incrementally; non-string /
+    unknown args are buffered per-parameter and coerced to their declared type, matching the
+    non-streaming parser. A tail is always held back so a partial ``</think>``, ``<tool_call>``,
+    or ``</parameter>`` marker never leaks into output. ``finish()`` flushes anything held back
+    and, if generation was truncated mid-call, closes the arguments JSON so it stays valid."""
+
+    # tool-parsing sub-states (active once the body's first <tool_call> is seen)
+    _SEEK_FUNC = "seek_func"  # looking for <function=NAME> (also skips a closed call's </tool_call>)
+    _IN_FUNC = "in_func"  # inside a function: next is <parameter=...> or </function>
+    _IN_STR = "in_str"  # streaming a string-typed parameter value
+    _IN_BUF = "in_buf"  # buffering a non-string/unknown value until </parameter>
 
     def __init__(self, tools: Optional[List[Dict[str, Any]]] = None):
-        self._tools = tools
+        self._types = _arg_types(tools)
         self._full = ""
+        # reasoning / content
         self._think_closed = False
-        self._body_at = 0  # index in _full where the post-</think> body starts
-        self._reason_emit = 0  # chars of reasoning already emitted
-        self._content_emit = 0  # absolute index in _full of content already emitted
+        self._body_at = 0
+        self._reason_emit = 0
+        self._content_emit = 0
         self._content_started = False
+        # tool calls
+        self._in_tools = False
+        self._cur = 0  # absolute cursor into _full for tool parsing
+        self._tc_state = self._SEEK_FUNC
+        self._tc_index = -1
+        self._any_tool = False
+        self._func_name = ""
+        self._first_param = True
+        self._args_open = False  # emitted "{" for the current function but not yet "}"
+        self._param_name = ""
+        self._param_type: Optional[str] = None
+        self._param_prefix = ""
+        self._val_start = 0  # absolute index where the current value begins
+        self._val_emit = 0  # chars of the current string value already emitted
+
+    @property
+    def any_tool(self) -> bool:
+        return self._any_tool
 
     def _content_delta(self, abs_end: int, events: list):
         if abs_end <= self._content_emit:
@@ -270,9 +318,13 @@ class _ChatStreamParser:
             self._content_started = True
         events.append(("content", chunk))
 
+    def _tool(self, events: list, **fn):
+        """Append an OpenAI tool_calls delta for the current call index."""
+        delta = {"index": self._tc_index, **fn}
+        events.append(("tool", delta))
+
     def push(self, full: str):
-        """Feed the full decoded text so far; return a list of (kind, delta) events where kind
-        is 'reasoning' or 'content'."""
+        """Feed the full decoded text so far; return a list of (kind, payload) events."""
         self._full = full
         events: list = []
         if not self._think_closed:
@@ -289,22 +341,121 @@ class _ChatStreamParser:
             self._think_closed = True
             self._body_at = i + len(THINK_END)
             self._content_emit = self._body_at
-        # body: emit content up to the first <tool_call>, holding back a partial-tag tail
-        j = full.find(TOOL_OPEN, self._body_at)
-        end = j if j != -1 else max(self._body_at, len(full) - (len(TOOL_OPEN) - 1))
-        self._content_delta(end, events)
+        if not self._in_tools:
+            # content mode: emit up to the first <tool_call>, holding back a partial-tag tail
+            j = full.find(TOOL_OPEN, self._body_at)
+            if j == -1:
+                self._content_delta(max(self._body_at, len(full) - (len(TOOL_OPEN) - 1)), events)
+                return events
+            self._content_delta(j, events)
+            self._in_tools = True
+            self._cur = j + len(TOOL_OPEN)
+            self._tc_state = self._SEEK_FUNC
+        self._drive_tools(events)
         return events
 
+    def _drive_tools(self, events: list):
+        """Advance the tool-call state machine over ``self._full`` as far as the available text
+        allows, emitting tool deltas. Each branch either advances the cursor/state or returns to
+        wait for more text, so this always terminates."""
+        full = self._full
+        while True:
+            st = self._tc_state
+            if st == self._SEEK_FUNC:
+                i = full.find(FUNC_OPEN, self._cur)
+                gt = full.find(">", i) if i != -1 else -1
+                if i == -1 or gt == -1:
+                    return  # function header not fully arrived yet
+                self._func_name = full[i + len(FUNC_OPEN) : gt].strip()
+                self._tc_index += 1
+                self._any_tool = True
+                self._first_param = True
+                self._tool(
+                    events,
+                    id=f"call_{uuid.uuid4().hex[:24]}",
+                    type="function",
+                    function={"name": self._func_name, "arguments": ""},
+                )
+                self._tool(events, function={"arguments": "{"})
+                self._args_open = True
+                self._cur = gt + 1
+                self._tc_state = self._IN_FUNC
+            elif st == self._IN_FUNC:
+                p = full.find(PARAM_OPEN, self._cur)
+                f = full.find(FUNC_CLOSE, self._cur)
+                if f != -1 and (p == -1 or f < p):  # function closes
+                    self._tool(events, function={"arguments": "}"})
+                    self._args_open = False
+                    self._cur = f + len(FUNC_CLOSE)
+                    self._tc_state = self._SEEK_FUNC  # find() skips the trailing </tool_call>
+                elif p != -1:  # a parameter starts
+                    gt = full.find(">", p)
+                    if gt == -1 or gt + 1 >= len(full):
+                        return  # need the full <parameter=...> plus ≥1 char to test the leading \n
+                    self._param_name = full[p + len(PARAM_OPEN) : gt].strip()
+                    self._param_type = self._types.get(self._func_name, {}).get(self._param_name)
+                    vstart = gt + 1 + (1 if full[gt + 1] == "\n" else 0)  # template puts \n after '>'
+                    self._val_start = vstart
+                    self._val_emit = 0
+                    self._cur = vstart
+                    self._param_prefix = ("" if self._first_param else ", ") + json.dumps(self._param_name) + ": "
+                    self._first_param = False
+                    if self._param_type == "string":
+                        self._tool(events, function={"arguments": self._param_prefix + '"'})
+                        self._tc_state = self._IN_STR
+                    else:
+                        self._tc_state = self._IN_BUF
+                else:
+                    return  # neither marker present yet
+            elif st == self._IN_STR:
+                end = full.find(PARAM_CLOSE, self._val_start)
+                if end == -1:  # value still growing: emit the safe prefix, hold back a tail
+                    safe = max(self._val_start + self._val_emit, len(full) - _VALUE_HOLDBACK)
+                    new = full[self._val_start + self._val_emit : safe]
+                    if new:
+                        self._tool(events, function={"arguments": _json_str_frag(new)})
+                        self._val_emit += len(new)
+                    return
+                vend = end - 1 if end > self._val_start and full[end - 1] == "\n" else end
+                rest = full[self._val_start + self._val_emit : vend]
+                self._tool(events, function={"arguments": _json_str_frag(rest) + '"'})
+                self._cur = end + len(PARAM_CLOSE)
+                self._tc_state = self._IN_FUNC
+            elif st == self._IN_BUF:
+                end = full.find(PARAM_CLOSE, self._val_start)
+                if end == -1:
+                    return
+                vend = end - 1 if end > self._val_start and full[end - 1] == "\n" else end
+                val = json.dumps(_coerce_arg(full[self._val_start : vend], self._param_type), ensure_ascii=False)
+                self._tool(events, function={"arguments": self._param_prefix + val})
+                self._cur = end + len(PARAM_CLOSE)
+                self._tc_state = self._IN_FUNC
+            else:
+                return
+
     def finish(self):
-        """Flush any remaining content (up to the first tool call) and parse tool calls.
-        Returns (content_tail, tool_calls)."""
-        body_at = self._body_at if self._think_closed else 0
-        body = self._full[body_at:]
-        j = body.find(TOOL_OPEN)
+        """Flush anything held back. Returns a list of (kind, payload) events (same shape as
+        push). For a clean generation this closes nothing extra; for one truncated mid-tool-call
+        it closes the arguments JSON so the emitted ``arguments`` string still parses."""
         events: list = []
-        self._content_delta(body_at + (j if j != -1 else len(body)), events)
-        content_tail = events[0][1] if events else ""
-        return content_tail, _parse_tool_calls(body, self._tools)
+        if not self._think_closed:
+            if len(self._full) > self._reason_emit:  # degenerate: think never closed
+                events.append(("reasoning", self._full[self._reason_emit :]))
+            return events
+        if not self._in_tools:
+            self._content_delta(len(self._full), events)
+            return events
+        if self._tc_state == self._IN_STR:
+            self._tool(
+                events, function={"arguments": _json_str_frag(self._full[self._val_start + self._val_emit :]) + '"'}
+            )
+        elif self._tc_state == self._IN_BUF:
+            val = json.dumps(_coerce_arg(self._full[self._val_start :], self._param_type), ensure_ascii=False)
+            self._tool(events, function={"arguments": self._param_prefix + val})
+        if self._args_open:
+            self._tool(events, function={"arguments": "}"})
+            self._args_open = False
+        return events
 
 
 # ── Engine ────────────────────────────────────────────────────────────────────
@@ -486,9 +637,13 @@ class Qwen36Engine:
         out_ids: List[int] = []
         self._n_generated = 0
         text = ""
+        t_start = time.time()  # progress logging: prove the device is decoding even if the client renders nothing
         for tid in self._generate_ids(ids, max_new, **sampling):
             out_ids.append(tid)
             self._n_generated = len(out_ids)
+            if len(out_ids) % 128 == 0:
+                dt = time.time() - t_start
+                logger.info(f"[gen] {len(out_ids)} tok, {len(out_ids) / dt:.1f} tok/s (still generating)")
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
             if stops:
                 cut = _earliest_stop(text, stops)
@@ -567,21 +722,23 @@ def _stream_chat(
     def chunk(delta, finish=None):
         return _sse({**base, "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]})
 
+    def to_delta(kind, payload):
+        if kind == "reasoning":
+            return {"reasoning_content": payload}
+        if kind == "content":
+            return {"content": payload}
+        return {"tool_calls": [payload]}  # already an OpenAI tool_calls delta
+
     parser = _ChatStreamParser(tools)
     with eng.lock:
         # first chunk announces the assistant role
         yield chunk({"role": "assistant"})
         for full in eng._generate_text(ids, max_new, stop=stop, **sampling):
-            for kind, delta in parser.push(full):
-                yield chunk({"reasoning_content": delta} if kind == "reasoning" else {"content": delta})
-        content_tail, tool_calls = parser.finish()
-        if content_tail:
-            yield chunk({"content": content_tail})
-        for idx, tc in enumerate(tool_calls):
-            yield chunk(
-                {"tool_calls": [{"index": idx, "id": tc["id"], "type": "function", "function": tc["function"]}]}
-            )
-        finish = "tool_calls" if tool_calls else eng._finish_reason
+            for kind, payload in parser.push(full):
+                yield chunk(to_delta(kind, payload))
+        for kind, payload in parser.finish():
+            yield chunk(to_delta(kind, payload))
+        finish = "tool_calls" if parser.any_tool else eng._finish_reason
     yield chunk({}, finish)
     yield "data: [DONE]\n\n"
 
