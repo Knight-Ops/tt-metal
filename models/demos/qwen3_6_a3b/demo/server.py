@@ -41,7 +41,6 @@ QWEN36_SERVER_TRACE (1 = capture a decode trace per request for the fast path).
 
 import json
 import os
-import re
 import threading
 import time
 import uuid
@@ -60,6 +59,39 @@ from models.demos.qwen3_6_a3b.tt.model import TtModel
 from models.demos.qwen3_6_a3b.tt.model_config import ModelArgs
 
 MODEL_ID = "qwen3.6-a3b"
+
+# Opt-in wire logging (QWEN36_LOG_REQUESTS=1): dump each chat request's shape and the model's raw
+# output. Use it to capture exactly what an agentic client (e.g. OpenCode) sends/receives —
+# whether it streams, what max_tokens/tools/tool_choice it sets, the prompt length, the
+# finish_reason, and the parsed tool calls — when debugging tool-calling interop.
+_LOG_REQUESTS = os.environ.get("QWEN36_LOG_REQUESTS") == "1"
+
+
+def _log_chat_request(req: "ChatCompletionRequest", prompt_tokens: int, max_seq: int):
+    if not _LOG_REQUESTS:
+        return
+    tool_names = [(t.get("function", t) or {}).get("name") for t in (req.tools or [])]
+    logger.info(
+        "[req] stream={} max_tokens={} temp={} pp={} prompt_tokens={}/{} msgs={} tools={} tool_choice={}".format(
+            req.stream,
+            req.max_tokens,
+            req.temperature,
+            req.presence_penalty,
+            prompt_tokens,
+            max_seq,
+            len(req.messages),
+            tool_names,
+            req.tool_choice,
+        )
+    )
+
+
+def _log_chat_response(raw_text: str, finish: str, tool_calls):
+    if not _LOG_REQUESTS:
+        return
+    names = [tc["function"]["name"] for tc in (tool_calls or [])]
+    logger.info(f"[resp] finish_reason={finish} tool_calls={names}")
+    logger.info(f"[resp] raw_output (first 800 chars): {raw_text[:800]!r}")
 
 
 # ── OpenAI-format request schemas (subset, matching gemma4's server.py) ───────
@@ -102,11 +134,11 @@ class CompletionRequest(BaseModel):
     model: Optional[str] = None
     prompt: str
     max_tokens: Optional[int] = None
-    temperature: float = 1.0
+    temperature: float = 0.6
     top_k: int = 20
     top_p: float = 0.95
     min_p: float = 0.0
-    presence_penalty: float = 1.5
+    presence_penalty: float = 0.0
     repetition_penalty: float = 1.0
     seed: Optional[int] = None
     stream: bool = False
@@ -145,9 +177,6 @@ PARAM_OPEN = "<parameter="
 PARAM_CLOSE = "</parameter>"
 TC_CLOSE = "</tool_call>"
 _VALUE_HOLDBACK = len("\n" + PARAM_CLOSE) - 1  # withhold this many chars so a forming close never leaks
-_TOOL_CALL_RE = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.DOTALL)
-_FUNCTION_RE = re.compile(r"<function=([^>\n]+)>\s*(.*?)\s*</function>", re.DOTALL)
-_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n?(.*?)\n?</parameter>", re.DOTALL)
 
 
 def _json_str_frag(s: str) -> str:
@@ -182,28 +211,6 @@ def _arg_types(tools: Optional[List[Dict[str, Any]]]) -> Dict[str, Dict[str, Any
     return types
 
 
-def _parse_tool_calls(body: str, tools: Optional[List[Dict[str, Any]]] = None) -> List[Dict[str, Any]]:
-    """Parse every <tool_call> block in ``body`` into OpenAI tool_calls dicts (arguments as a
-    JSON string, per the OpenAI wire format)."""
-    types = _arg_types(tools)
-    calls: List[Dict[str, Any]] = []
-    for block in _TOOL_CALL_RE.findall(body):
-        m = _FUNCTION_RE.search(block)
-        if not m:
-            continue
-        fname = m.group(1).strip()
-        ptypes = types.get(fname, {})
-        args = {name.strip(): _coerce_arg(val, ptypes.get(name.strip())) for name, val in _PARAM_RE.findall(m.group(2))}
-        calls.append(
-            {
-                "id": f"call_{uuid.uuid4().hex[:24]}",
-                "type": "function",
-                "function": {"name": fname, "arguments": json.dumps(args, ensure_ascii=False)},
-            }
-        )
-    return calls
-
-
 def _norm_stop(stop) -> List[str]:
     """Normalize the OpenAI ``stop`` field (str | list[str] | None) to a list of non-empty strings."""
     if stop is None:
@@ -223,21 +230,37 @@ def _earliest_stop(text: str, stops: List[str]) -> Optional[int]:
     return cut
 
 
-def _split_think(text: str):
-    """Split generated text into (reasoning, body) at the closing </think> marker. If absent
-    (model produced no thinking), everything is body."""
-    if THINK_END in text:
-        reasoning, body = text.split(THINK_END, 1)
-        return reasoning.strip(), body.lstrip("\n")
-    return "", text
-
-
 def _parse_chat_output(text: str, tools: Optional[List[Dict[str, Any]]] = None):
-    """Full parse of a completed generation -> (reasoning, visible_content, tool_calls)."""
-    reasoning, body = _split_think(text)
-    tool_calls = _parse_tool_calls(body, tools)
-    content = _TOOL_CALL_RE.sub("", body).strip()
-    return reasoning, content, tool_calls
+    """Full parse of a completed generation -> (reasoning, visible_content, tool_calls).
+
+    Drives the SAME ``_ChatStreamParser`` used for streaming over the full text in one shot
+    (push + finish), so the streaming and non-streaming endpoints produce identical results.
+    Crucially this handles a generation truncated mid ``<tool_call>`` (finish_reason="length",
+    e.g. a long file written as a tool argument): ``finish()`` closes the partial arguments JSON
+    so the (incomplete but valid) tool call is still surfaced — instead of being dropped by a
+    regex that requires a closing ``</tool_call>`` and leaking the half-written call as content."""
+    parser = _ChatStreamParser(tools)
+    reasoning_parts: List[str] = []
+    content_parts: List[str] = []
+    calls: Dict[int, Dict[str, Any]] = {}
+    for kind, payload in [*parser.push(text), *parser.finish()]:
+        if kind == "reasoning":
+            reasoning_parts.append(payload)
+        elif kind == "content":
+            content_parts.append(payload)
+        else:  # ("tool", <OpenAI tool_calls delta>): first delta carries id/type/name, rest append args
+            c = calls.setdefault(
+                payload["index"], {"id": None, "type": "function", "function": {"name": "", "arguments": ""}}
+            )
+            if payload.get("id"):
+                c["id"] = payload["id"]
+            fn = payload.get("function", {})
+            if "name" in fn:
+                c["function"]["name"] = fn["name"]
+            if "arguments" in fn:
+                c["function"]["arguments"] += fn["arguments"]
+    tool_calls = [calls[i] for i in sorted(calls)]
+    return "".join(reasoning_parts).strip(), "".join(content_parts).strip(), tool_calls
 
 
 def _normalize_history_tool_call(tc: Dict[str, Any]) -> Dict[str, Any]:
@@ -580,8 +603,7 @@ class Qwen36Engine:
         prompt_len = int(ids.shape[1])
         if prompt_len >= self.max_seq:
             raise ValueError(
-                f"prompt length {prompt_len} >= max_seq_len {self.max_seq}; "
-                "raise QWEN36_MAX_SEQ or shorten the prompt"
+                f"prompt length {prompt_len} >= max_seq_len {self.max_seq}; raise QWEN36_MAX_SEQ or shorten the prompt"
             )
         # Finish reason for this generation, refined as we go: "length" unless we hit an EOS id
         # ("stop") or, in the text layer, a user stop string ("stop"). Read by callers after the
@@ -705,7 +727,12 @@ def list_models():
 
 
 def _default_max_new(eng: Qwen36Engine, req_max: Optional[int]) -> int:
-    return req_max if req_max and req_max > 0 else max(1, eng.max_seq // 4)
+    # When the client sets max_tokens, honor it. Otherwise offer the FULL remaining context, not a
+    # fraction: this is a thinking model and agentic clients (e.g. OpenCode) emit whole files as tool
+    # arguments — a small default (the old max_seq//4) truncates the reasoning or the file before the
+    # <tool_call> closes, so the call is incomplete/dropped. _generate_ids caps this to the real
+    # budget (max_seq - prompt_len - 1) and generation stops early on EOS, so this is an upper bound.
+    return req_max if req_max and req_max > 0 else eng.max_seq
 
 
 def _sse(payload: dict) -> str:
@@ -730,6 +757,7 @@ def _stream_chat(
         return {"tool_calls": [payload]}  # already an OpenAI tool_calls delta
 
     parser = _ChatStreamParser(tools)
+    full = ""
     with eng.lock:
         # first chunk announces the assistant role
         yield chunk({"role": "assistant"})
@@ -739,6 +767,7 @@ def _stream_chat(
         for kind, payload in parser.finish():
             yield chunk(to_delta(kind, payload))
         finish = "tool_calls" if parser.any_tool else eng._finish_reason
+    _log_chat_response(full, finish, None)  # raw stream text; tool calls were streamed as deltas
     yield chunk({}, finish)
     yield "data: [DONE]\n\n"
 
@@ -763,6 +792,7 @@ def chat_completions(req: ChatCompletionRequest):
     ids = eng.ids_from_messages(req.messages, tools=req.tools, tool_choice=req.tool_choice)
     max_new = _default_max_new(eng, req.max_tokens)
     model = req.model or MODEL_ID
+    _log_chat_request(req, int(ids.numel()), eng.max_seq)
     if int(ids.numel()) >= eng.max_seq:
         raise HTTPException(status_code=400, detail=f"prompt too long ({int(ids.numel())} >= {eng.max_seq})")
 
@@ -797,6 +827,7 @@ def chat_completions(req: ChatCompletionRequest):
         f"[chat] {n_tok} tok in {secs:.2f}s = {tok_s:.1f} tok/s"
         + (f" ({len(tool_calls)} tool call(s))" if tool_calls else "")
     )
+    _log_chat_response(text, finish, tool_calls)
     return {
         "id": f"chatcmpl-{uuid.uuid4().hex[:12]}",
         "object": "chat.completion",
@@ -854,7 +885,7 @@ def completions(req: CompletionRequest):
 def main():
     ckpt = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
     n_layers = int(os.environ.get("QWEN36_LAYERS", "40"))
-    max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "512"))
+    max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "8192"))
     use_trace = os.environ.get("QWEN36_SERVER_TRACE", "1") != "0"
     host = os.environ.get("QWEN36_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("QWEN36_SERVER_PORT", "8000"))

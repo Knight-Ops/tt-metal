@@ -440,20 +440,53 @@ class TtModel(LightweightModule):
         sin = ttnn.reshape(ttnn.embedding(rope_pos, self.sin_table, layout=ttnn.TILE_LAYOUT), [1, 1, 1, rd])
         return cos, sin
 
-    def _decode_graph(self):
-        """Self-contained, traceable decode step: read device-resident token + position, run
-        embed -> layers -> norm -> lm_head -> argmax, write the next token back into self.t_tok, and
-        advance the position tensors on device. No host work / no full-logit readback."""
+    def _decode_hidden(self):
+        """Shared decode body: read the device-resident token(s) + position(s), run
+        embed -> layers -> final norm, and return the post-norm hidden state [B, dim]. Used by both
+        the self-contained on-device-select path (_decode_graph) and the logits-returning path
+        (decode_forward_logits). Does NOT advance positions — the caller does, after consuming x."""
         cos, sin = self._rope_for(self.t_ropepos)
         x = ttnn.embedding(self.t_tok, self.embed_weight, layout=ttnn.TILE_LAYOUT)
         x = ttnn.reshape(x, [1, 1, 1, self.args.dim])
         for layer, cache in zip(self.layers, self.caches):
             x = layer.forward_decode(x, cos, sin, cache, self.t_curpos)
         x = self.final_norm.forward(x)
-        x = ttnn.reshape(x, [1, self.args.dim])
+        return ttnn.reshape(x, [1, self.args.dim])
+
+    def _decode_graph(self):
+        """Self-contained, traceable decode step: read device-resident token + position, run
+        embed -> layers -> norm -> lm_head -> argmax, write the next token back into self.t_tok, and
+        advance the position tensors on device. No host work / no full-logit readback."""
+        x = self._decode_hidden()
         self._select_token(x)  # lm_head -> argmax (greedy) or topk+sampling; writes self.t_tok
         ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
         ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
+
+    def set_decode_tokens(self, token_ids):
+        """Host->device write of the next input token(s) into the device-resident decode state.
+        The continuous-batching counterpart to the on-device token write _select_token does for the
+        standalone greedy/sampling path: under vLLM the host samples from the returned logits and
+        feeds the chosen token(s) back here before the next decode_forward_logits() call.
+        token_ids: an int or a length-B sequence of ints."""
+        if isinstance(token_ids, int):
+            token_ids = [token_ids]
+        t = torch.as_tensor(list(token_ids), dtype=torch.int32).flatten()
+        src = to_tt(t, self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
+        ttnn.copy(src, self.t_tok)  # in place, stable address (trace-safe)
+
+    def decode_forward_logits(self):
+        """Run one decode step and return host logits [B, vocab] WITHOUT selecting a token on device.
+        This is the vLLM continuous-batching contract: vLLM's sampler consumes the logits (per-request
+        temperature/top-p/penalties/logprobs/stops) and writes the chosen token(s) back via
+        set_decode_tokens() before the next call. Positions still advance on device, exactly as in the
+        greedy path. (B==1 today; A3 threads the batch axis.)"""
+        x = self._decode_hidden()
+        logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]  (all rows kept; no last-token slice)
+        out = from_tt(logits, self.mesh_device)
+        ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
+        ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
+        self.pos += 1
+        return out
 
     def _select_token(self, x):
         """Run lm_head on the post-norm hidden state and write the next token id into self.t_tok.

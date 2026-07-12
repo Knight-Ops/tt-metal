@@ -39,3 +39,38 @@ def test_model_real_weights(mesh_device):
     assert torch.isfinite(logits).all(), "non-finite logits"
     # sanity: top token ids are valid
     assert int(logits.argmax(-1).max()) < args.vocab_size
+
+
+@torch.no_grad()
+def test_decode_logits_matches_greedy(mesh_device):
+    """A1: decode_forward_logits + host argmax + set_decode_tokens reproduces the on-device greedy
+    decode_step_eager token stream at B=1. This is the vLLM continuous-batching contract (host samples
+    from returned logits, feeds the token back) and must be token-identical to the proven greedy path.
+    """
+    n_layers = int(os.environ.get("QWEN36_LAYERS", "4"))
+    ckpt = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
+    args = ModelArgs(mesh_device, ckpt_dir=ckpt, max_seq_len=512)
+    loader = CheckpointLoader(ckpt)
+    model = TtModel(mesh_device, args, loader, num_layers=n_layers)
+
+    T, N = 16, 8
+    torch.manual_seed(0)
+    input_ids = torch.randint(0, args.vocab_size, (1, T))
+
+    # Greedy trajectory: on-device argmax (the proven standalone path).
+    logits = model.forward(input_ids)
+    first = int(logits[0, -1].argmax())
+    model.start_decode(first)
+    greedy = [first] + [model.decode_step_eager() for _ in range(N)]
+
+    # Logits trajectory: re-prefill (reallocates caches + reseeds positions), then host-argmax the
+    # returned logits and feed the chosen token back via set_decode_tokens — the vLLM contract.
+    logits = model.forward(input_ids)
+    model.start_decode(int(logits[0, -1].argmax()))
+    host = [int(logits[0, -1].argmax())]
+    for _ in range(N):
+        nxt = int(model.decode_forward_logits()[0].argmax())
+        model.set_decode_tokens(nxt)
+        host.append(nxt)
+
+    assert host == greedy, f"logits-path tokens {host} != greedy {greedy}"
