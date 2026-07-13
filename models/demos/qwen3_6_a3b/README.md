@@ -95,9 +95,11 @@ OpenAI HTTP API for interactive testing. It is single-batch. Sampling is honored
 **on device**: `temperature` (with `top_k` / `top_p` / `seed`) drives a chunked
 `ttnn.topk` + `ttnn.sampling` decode tail (no host-side logit readback, fully
 in-trace, ~0.5 ms/token over greedy); `temperature == 0` selects greedy argmax.
-Per OpenAI semantics the `temperature` default is `1.0`, so requests that omit it
-sample at full temperature — pass `"temperature": 0` for deterministic greedy. The
-first token (from prefill) is always greedy argmax; decode tokens are sampled.
+The request defaults are Qwen3's recommended "thinking mode" config (`temperature`
+`0.6`, `top_k` `20`, `top_p` `0.95`, `presence_penalty` `1.5`). Qwen3 thinking models
+should NOT be run greedy (it degrades into repetition), so requests that omit
+`temperature` sample at `0.6` — pass `"temperature": 0` only for deterministic greedy.
+The first token (from prefill) is always greedy argmax; decode tokens are sampled.
 Since the model is autoregressive it supports real token-by-token SSE streaming
 (`"stream": true`), unlike the gemma4 diffusion server.
 
@@ -176,9 +178,10 @@ tt-inference-server workflows.
 | `TT_CACHE_PATH` | `<ckpt>/tt_weight_cache` | weight-cache dir |
 | `QWEN36_WEIGHT_CACHE` | 1 | `0` disables the on-disk weight cache |
 | `QWEN36_FUSED_PREFILL` | 1 | `0` falls back to the sequential recurrent scan |
-| `QWEN36_DELTA_IPLUSL` | 1 | `0` uses the fp32 doubling-product inverse |
 | `QWEN36_SPARSE_DECODE` | 0 | `1` uses the gather-top-k decode path (host sync) |
 | `QWEN36_LMHEAD_BF4` | 1 | `0` keeps lm_head in BFP8 |
+| `QWEN36_EXPERT_DTYPE` | `bf4` | routed-expert precision (`bf4`/`bf8`); used by the accuracy sweep in `evaluation/` |
+| `QWEN36_EXPERT_DOWN_BF8` | 0 | `1` pins the sensitive routed-expert `down_proj` to bf8 (gate_up stays bf4) — mixed-precision recipe, ~+5GB, still fits a 32GB P150 |
 
 ## Correctness
 
@@ -228,9 +231,12 @@ sequential recurrent scan for the 30 linear layers is replaced by the chunked de
 per-chunk prep batched over all 32 heads + a fused tt-lang `_chunk_state` kernel that runs all heads in
 one launch (8×4 grid, head-dim 128) + `[Dk×Dv]` state carry across chunks. Warm prefill: **40-layer seq
 256, 26.4 → 149 tok/s (~5.65×)**; 4-layer microbench ~11.7× (same kernel dims). Matches the chunked
-reference (PCC ≥ 0.9995), decode is unaffected, and 40-layer generation stays coherent. The cheap
-`T≈I+L` inverse is the default (`QWEN36_DELTA_IPLUSL=0` selects the fp32 doubling product). The kernel
-compiles once per shape (~70 s, then disk-cached). MoE prefill still uses the dense (all-expert) path.
+reference (PCC ≥ 0.9995), decode is unaffected, and 40-layer generation stays coherent. The intra-chunk
+`(I−L)⁻¹` uses a numerically-stable recursive block inversion (the cheap `T≈I+L` and the fp32
+doubling-product approximations were both removed — they drift to gibberish on this model's O(1) `L`).
+Note the default eager prefill runs the per-chunk recurrence in fp32/HiFi4 ttnn (`_chunk_state_ttnn`)
+for accuracy; the bf16 tt-lang `chunk_state_tt` kernel is the faster-but-approximate traced/opt-in path.
+The kernel compiles once per shape (~70 s, then disk-cached). MoE prefill uses the dense (all-expert) path.
 
 Implemented (Phase B), all PCC-gated:
 - On-device Gated-DeltaNet recurrent scan (rank-1 update = batched matmuls) + conv/recurrent state cache.

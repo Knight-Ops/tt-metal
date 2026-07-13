@@ -16,10 +16,11 @@ additionally carries ``tokens_per_second`` and ``generation_seconds``.
 Generation is single-batch. Sampling is honored on device: ``temperature`` (with
 ``top_k`` / ``top_p`` / ``presence_penalty``) drives an on-device topk + ttnn.sampling
 decode tail (no host-side logit readback); ``temperature == 0`` selects greedy argmax.
-The request defaults are Qwen3's recommended "thinking mode" config (temperature 1.0,
+The request defaults are Qwen3's recommended "thinking mode" config (temperature 0.6,
 top_k 20, top_p 0.95, presence_penalty 1.5); ``min_p`` / ``repetition_penalty`` are
-accepted but not implemented (their recommended 0.0 / 1.0 are no-ops). Since the default
-temperature is 1.0, requests that omit it sample — pass ``"temperature": 0`` for greedy.
+accepted but not implemented (their recommended 0.0 / 1.0 are no-ops). Qwen3 thinking
+models should NOT be run greedy (it degrades into repetition), so the default samples at
+0.6 — pass ``"temperature": 0`` only if you explicitly want deterministic greedy.
 The first token (from prefill) is always greedy argmax; decode tokens are sampled.
 
 Tool/function calling is supported via Qwen3's native XML format. Pass OpenAI-style ``tools``
@@ -112,7 +113,7 @@ class ChatCompletionRequest(BaseModel):
     model: Optional[str] = None
     messages: List[ChatMessage]
     max_tokens: Optional[int] = None
-    temperature: float = 1.0  # 0 = greedy argmax; >0 = on-device temperature sampling
+    temperature: float = 0.6  # Qwen3 thinking-mode rec; 0 = greedy argmax (discouraged); >0 = sampling
     top_k: int = 20  # 0 (or >32) = 32, the device max
     top_p: float = 0.95  # nucleus probability
     min_p: float = 0.0  # accepted; not implemented (0.0 = no-op)
@@ -128,6 +129,12 @@ class ChatCompletionRequest(BaseModel):
     # "function":{"name":...}} to narrow the offered tools to a single function.
     tools: Optional[List[Dict[str, Any]]] = None
     tool_choice: Optional[Union[str, Dict[str, Any]]] = None
+    # Qwen3 thinking control. None => AUTO: OFF when ``tools`` are present (non-thinking is the reliable
+    # agentic/tool-calling config — thinking can burn the token budget before the tool call and slows
+    # every turn), ON otherwise (Qwen3's default). Explicit true/false overrides. Also honored via
+    # ``chat_template_kwargs={"enable_thinking": bool}`` for clients that pass it that way.
+    enable_thinking: Optional[bool] = None
+    chat_template_kwargs: Optional[Dict[str, Any]] = None
 
 
 class CompletionRequest(BaseModel):
@@ -230,7 +237,7 @@ def _earliest_stop(text: str, stops: List[str]) -> Optional[int]:
     return cut
 
 
-def _parse_chat_output(text: str, tools: Optional[List[Dict[str, Any]]] = None):
+def _parse_chat_output(text: str, tools: Optional[List[Dict[str, Any]]] = None, expect_thinking: bool = True):
     """Full parse of a completed generation -> (reasoning, visible_content, tool_calls).
 
     Drives the SAME ``_ChatStreamParser`` used for streaming over the full text in one shot
@@ -239,7 +246,7 @@ def _parse_chat_output(text: str, tools: Optional[List[Dict[str, Any]]] = None):
     e.g. a long file written as a tool argument): ``finish()`` closes the partial arguments JSON
     so the (incomplete but valid) tool call is still surfaced — instead of being dropped by a
     regex that requires a closing ``</tool_call>`` and leaking the half-written call as content."""
-    parser = _ChatStreamParser(tools)
+    parser = _ChatStreamParser(tools, expect_thinking=expect_thinking)
     reasoning_parts: List[str] = []
     content_parts: List[str] = []
     calls: Dict[int, Dict[str, Any]] = {}
@@ -301,11 +308,14 @@ class _ChatStreamParser:
     _IN_STR = "in_str"  # streaming a string-typed parameter value
     _IN_BUF = "in_buf"  # buffering a non-string/unknown value until </parameter>
 
-    def __init__(self, tools: Optional[List[Dict[str, Any]]] = None):
+    def __init__(self, tools: Optional[List[Dict[str, Any]]] = None, expect_thinking: bool = True):
         self._types = _arg_types(tools)
         self._full = ""
-        # reasoning / content
-        self._think_closed = False
+        # reasoning / content. When thinking is disabled the prompt already contains the closed
+        # <think></think>, so the model's OUTPUT has no </think> — start with the think block already
+        # "closed" so the whole output is parsed as body (content + tool_calls). Otherwise the parser
+        # would wait forever for a </think> that never comes and never emit the tool call.
+        self._think_closed = not expect_thinking
         self._body_at = 0
         self._reason_emit = 0
         self._content_emit = 0
@@ -562,14 +572,20 @@ class Qwen36Engine:
             d["tool_calls"] = [_normalize_history_tool_call(tc) for tc in m.tool_calls]
         return d
 
-    def ids_from_messages(self, messages: List[ChatMessage], tools=None, tool_choice=None) -> torch.Tensor:
+    def ids_from_messages(
+        self, messages: List[ChatMessage], tools=None, tool_choice=None, enable_thinking=None
+    ) -> torch.Tensor:
         if self.tokenizer.chat_template:
+            # Only pass enable_thinking when set, so we don't override the template's own default when
+            # the caller leaves it unspecified.
+            extra = {} if enable_thinking is None else {"enable_thinking": bool(enable_thinking)}
             out = self.tokenizer.apply_chat_template(
                 [self._to_template_msg(m) for m in messages],
                 tools=self._select_tools(tools, tool_choice),
                 tokenize=True,
                 add_generation_prompt=True,
                 return_tensors="pt",
+                **extra,
             )
             ids = (out["input_ids"] if not isinstance(out, torch.Tensor) else out).squeeze(0)
         else:
@@ -740,7 +756,14 @@ def _sse(payload: dict) -> str:
 
 
 def _stream_chat(
-    eng: Qwen36Engine, ids: torch.Tensor, max_new: int, model: str, tools=None, stop=None, **sampling
+    eng: Qwen36Engine,
+    ids: torch.Tensor,
+    max_new: int,
+    model: str,
+    tools=None,
+    stop=None,
+    expect_thinking: bool = True,
+    **sampling,
 ) -> Iterator[str]:
     cid = f"chatcmpl-{uuid.uuid4().hex[:12]}"
     created = int(time.time())
@@ -756,7 +779,7 @@ def _stream_chat(
             return {"content": payload}
         return {"tool_calls": [payload]}  # already an OpenAI tool_calls delta
 
-    parser = _ChatStreamParser(tools)
+    parser = _ChatStreamParser(tools, expect_thinking=expect_thinking)
     full = ""
     with eng.lock:
         # first chunk announces the assistant role
@@ -789,10 +812,23 @@ def _stream_completion(
 @app.post("/v1/chat/completions")
 def chat_completions(req: ChatCompletionRequest):
     eng: Qwen36Engine = app.state.engine
-    ids = eng.ids_from_messages(req.messages, tools=req.tools, tool_choice=req.tool_choice)
+    # Resolve thinking: explicit request field > chat_template_kwargs.enable_thinking > AUTO (off when
+    # tools are present, else on). Non-thinking is the reliable config for agentic tool calling.
+    ctk = req.chat_template_kwargs or {}
+    if req.enable_thinking is not None:
+        enable_thinking = req.enable_thinking
+    elif "enable_thinking" in ctk:
+        enable_thinking = bool(ctk["enable_thinking"])
+    else:
+        enable_thinking = not bool(req.tools)
+    ids = eng.ids_from_messages(
+        req.messages, tools=req.tools, tool_choice=req.tool_choice, enable_thinking=enable_thinking
+    )
     max_new = _default_max_new(eng, req.max_tokens)
     model = req.model or MODEL_ID
     _log_chat_request(req, int(ids.numel()), eng.max_seq)
+    if _LOG_REQUESTS:
+        logger.info(f"[req] enable_thinking={enable_thinking} (tools={bool(req.tools)})")
     if int(ids.numel()) >= eng.max_seq:
         raise HTTPException(status_code=400, detail=f"prompt too long ({int(ids.numel())} >= {eng.max_seq})")
 
@@ -808,7 +844,9 @@ def chat_completions(req: ChatCompletionRequest):
     stop = _norm_stop(req.stop)
     if req.stream:
         return StreamingResponse(
-            _stream_chat(eng, ids, max_new, model, tools=req.tools, stop=stop, **sampling),
+            _stream_chat(
+                eng, ids, max_new, model, tools=req.tools, stop=stop, expect_thinking=enable_thinking, **sampling
+            ),
             media_type="text/event-stream",
         )
 
@@ -816,7 +854,7 @@ def chat_completions(req: ChatCompletionRequest):
         text, n_tok, secs, tok_s, finish = eng.generate(ids, max_new, stop=stop, **sampling)
     # Split the raw generation into reasoning / visible content / tool calls (the tool/think
     # markers are plain text, so they survive decode and are parsed here).
-    reasoning, content, tool_calls = _parse_chat_output(text, req.tools)
+    reasoning, content, tool_calls = _parse_chat_output(text, req.tools, expect_thinking=enable_thinking)
     message: Dict[str, Any] = {"role": "assistant", "content": content or None}
     if reasoning:
         message["reasoning_content"] = reasoning

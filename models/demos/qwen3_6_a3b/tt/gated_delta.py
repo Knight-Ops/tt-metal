@@ -2,15 +2,22 @@
 # SPDX-License-Identifier: Apache-2.0
 """tt-nn Gated DeltaNet (linear attention) for Qwen3.6-35B-A3B.
 
-Phase B: the delta-rule recurrence runs ON DEVICE (no host round-trip). The per-step rank-1 state
-update is expressed as batched matmuls over the head dim:
-    kv_mem = k_row @ state ;  outer = k_col @ delta ;  out = q_row @ state
-where ``state`` is [1, V, Dk, Dv]. Supports a persistent (conv_state, recurrent_state) cache so
-decode is a single step instead of recomputing the sequence.
+The delta-rule recurrence runs ON DEVICE (no host round-trip). Three paths, by shape/mode:
 
-This is still a sequential scan (O(seq)); the further optimization is a fused chunked tt-lang
-kernel (parallel over the sequence). The recurrent form here is mathematically identical to the
-chunked form (verified) and is the natural reference for that kernel.
+- DECODE (T=1), default: a fused single-step tt-lang kernel (``decode_step_tt`` in ttl_delta.py)
+  collapses the whole per-head step into ONE launch (QWEN36_GDN_FUSED=1). Falls back to the batched-
+  matmul recurrent scan (``state`` [1,V,Dk,Dv]) with QWEN36_GDN_FUSED=0.
+- PREFILL (T>1), default: the chunked delta-rule with the per-chunk recurrence run in ttnn at
+  HiFi4 + fp32 accumulation (``_chunk_state_ttnn``) — numerically stable and coherent over all 40
+  layers. This is what demo.py and demo/server.py use by default.
+- PREFILL, EXPERIMENTAL: the fused tt-lang ``chunk_state_tt`` kernel (bf16 DST). Faster but
+  numerically approximate — it drifts to incoherence over many layers (see the _STABLE_PREFILL note
+  below), so it is OPT-IN only (the traced-prefill path, and QWEN36_DELTA_STABLE_PREFILL=0). NOT a
+  production accuracy path. Promoting it would need fp32 DST accumulation, which exceeds the ttl
+  16-tile DST capacity and thus requires per-matmul tiling (future work).
+
+The recurrent form is mathematically identical to the chunked form (verified) and is the reference
+for the kernels.
 """
 
 from __future__ import annotations
@@ -30,12 +37,11 @@ from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_tt
 # delta-rule — ttnn per-chunk prep batched over heads + the fused tt-lang _chunk_state kernel (one
 # launch over all heads per chunk). This is the DEFAULT (5.4-5.7x faster prefill at 40 layers, warm);
 # set QWEN36_FUSED_PREFILL=0 to fall back to the sequential scan. Decode (T=1) always uses the scan.
-# Intra-chunk inverse (I-L)^-1: numerically-stable recursive block inversion by default (see
-# _chunk_prep). QWEN36_DELTA_IPLUSL=1 selects the fast T≈I+L approximation (INACCURATE for this
-# model's strong-decay heads -> gibberish; A/B only). The old doubling product is removed (it explodes
-# on real L). First fused prefill compiles the ttl kernel once (~1 min, cached on disk thereafter).
+# Intra-chunk inverse (I-L)^-1 uses numerically-stable recursive block inversion (see _chunk_prep).
+# The fast T≈I+L approximation and the old doubling product were both removed: both are INACCURATE for
+# this model's strong-decay heads (they explode / drift to gibberish on real L). First fused prefill
+# compiles the ttl kernel once (~1 min, cached on disk thereafter).
 _FUSED_PREFILL = os.environ.get("QWEN36_FUSED_PREFILL", "1") == "1"
-_DELTA_IPLUSL = os.environ.get("QWEN36_DELTA_IPLUSL") == "1"
 # Run the per-chunk prep in bf16 instead of fp32: the prefill is dispatch-bound and the fp32 path adds
 # ~124 typecast ops/forward (up to fp32, back to bf16) plus 2x data movement. OFF by default: the
 # stable recursive inverse + cumsum/exp are precision-sensitive (bf16 prep regresses 40-layer
@@ -73,8 +79,13 @@ TILE = 32
 #       (v_new/out/Snew matmuls) accumulates too much error over 30 layers (confirmed still gibberish).
 #       Fix: run the per-chunk recurrence in ttnn at HiFi4 + fp32 accumulation (near-fp32, matching the
 #       reference) — _chunk_state_ttnn. Keeps the chunked parallelism (fast, O(seq/chunk)) and is
-#       numerically correct. The (incoherent) bf16 ttl kernel path stays behind
-#       QWEN36_DELTA_STABLE_PREFILL=0 for perf experiments only.
+#       numerically correct. This is the DEFAULT eager prefill.
+# _STABLE_PREFILL gates ONLY the eager path (use_stable = _STABLE_PREFILL and pool is None). The TRACED
+# prefill path (pool != None: forward_prefill_traced, QWEN36_SERVER_PREFILL_TRACE=1, and the
+# bench/prof scripts) ALWAYS uses the bf16 ttl kernel — it needs pre-allocated buffers and the fp32
+# ttnn path allocates intermediates in-graph, which trace capture forbids. So traced prefill is the
+# faster-but-numerically-approximate path and is EXPERIMENTAL/opt-in for that reason; the shipping
+# server prefill is eager (see demo/server.py: traced is gated on QWEN36_SERVER_PREFILL_TRACE).
 _STABLE_PREFILL = os.environ.get("QWEN36_DELTA_STABLE_PREFILL", "1") != "0"
 _HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
@@ -257,29 +268,27 @@ class TtGatedDeltaNet(LightweightModule):
         L = ttnn.multiply(
             ttnn.multiply(ttnn.multiply(ttnn.matmul(kbeta, kT, compute_kernel_config=ck), decay), strict_lower), -1.0
         )
-        if _DELTA_IPLUSL:
-            T = ttnn.add(eye, L)  # T ≈ I+L (fast escape; only valid when L tiny; wrong for real data)
-        else:
-            # (I-L)^-1 via numerically-stable recursive block inversion (block Gaussian elimination).
-            # The doubling product (I+L)(I+L^2)...(I+L^32) is mathematically exact for nilpotent L but
-            # numerically EXPLODES on real data: the intermediate L^k have huge entries (large singular
-            # values, despite eigenvalues=0) that must telescope but don't in finite precision -> 1e6-1e11
-            # blow-up while the true inverse is ~1.0. The recursive block form never forms L^k: it merges
-            # h-block inverses pairwise via corner = -D^-1 (M_B) A^-1, staying bounded (max|T|~1.0). All
-            # ops are full-CxC (tile-aligned) batched matmuls + fixed mask multiplies; log2(C) levels.
-            M = ttnn.subtract(eye, L)  # I - L (unit lower-tri)
-            T = ttnn.repeat(
-                eye, ttnn.Shape([1, M.shape[1], 1, 1])
-            )  # identity, batched over heads (matmul needs matching batch)
-            for lv in masks["inv_levels"]:
-                Dp = ttnn.multiply(T, lv["D"])  # lower-right h-block inverses
-                Ap = ttnn.multiply(T, lv["A"])  # upper-left h-block inverses
-                Bp = ttnn.multiply(M, lv["BL"])  # original lower-left h-blocks of M
-                corner = ttnn.multiply(
-                    ttnn.matmul(ttnn.matmul(Dp, Bp, compute_kernel_config=ck), Ap, compute_kernel_config=ck),
-                    lv["BL"],
-                )
-                T = ttnn.add(T, ttnn.multiply(corner, -1.0))
+        # (I-L)^-1 via numerically-stable recursive block inversion (block Gaussian elimination).
+        # The doubling product (I+L)(I+L^2)...(I+L^32) is mathematically exact for nilpotent L but
+        # numerically EXPLODES on real data: the intermediate L^k have huge entries (large singular
+        # values, despite eigenvalues=0) that must telescope but don't in finite precision -> 1e6-1e11
+        # blow-up while the true inverse is ~1.0. The recursive block form never forms L^k: it merges
+        # h-block inverses pairwise via corner = -D^-1 (M_B) A^-1, staying bounded (max|T|~1.0). All
+        # ops are full-CxC (tile-aligned) batched matmuls + fixed mask multiplies; log2(C) levels.
+        # (The old T≈I+L fast approximation was removed — it is wrong for this model's O(1) L -> gibberish.)
+        M = ttnn.subtract(eye, L)  # I - L (unit lower-tri)
+        T = ttnn.repeat(
+            eye, ttnn.Shape([1, M.shape[1], 1, 1])
+        )  # identity, batched over heads (matmul needs matching batch)
+        for lv in masks["inv_levels"]:
+            Dp = ttnn.multiply(T, lv["D"])  # lower-right h-block inverses
+            Ap = ttnn.multiply(T, lv["A"])  # upper-left h-block inverses
+            Bp = ttnn.multiply(M, lv["BL"])  # original lower-left h-blocks of M
+            corner = ttnn.multiply(
+                ttnn.matmul(ttnn.matmul(Dp, Bp, compute_kernel_config=ck), Ap, compute_kernel_config=ck),
+                lv["BL"],
+            )
+            T = ttnn.add(T, ttnn.multiply(corner, -1.0))
         qg = ttnn.multiply(q, egc_col)
         w = ttnn.matmul(T, vbeta, compute_kernel_config=ck)
         kcd = ttnn.matmul(T, ttnn.multiply(kbeta, egc_col), compute_kernel_config=ck)

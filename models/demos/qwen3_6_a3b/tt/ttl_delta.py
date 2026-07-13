@@ -31,11 +31,21 @@ Builds the chunked delta-rule kernel piece by piece, each PCC-gated vs the torch
            old "K=4+8-out illegal" note was the fp32-DST case only.
   Step 7 — INTEGRATED (done): per-chunk prep on-device (batched ttnn: decay/cumsum/exp/L/inverse/w/kcd),
            sequence chaining + state carry, wired into tt/gated_delta.py (_chunk_prep +
-           _forward_prefill_chunked) as the DEFAULT prefill (QWEN36_FUSED_PREFILL=0 disables). Full
-           chunked path 3-chunk PCC 0.99950; module tests pass; 40-layer prefill 5.4–5.7× faster than
-           the scan (warm, seq 256). Only _chunk_state is a ttl kernel — chunk_state_tt is the
-           ttnn-native entry; everything else is ttnn (so _chunk_apply/_chunk_inverse are unused in the
-           model, kept here for the standalone step ladder).
+           _forward_prefill_chunked). Full chunked path 3-chunk PCC 0.99950; 40-layer prefill 5.4–5.7×
+           faster than the scan (warm, seq 256). Only _chunk_state is a ttl kernel — chunk_state_tt is
+           the ttnn-native entry; everything else is ttnn (so _chunk_apply/_chunk_inverse are unused in
+           the model, kept here for the standalone step ladder self-test only).
+
+PRODUCTION STATUS (which of these ship):
+  - ``decode_step_tt`` (fused T=1 decode) IS the default decode path (gated_delta.py QWEN36_GDN_FUSED=1).
+  - ``chunk_state_tt`` (bf16 chunk prefill) is EXPERIMENTAL/opt-in: the bf16 DST recurrence drifts to
+    incoherence over many layers, so the DEFAULT eager prefill uses the fp32/HiFi4 ttnn path
+    (_chunk_state_ttnn in gated_delta.py), NOT this kernel. chunk_state_tt is reached only by the
+    traced-prefill path and QWEN36_DELTA_STABLE_PREFILL=0. Making it the default would need fp32 DST
+    accumulation, which exceeds the 16-tile DST capacity (see Step 6) and thus requires per-matmul
+    tiling — future work.
+  - ``_chunk_apply``/``_chunk_inverse``/``chunk_inverse`` are used ONLY by main() below (the step-ladder
+    self-test), not by the model.
 
 Layout: one head per core (grid (n_heads,1)); C=64 (2 tiles); head-dim 64 or 128. Inputs are head-major
 stacked on the row (M) axis. k is passed pre-transposed as kt [D, C] so the kernel uses plain block

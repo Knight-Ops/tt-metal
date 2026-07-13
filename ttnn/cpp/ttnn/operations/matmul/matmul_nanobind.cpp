@@ -1048,7 +1048,7 @@ void py_module(nb::module_& mod) {
         Keyword Args:
             sparsity (ttnn.Tensor): the sparsity tensor containing the mask values. Needs to be on the device. The data type must be bfloat16.
             program_config (ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig): the program configuration for the matmul operation. Only this config type is supported. ``mcast_in0`` must be set to True.
-            nnz (int, optional): the number of non-zero values in the sparsity tensor. If not provided, it will be inferred from the sparsity tensor at runtime.
+            nnz (int, optional): the number of non-zero values in the sparsity tensor. If not provided (``None``), it is inferred from the sparsity tensor at runtime. When set, it MUST match the actual number of non-zero sparsity entries: a static ``nnz`` larger than the real count only wastes compute, but one SMALLER than the real count leaves selected groups uncomputed and can HANG/deadlock the kernel. Pin ``nnz`` to a fixed value only when the active count is invariant (e.g. fixed top-k routing, where exactly ``k`` entries are always non-zero).
             is_input_a_sparse (bool, optional): boolean indicating whether `input_tensor_a` is sparse. Defaults to `False`. Together with `is_input_b_sparse`, it determines how the sparsity tensor is interpreted. See the supported modes table below.
             is_input_b_sparse (bool, optional): boolean indicating whether `input_tensor_b` is sparse. Defaults to `True`. Together with `is_input_a_sparse`, it determines how the sparsity tensor is interpreted. See the supported modes table below.
             memory_config (ttnn.MemoryConfig, optional): the memory configuration of the output tensor. Defaults to `None`, which will result in using ttnn.DRAM_MEMORY_CONFIG.
@@ -1057,6 +1057,7 @@ void py_module(nb::module_& mod) {
             core_grid (ttnn.CoreGrid, optional): the grid on which to distribute the sharded tensor on (writes to the cores L1s). Defaults to `None`.
             output_tile (List of [int], optional): Specifies the output tile configuration. Defaults to `None`.
             optional_output_tensor (ttnn.Tensor, optional): User provided on-device output tensor where the result of matmul is to be written. Defaults to `None`.
+            indices (ttnn.Tensor, optional): enables INDEXED/GATHER mode. A ROW_MAJOR ``UINT16`` tensor listing the ``num_active`` sparse-group ids to compute (e.g. the top-k expert ids). When provided, the kernels iterate ONLY those ids (``bB = indices[i]``) instead of scanning every sparse group, and the output's group axis becomes COMPACT with length ``num_active`` (``output_shape[-3] = num_active``) rather than the full group count ``E``. ``num_active`` (the number of elements in ``indices``) must be <= the total number of sparse groups. Defaults to `None` (the group axis is scanned densely). Use this when only a few groups are active per call to avoid the full-group multicast cost.
 
         Returns:
             ttnn.Tensor: the output tensor with sparse results.

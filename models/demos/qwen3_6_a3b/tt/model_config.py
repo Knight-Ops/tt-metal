@@ -73,8 +73,21 @@ class ModelArgs:
         # --- precision (single-card memory budget) ---
         # Routed experts dominate the parameter count -> BFP4. Attention/linear-attn projections
         # and norms stay higher precision for accuracy.
-        self.expert_weight_dtype = ttnn.bfloat4_b
-        self.mlp_weight_dtype = ttnn.bfloat4_b
+        # QWEN36_EXPERT_DTYPE={bf4,bf8} overrides the routed-expert + shared-MLP precision. Default
+        # bf4 (the 35B model is ~17.5 GB in BFP4 vs ~35 GB in BFP8, and only BFP4 fits a 32 GB P150).
+        # bf8 is used by the accuracy sweep in evaluation/ to measure the BFP4 accuracy cost (it needs
+        # more DRAM, so pair it with fewer QWEN36_LAYERS if it OOMs on a single card).
+        _expert_dtype = {"bf4": ttnn.bfloat4_b, "bf8": ttnn.bfloat8_b}.get(
+            os.environ.get("QWEN36_EXPERT_DTYPE", "bf4").lower(), ttnn.bfloat4_b
+        )
+        self.expert_weight_dtype = _expert_dtype
+        self.mlp_weight_dtype = _expert_dtype
+        # Mixed-precision recipe (AesSedai/Ubergarm): pin the more-sensitive routed-expert down_proj
+        # to bf8 while gate_up stays bf4. Costs ~+5GB (still fits a 32GB P150), unlike uniform bf8
+        # experts (~+16GB -> OOM). QWEN36_EXPERT_DOWN_BF8=1 enables; default = same as expert dtype.
+        self.expert_down_weight_dtype = (
+            ttnn.bfloat8_b if os.environ.get("QWEN36_EXPERT_DOWN_BF8") == "1" else self.expert_weight_dtype
+        )
         self.attn_weight_dtype = ttnn.bfloat8_b
         self.linear_attn_weight_dtype = ttnn.bfloat8_b
         self.activation_dtype = ttnn.bfloat16

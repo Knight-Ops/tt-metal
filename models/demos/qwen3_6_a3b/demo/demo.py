@@ -7,9 +7,9 @@ Usage (tt-metal python_env):
     QWEN36_LAYERS=4  python models/demos/qwen3_6_a3b/demo/demo.py --prompt "Hello, world"
 
 Notes:
-  - Phase A: prefill-only path; "generation" re-runs the growing sequence per token (no caches),
-    so decode is O(seq^2). Use it to sanity-check coherence + measure prefill throughput.
-  - Real perf needs Phase B (fused on-device delta-rule scan + sparse MoE). See plan/status.
+  - Prefill then cached autoregressive decode (per-layer KV / gated-delta state caches).
+  - --trace uses the captured on-device decode trace (fast path); without it, decode runs eager.
+  - --temperature>0 enables on-device sampling for the decode tail (first token stays greedy).
 """
 
 import argparse

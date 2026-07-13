@@ -1,6 +1,6 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
-"""tt-nn MoE block for Qwen3.6-35B-A3B (Phase A: correctness-first, dense experts).
+"""tt-nn MoE block for Qwen3.6-35B-A3B.
 
 Matches HF ``Qwen3_5MoeSparseMoeBlock``:
   router: softmax over all experts -> top-k -> renormalize;
@@ -8,9 +8,10 @@ Matches HF ``Qwen3_5MoeSparseMoeBlock``:
   shared expert: an always-on MLP gated by ``sigmoid(shared_expert_gate)``;
   output = routed + shared.
 
-Phase A computes ALL experts for ALL tokens via a single batched matmul and masks by the
-(scattered) routing weights. This is ~num_experts/ top_k x the needed FLOPs but is simple and
-numerically faithful.
+PREFILL (default) computes ALL experts for ALL tokens via a single batched matmul and masks by the
+(scattered) routing weights. This is ~num_experts/top_k x the needed FLOPs but, at this expert size,
+the MoE prefill is dispatch-bound not FLOP-bound, so dense is measured faster than the sparse per-tile
+path and is the default. DECODE (T=1) uses the sparse/gather path (only the top_k active experts).
 
 An optional SPARSE per-tile prefill path (``forward_sparse_prefill``, opt-in via
 ``QWEN36_SPARSE_PREFILL=1``) processes tokens in 32-row tiles and computes, per tile, only the
@@ -55,6 +56,7 @@ class TtMoE(LightweightModule):
         num_experts,
         top_k,
         expert_dtype=ttnn.bfloat4_b,
+        down_dtype=None,
         dtype=ttnn.bfloat16,
         sparse_decode=True,
         compute_kernel_config=None,
@@ -105,7 +107,12 @@ class TtMoE(LightweightModule):
         # back to a shape read for direct callers (tests) that don't pass them.
         H = hidden if hidden is not None else W("gate_up_proj").shape[2]
         I = inter if inter is not None else W("gate_up_proj").shape[1] // 2
-        self.hidden, self.inter, self.expert_dtype = H, I, expert_dtype
+        # Routed-expert precision. gate_up stays at expert_dtype (bf4 by default); down_proj can be
+        # pinned higher via down_dtype (the AesSedai/Ubergarm mixed-precision recipe: down_proj is the
+        # more sensitive projection, so lifting only it recovers accuracy at ~1/3 the memory cost of
+        # lifting the whole expert). down_dtype=None -> same as expert_dtype (uniform).
+        down_dtype = down_dtype or expert_dtype
+        self.hidden, self.inter, self.expert_dtype, self.down_dtype = H, I, expert_dtype, down_dtype
         self.gate_up_sp = to_tt(
             lambda: W("gate_up_proj").transpose(1, 2).reshape(1, E, H, 2 * I).contiguous(),
             mesh_device,
@@ -115,7 +122,7 @@ class TtMoE(LightweightModule):
         self.down_sp = to_tt(
             lambda: W("down_proj").transpose(1, 2).reshape(1, E, I, H).contiguous(),
             mesh_device,
-            dtype=expert_dtype,
+            dtype=down_dtype,
             cache_file_name=cn("down_proj"),
         )
 

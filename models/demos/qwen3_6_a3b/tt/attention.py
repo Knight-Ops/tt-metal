@@ -8,7 +8,9 @@ Matches the HF ``Qwen3_5MoeAttention``:
   - per-head RMSNorm on q and k (head_dim), partial RoPE (rotary_dim = head_dim * 0.25),
   - GQA softmax attention (SDPA), output gated by ``sigmoid(gate)``, then ``o_proj``.
 
-Naive prefill path (no KV cache yet); decode/KV-cache to follow in Stage 4.
+Implements prefill (single-shot, chunked/incremental) and cached decode: a fixed-shape KV cache
+[1, n_kv, max_seq, head_dim] written in place via paged_update_cache, read by sdpa_decode. See the
+forward_prefill / forward_prefill_incremental / forward_decode methods.
 """
 from __future__ import annotations
 

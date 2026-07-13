@@ -1,12 +1,14 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
-"""tt-nn full model assembly for Qwen3.6-35B-A3B (text-only, prefill path).
+"""tt-nn full model assembly for Qwen3.6-35B-A3B (text-only).
 
 Embedding -> 40 hybrid decoder layers -> final RMSNorm -> lm_head. Layers are built one at a time
 via the streaming ``CheckpointLoader`` so host RAM never holds the full 72 GB checkpoint.
 
-Phase A: prefill only (no KV/state cache). Generation in the demo re-runs the growing sequence per
-token. KV/state caches + the fused delta-rule kernel come in Phase B.
+Implements prefill (single-shot, chunked long-prompt, and traced) plus cached decode with per-layer
+KV / gated-delta state caches and an optional captured decode trace. Decode selection is on-device
+(greedy argmax by default; on-device sampling via enable_sampling); a logits-returning decode
+(decode_forward_logits) supports host-side sampling for the vLLM path.
 """
 
 from __future__ import annotations
@@ -92,6 +94,40 @@ class TtModel(LightweightModule):
         x = ttnn.reshape(x, [1, self.args.dim])
         logits = ttnn.linear(x, self.lm_head_w)  # [1, vocab]
         return from_tt(logits, self.mesh_device).reshape(1, 1, self.args.vocab_size)
+
+    def _head_all(self, x, T, last_n=None):
+        """Like _head but returns logits for EVERY position (or the last ``last_n``), not just the last
+        token. Used by eval loglikelihood scoring (evaluation/), which needs the model's distribution at
+        each continuation position. ``last_n`` slices to the final ``last_n`` positions BEFORE the
+        248k-vocab matmul so the compute + D2H transfer scale with the (short) continuation, not the full
+        prompt. Returns torch [S, vocab] where S = min(T, last_n) (or T if last_n is None)."""
+        S = T if last_n is None or last_n >= T else last_n
+        if S != T:
+            x = ttnn.slice(x, [0, 0, T - S, 0], [1, 1, T, self.args.dim])
+        x = self.final_norm.forward(x)
+        x = ttnn.reshape(x, [S, self.args.dim])
+        logits = ttnn.linear(x, self.lm_head_w)  # [S, vocab]
+        return from_tt(logits, self.mesh_device).reshape(S, self.args.vocab_size)
+
+    def forward_prefill_all_logits(self, input_ids: torch.Tensor, last_n: int | None = None):
+        """Prefill returning per-position logits [S, vocab] (S = min(T, last_n), or T). Additive eval
+        entry point — existing callers (forward/_prefill_single) are unchanged. Single-shot only, so the
+        prompt must fit a single-shot prefill (bounded by max_seq_len; MMLU-style prompts are short).
+        Each call is self-contained: caches are (re)allocated and the gated-delta conv left-pad reset, so
+        successive independent sequences don't leak state into one another."""
+        T = input_ids.shape[1]
+        self.max_seq = self.args.max_seq_len
+        if getattr(self, "caches", None) is None or not getattr(self, "_pf_caches_ready", False):
+            self.caches = [self._alloc_cache(layer) for layer in self.layers]
+            self._pf_caches_ready = True
+        else:
+            self._reset_linear_state()  # fresh sequence: clear the gated-delta conv left-pad
+        self.pos = T
+        x = self._embed(input_ids, T)
+        cos, sin = precompute_rope(T, self.args.rotary_dim, self.args.rope_theta, self.mesh_device)
+        for layer, cache in zip(self.layers, self.caches):
+            x = layer.forward_prefill(x, cos, sin, cache)
+        return self._head_all(x, T, last_n=last_n)
 
     def _alloc_cache(self, layer):
         if layer.is_linear:
@@ -291,7 +327,13 @@ class TtModel(LightweightModule):
         """Traced prefill with bucketing. Pads the prompt up to the smallest captured bucket >= T,
         replays that trace, and runs the eager head at the REAL last token. Falls back to eager
         forward() if T exceeds the largest bucket (only possible if buckets don't reach max_seq_len;
-        a prompt > max_seq_len can't run at all — fixed KV cache). Leaves caches + self.pos for decode."""
+        a prompt > max_seq_len can't run at all — fixed KV cache). Leaves caches + self.pos for decode.
+
+        NUMERICAL CAVEAT: the traced gated-delta prefill runs the bf16 ttl chunk_state kernel (trace
+        capture forbids the in-graph allocations the fp32 _chunk_state_ttnn path needs), which is
+        numerically approximate and drifts over many layers — see gated_delta.py's _STABLE_PREFILL
+        note. Prefer eager forward() for accuracy; this path is for perf experiments (it is opt-in in
+        demo/server.py via QWEN36_SERVER_PREFILL_TRACE)."""
         T = input_ids.shape[1]
         buckets = getattr(self, "_pf_buckets", None) or sorted(getattr(self, "_pf_traces", {}).keys())
         B = next((b for b in buckets if b >= T), None)

@@ -87,6 +87,28 @@ def test_plain_text_no_tools():
     assert reasoning == "thinking..."
 
 
+# Thinking-OFF output: with enable_thinking=False the prompt already contains the closed
+# <think></think>, so the model's OUTPUT has no </think> and goes straight to the tool call.
+NO_THINK = "<tool_call>\n<function=set_count>\n<parameter=n>\n5\n</parameter>\n</function>\n</tool_call>"
+
+
+def test_no_think_tool_call_parses():
+    # expect_thinking=False (the default for tool requests): the tool call must be parsed even though
+    # the output has no </think>.
+    reasoning, content, calls = _parse_chat_output(NO_THINK, TOOLS, expect_thinking=False)
+    assert reasoning == ""
+    assert len(calls) == 1 and calls[0]["function"]["name"] == "set_count"
+    assert _args(calls[0]) == {"n": 5}
+
+
+def test_no_think_output_with_expect_thinking_true_is_not_a_tool_call():
+    # Guard the failure mode: if the parser wrongly expects a leading think block on a no-think output,
+    # it swallows the whole thing as reasoning and emits no tool call. This documents why the server
+    # threads expect_thinking through from the request's resolved thinking mode.
+    reasoning, content, calls = _parse_chat_output(NO_THINK, TOOLS, expect_thinking=True)
+    assert calls == []
+
+
 def _stream_parse(text):
     """Reassemble (reasoning, content, tool_calls) by feeding cumulative prefixes to the stream
     parser, char by char — mimics how the SSE endpoint drives it from growing decoded text."""

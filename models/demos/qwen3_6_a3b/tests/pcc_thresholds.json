@@ -1,0 +1,15 @@
+{
+  "_comment": "Per-test PCC gates for the qwen3_6_a3b module tests (mirrors TT's blackhole/qwen36 tests/pcc_thresholds.json). These are the CHECKPOINT-FREE module tests (random / per-module weights), so they run on a single Blackhole in CI without the 87GB HF checkpoint. Source of truth for the CI gate (see run_ci_tests.sh). NOTE: the tests currently hardcode these thresholds inline; adopt this file as the single source in a follow-up.",
+  "test_norms": 0.999,
+  "test_attention": 0.99,
+  "test_attention_decode": 0.99,
+  "test_gated_delta": 0.99,
+  "test_gated_delta_decode": 0.99,
+  "test_moe": 0.99,
+  "test_moe_sparse": 0.999,
+  "_excluded_from_device_ci": {
+    "_reason": "test_model/test_trace/test_long_prefill/test_ragged_prefill need the 87GB HF checkpoint; test_reference_smoke needs the separate transformers>=5.2 reference venv, not python_env.",
+    "checkpoint_required": ["test_model", "test_trace", "test_long_prefill", "test_ragged_prefill"],
+    "reference_venv_required": ["test_reference_smoke"]
+  }
+}
