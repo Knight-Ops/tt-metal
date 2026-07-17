@@ -97,6 +97,32 @@ def from_tt(tt_tensor, mesh_device=None):
     return ttnn.to_torch(tt_tensor)
 
 
+def build_dram_shard(w, K, N, nb=8):
+    """Width-shard an already-loaded weight ``w`` [K, N] across ``nb`` DRAM banks (P150 has 8) and return
+    ``(w_dram, act_mc, out_mc, program_config)`` for a T=1 DRAM-sharded decode matmul.
+
+    At T=1 a matmul that reads its weight from interleaved DRAM is only ~25-70% bandwidth-efficient;
+    width-sharding the weight across the DRAM banks + L1-width-sharding the activation ([32, K/nb]) and
+    output ([32, N/nb]) runs it up to ~2.7x faster (measured — biggest gain on K-heavy / narrow-N output
+    projections). ``nb``=8 (== DRAM banks) is optimal; more compute cores only add multicast overhead at
+    M=1 (measured sweep). Caller resards the activation into ``act_mc`` and the output back out. See
+    FUTURE_OPTIMIZATIONS.md."""
+    Nt, Kt = (N + 31) // 32, (K + 31) // 32
+    sn, sk = ((Nt + nb - 1) // nb) * 32, ((Kt + nb - 1) // nb) * 32
+    cores = ttnn.CoreRangeSet({ttnn.CoreRange(ttnn.CoreCoord(0, 0), ttnn.CoreCoord(nb - 1, 0))})
+
+    def smc(h, ww, buf):
+        return ttnn.MemoryConfig(
+            ttnn.TensorMemoryLayout.WIDTH_SHARDED, buf, ttnn.ShardSpec(cores, [h, ww], ttnn.ShardOrientation.ROW_MAJOR)
+        )
+
+    w_dram = ttnn.to_memory_config(w, smc(K, sn, ttnn.BufferType.DRAM))
+    pc = ttnn.MatmulMultiCoreReuseMultiCastDRAMShardedProgramConfig(
+        in0_block_w=sk // 32, per_core_M=1, per_core_N=sn // 32, fused_activation=None
+    )
+    return w_dram, smc(32, sk, ttnn.BufferType.L1), smc(32, sn, ttnn.BufferType.L1), pc
+
+
 def as_weight(source, mesh_device, dtype=ttnn.bfloat16, cache_file_name=None):
     """Convert an nn.Linear weight (out, in) to a tt tensor laid out for ttnn.linear (in, out).
 

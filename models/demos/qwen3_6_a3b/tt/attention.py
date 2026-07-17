@@ -14,12 +14,22 @@ forward_prefill / forward_prefill_incremental / forward_decode methods.
 """
 from __future__ import annotations
 
+import os
+
 import torch
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt.common import as_weight, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
+
+# DRAM-shard the DECODE output projection (o_proj / wo): K=n_heads*head_dim, N=hidden — the K-heavy
+# narrow-N shape that DRAM sharding speeds up ~2.7x at T=1 (measured; incl. reshards). Decode-only.
+# Default on; QWEN36_ATTN_DRAM_SHARD=0 reverts. See FUTURE_OPTIMIZATIONS.md.
+_ATTN_DRAM_SHARD = os.environ.get("QWEN36_ATTN_DRAM_SHARD", "1") != "0"
+# DRAM-shard the DECODE input projections wq/wgate (K=hidden, N=n_heads*head_dim). Measured 1.71-1.73x
+# per op at T=1 (bench_matmul_layout.py). Decode-only; prefill keeps interleaved. QWEN36_ATTN_DRAM_SHARD_IN=0 reverts.
+_ATTN_DRAM_SHARD_IN = os.environ.get("QWEN36_ATTN_DRAM_SHARD_IN", "1") != "0"
 
 
 def precompute_rope(seq_len, rotary_dim, theta, device, dtype=ttnn.bfloat16, start_pos=0):
@@ -94,6 +104,19 @@ class TtAttention(LightweightModule):
         self.wk = as_weight(weights["k_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wk"))
         self.wv = as_weight(weights["v_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wv"))
         self.wo = as_weight(weights["o_proj"], mesh_device, dtype=dtype, cache_file_name=cn("wo"))
+        # DRAM-sharded decode output projection (built from the interleaved wo; prefill keeps interleaved).
+        self._wo_dram = None
+        if _ATTN_DRAM_SHARD:
+            self._wo_dram, self._wo_amc, self._wo_omc, self._wo_pc = build_dram_shard(
+                self.wo, self.wo.shape[-2], self.wo.shape[-1]
+            )
+        # DRAM-sharded decode input projections wq/wgate (identical [hidden, n_heads*head_dim] shape ->
+        # one shared act/out/program config; two weight tensors). Prefill keeps the interleaved wq/wgate.
+        self._wq_dram = None
+        if _ATTN_DRAM_SHARD_IN:
+            Kq, Nq = self.wq.shape[-2], self.wq.shape[-1]
+            self._wq_dram, self._wqg_amc, self._wqg_omc, self._wqg_pc = build_dram_shard(self.wq, Kq, Nq)
+            self._wgate_dram, _, _, _ = build_dram_shard(self.wgate, Kq, Nq)
         self.q_norm = TtRMSNorm(mesh_device, W("q_norm"), eps, add_unit_offset=True)
         self.k_norm = TtRMSNorm(mesh_device, W("k_norm"), eps, add_unit_offset=True)
         # Bounded K/V chunking so flash-decode L1 use stays within budget at long context
@@ -118,8 +141,18 @@ class TtAttention(LightweightModule):
 
     def _qkv(self, x, cos, sin):
         S = x.shape[2]
-        q = ttnn.linear(x, self.wq)
-        gate = ttnn.linear(x, self.wgate)
+        if S == 1 and self._wq_dram is not None:
+            # Decode: DRAM-sharded wq/wgate. Reshard x once (shared K), run both, reshard outputs back
+            # to interleaved DRAM and restore the [1,1,1,N] contract the interleaved path produces.
+            N = self.n_heads * self.head_dim
+            x2 = ttnn.to_memory_config(ttnn.reshape(x, [1, self.wq.shape[-2]]), self._wqg_amc)
+            q = ttnn.linear(x2, self._wq_dram, program_config=self._wqg_pc, memory_config=self._wqg_omc)
+            gate = ttnn.linear(x2, self._wgate_dram, program_config=self._wqg_pc, memory_config=self._wqg_omc)
+            q = ttnn.reshape(ttnn.to_memory_config(q, ttnn.DRAM_MEMORY_CONFIG), [1, 1, 1, N])
+            gate = ttnn.reshape(ttnn.to_memory_config(gate, ttnn.DRAM_MEMORY_CONFIG), [1, 1, 1, N])
+        else:
+            q = ttnn.linear(x, self.wq)
+            gate = ttnn.linear(x, self.wgate)
         k = ttnn.linear(x, self.wk)
         v = ttnn.linear(x, self.wv)
         q = self.q_norm.forward(ttnn.reshape(q, [1, S, self.n_heads, self.head_dim]))
@@ -209,4 +242,8 @@ class TtAttention(LightweightModule):
         )
         attn = ttnn.reshape(attn, [1, 1, 1, self.n_heads * self.head_dim])
         attn = ttnn.multiply(attn, ttnn.sigmoid(gate))
+        if self._wo_dram is not None:
+            attn2 = ttnn.to_memory_config(ttnn.reshape(attn, [1, self.n_heads * self.head_dim]), self._wo_amc)
+            osh = ttnn.linear(attn2, self._wo_dram, program_config=self._wo_pc, memory_config=self._wo_omc)
+            return ttnn.reshape(ttnn.to_memory_config(osh, ttnn.DRAM_MEMORY_CONFIG), [1, 1, 1, self.wo.shape[-1]])
         return ttnn.linear(attn, self.wo)

@@ -40,7 +40,12 @@ import ttnn
 from models.common import moe_gather
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt.common import as_weight, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
+
+# DRAM-shard the DECODE shared-expert down projection se_down (K=se_inter, N=hidden). Microbench showed
+# 1.46x per op, but at 40L it is a WASH: se_down's ~6us matmul saving is eaten by the ~8us reshard in/out
+# (K=512 is small, so the fixed reshard cost dominates). Default OFF; opt in with QWEN36_MOE_SE_DRAM_SHARD=1.
+_SE_DRAM_SHARD = os.environ.get("QWEN36_MOE_SE_DRAM_SHARD", "0") == "1"
 
 # Max tokens per dense-expert matmul chunk. The tuned batched-matmul program config holds each
 # expert's full [tc, N] output in L1 (per_core_M = tc/32); tc=256 (per_core_M=8) is proven to fit,
@@ -137,6 +142,12 @@ class TtMoE(LightweightModule):
         )
         self.se_down = as_weight(weights["se_down_proj"], mesh_device, dtype=dtype, cache_file_name=cn("se_down"))
         self.se_router = as_weight(weights["se_router"], mesh_device, dtype=dtype, cache_file_name=cn("se_router"))
+        # DRAM-sharded decode se_down (built from the interleaved weight; prefill keeps interleaved).
+        self._se_down_dram = None
+        if _SE_DRAM_SHARD:
+            self._se_down_dram, self._se_amc, self._se_omc, self._se_pc = build_dram_shard(
+                self.se_down, self.se_down.shape[-2], self.se_down.shape[-1]
+            )
 
     @staticmethod
     def _grid_for(Nt):
@@ -191,8 +202,9 @@ class TtMoE(LightweightModule):
         cx, cy = cls._grid_for(Nt)
         # in0_block_w = K-tiles processed per K-block. Larger -> fewer K-block iterations -> fewer
         # per-block multicast-semaphore handshakes (the measured decode MoE bottleneck). Must divide
-        # Kt for both expert matmuls (gate_up Kt=64, down Kt=16 -> common divisors 1,2,4,8,16).
-        in0bw = int(os.environ.get("QWEN36_SPARSE_IN0BW", "8"))
+        # Kt for both expert matmuls (gate_up Kt=64, down Kt=16 -> common divisors 1,2,4,8,16). Measured
+        # 16 > 8 at 40L: MoE 0.348 -> 0.321 ms/op (~-1.1 ms/token), PCC-identical (program config only).
+        in0bw = int(os.environ.get("QWEN36_SPARSE_IN0BW", "16"))
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(cx, cy),
             in0_block_w=in0bw,
@@ -327,7 +339,13 @@ class TtMoE(LightweightModule):
         se_gu = ttnn.linear(x2, self.se_gate_up)  # [T, 2*se_inter]
         se_gate, se_up = self._split_last(se_gu, self.se_inter)
         shared = ttnn.multiply(ttnn.silu(se_gate), se_up)
-        shared = ttnn.linear(shared, self.se_down)
+        if self._se_down_dram is not None and x2.shape[0] == 1:
+            # Decode: DRAM-sharded se_down. Reshard in, matmul, reshard back to interleaved DRAM.
+            sh_in = ttnn.to_memory_config(shared, self._se_amc)
+            shared = ttnn.linear(sh_in, self._se_down_dram, program_config=self._se_pc, memory_config=self._se_omc)
+            shared = ttnn.to_memory_config(shared, ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            shared = ttnn.linear(shared, self.se_down)
         shared = ttnn.multiply(shared, ttnn.sigmoid(ttnn.linear(x2, self.se_router)))  # [T, hidden]
         logits = ttnn.linear(x2, self.gate_w)  # [T, E]
         probs = ttnn.softmax(logits, dim=-1)

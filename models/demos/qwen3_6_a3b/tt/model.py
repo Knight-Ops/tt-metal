@@ -23,6 +23,7 @@ from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt.attention import precompute_rope
 from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt
 from models.demos.qwen3_6_a3b.tt.decoder import TtDecoderLayer
+from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
@@ -139,7 +140,7 @@ class TtModel(LightweightModule):
             # eager-prefill→traced-decode path fataled only at high layer counts (memory pressure
             # reclaims the ~1 MB-per-layer transients); the traced-prefill path already pre-allocated.
             a = self.args
-            return {
+            cache = {
                 "conv_state": ttnn.zeros(
                     [a.conv_kernel_size - 1, a.lin_conv_dim],
                     dtype=ttnn.bfloat16,
@@ -153,6 +154,16 @@ class TtModel(LightweightModule):
                     device=self.mesh_device,
                 ),
             }
+            if _CONV_ADDCHAIN:
+                # decode add-chain history: K-1 persistent [1, conv_dim] row buffers (stable address ->
+                # in-place shift is trace-safe). Populated from conv_state at start_decode; see gated_delta.
+                cache["conv_rows"] = [
+                    ttnn.zeros(
+                        [1, a.lin_conv_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+                    )
+                    for _ in range(a.conv_kernel_size - 1)
+                ]
+            return cache
         # fixed-shape KV cache for an attention layer: [1, n_kv, max_seq, head_dim]
         shape = [1, self.args.n_kv_heads, self.max_seq, self.args.head_dim]
         k = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
@@ -474,6 +485,12 @@ class TtModel(LightweightModule):
             dtype=ttnn.uint32,
             layout=ttnn.ROW_MAJOR_LAYOUT,
         )
+        if _CONV_ADDCHAIN:
+            # seed the decode conv add-chain's history rows from the prefill-filled conv_state (once,
+            # eager). After this, each decode step reads/shifts conv_rows in place; conv_state is unused.
+            for layer, cache in zip(self.layers, self.caches):
+                if layer.is_linear:
+                    layer.mixer.sync_conv_rows(cache)
 
     def _rope_for(self, rope_pos):
         """Index the RoPE tables at the current position -> (cos, sin) of [1,1,1,rotary_dim]."""
@@ -584,8 +601,9 @@ class TtModel(LightweightModule):
         for c in self.caches:
             if isinstance(c, list):  # attention KV [k, v]
                 ts += c
-            else:  # gated-delta state dict
-                ts += [v for v in c.values()]
+            else:  # gated-delta state dict (conv_rows is itself a list of row buffers -> flatten)
+                for v in c.values():
+                    ts += v if isinstance(v, list) else [v]
         ts += [self.t_tok, self.t_curpos, self.t_ropepos]  # generation state advances on device
         if self.sampling is not None:
             ts.append(self.t_seed)  # RNG seed advances each step; snapshot/restore around capture

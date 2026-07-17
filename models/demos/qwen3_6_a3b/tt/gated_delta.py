@@ -29,7 +29,7 @@ import torch
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt.common import as_weight, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
 from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_tt
 
@@ -59,6 +59,21 @@ _BATCH_PREP = os.environ.get("QWEN36_DELTA_BATCH_PREP", "1") != "0"
 _GDN_L1 = os.environ.get("QWEN36_GDN_L1", "1") != "0"
 _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
 
+# DECODE conv as an add-chain over K-1 separate [1,conv_dim] history-row buffers instead of the
+# concat+multiply+row-sum+slice path. The two dim-0 (row) ops in the stacked path — concat([state,mixed])
+# and slice(xpad[1:K]) — are dispatch-bound and cost ~0.075 ms/layer EACH (measured, ~87% of the decode
+# conv); the row-assembly can't be made cheaper in place (ttnn slice/concat have no output_tensor= and
+# tiled tensors can't be sub-region-written). Keeping history as separate rows makes the sliding-window
+# shift 3 cheap equal-shape copies and the compute 4 mul + 3 add over [1,conv_dim], removing both dim-0
+# ops: measured 0.430 -> 0.318 ms/layer (~3.4 ms/token, ~10% of decode). NOT bit-identical (bf16 add-chain
+# vs fp32 row-sum) but PCC-validated == baseline (0.99979 on test_gated_delta_decode; the accumulation
+# matches, unlike the reverted on-core kernel's matmul-ones row-sum which drifted to 0.885). conv_rows is
+# populated once from conv_state at start_decode (prefill stays on the unchanged concat/stacked path).
+# Default ON (measured 40L: decode 31.5->34.6 tok/s/user, +9.8%; teacher-forced decode logit-PCC vs the
+# baseline mean 0.996, stable); QWEN36_CONV_ADDCHAIN=0 reverts to the concat/row-sum path. See
+# CONV_FOLD_HANDOFF.md / FUTURE_OPTIMIZATIONS.md Lever 3b.
+_CONV_ADDCHAIN = os.environ.get("QWEN36_CONV_ADDCHAIN", "1") != "0"
+
 # Fused single-step (T=1) DECODE kernel: collapse the whole per-head gated-delta decode step
 # (l2norm(q)*scale + l2norm(k) + gate/beta + rank-1 recurrence + gated RMSNorm) into ONE ttl launch
 # over all value heads, instead of ~30 tiny dispatch-bound ttnn ops. The 4 projections (w_qkv/w_z/
@@ -66,6 +81,20 @@ _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
 # The kernel compiles once per (n_v_heads, n_k_heads, head-dim) shape (~1 min, disk-cached).
 _GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") != "0"
 TILE = 32
+
+# Fuse the 3 input projections (in_proj_qkv -> conv_dim, in_proj_z -> value_dim, in_proj_b|a -> 2V)
+# into ONE [hidden, conv_dim+value_dim+2V] matmul: a single dispatch + weight read per step instead of
+# three (the T=1 decode path is dispatch-bound). The output is sliced [conv_dim | value_dim | 2V] in
+# forward. Also makes the input projection a single big matmul, the natural unit for DRAM sharding
+# (QWEN36_GDN_DRAM_SHARD). Default on; QWEN36_GDN_FUSE_IN=0 loads the three weights separately.
+_FUSE_IN = os.environ.get("QWEN36_GDN_FUSE_IN", "1") != "0"
+
+# DRAM-shard the DECODE output projection (w_out): at T=1 the [value_dim, hidden] matmul reads the
+# weight from interleaved DRAM at only ~25% BW efficiency; width-sharding it across the 8 DRAM banks +
+# L1-width-sharding the activation runs it ~2.7x faster (measured, incl. the in/out reshards). Decode-
+# only (prefill keeps the interleaved w_out). Default on; QWEN36_GDN_DRAM_SHARD=0 reverts.
+_DRAM_SHARD = os.environ.get("QWEN36_GDN_DRAM_SHARD", "1") != "0"
+_DRAM_BANKS = 8  # P150 DRAM controllers
 
 # Numerically-stable chunked PREFILL (default on). Two independent issues made the original chunked
 # prefill emit gibberish for prompts >1 chunk on this model's strong-decay heads (g down to ~-92/step,
@@ -124,16 +153,33 @@ class TtGatedDeltaNet(LightweightModule):
 
         # weights[*] are lazy thunks (see load_checkpoints): projections passed straight through to
         # as_weight (read only on a cache miss); tiny conv/norm/A_log/dt_bias tensors read eagerly.
-        self.w_qkv = as_weight(weights["in_proj_qkv"], mesh_device, dtype=dtype, cache_file_name=cn("w_qkv"))
-        self.w_z = as_weight(weights["in_proj_z"], mesh_device, dtype=dtype, cache_file_name=cn("w_z"))
-        # in_proj_b and in_proj_a both map hidden -> V; fuse into one [hidden, 2V] matmul (one launch
-        # instead of two), split the output b|a in forward. Both weights are [V, hidden] (nn.Linear).
-        self.w_ba = as_weight(
-            lambda: torch.cat([W("in_proj_b"), W("in_proj_a")], dim=0),
-            mesh_device,
-            dtype=dtype,
-            cache_file_name=cn("w_ba"),
+        # Output slice offsets for the fused input projection: [0:conv_dim] -> qkv (conv input),
+        # [conv_dim:+value_dim] -> z, [+2V] -> b|a (b first, a second).
+        self._in_off = (
+            self.conv_dim,
+            self.conv_dim + self.value_dim,
+            self.conv_dim + self.value_dim + 2 * self.num_v_heads,
         )
+        if _FUSE_IN:
+            # One fused matmul weight = concat(in_proj_qkv, in_proj_z, in_proj_b, in_proj_a) along the
+            # output dim (nn.Linear [out, hidden]); as_weight transposes to [hidden, N_total].
+            self.w_in_proj = as_weight(
+                lambda: torch.cat([W("in_proj_qkv"), W("in_proj_z"), W("in_proj_b"), W("in_proj_a")], dim=0),
+                mesh_device,
+                dtype=dtype,
+                cache_file_name=cn("w_in_proj"),
+            )
+        else:
+            self.w_qkv = as_weight(weights["in_proj_qkv"], mesh_device, dtype=dtype, cache_file_name=cn("w_qkv"))
+            self.w_z = as_weight(weights["in_proj_z"], mesh_device, dtype=dtype, cache_file_name=cn("w_z"))
+            # in_proj_b and in_proj_a both map hidden -> V; fuse into one [hidden, 2V] matmul (one launch
+            # instead of two), split the output b|a in forward. Both weights are [V, hidden] (nn.Linear).
+            self.w_ba = as_weight(
+                lambda: torch.cat([W("in_proj_b"), W("in_proj_a")], dim=0),
+                mesh_device,
+                dtype=dtype,
+                cache_file_name=cn("w_ba"),
+            )
         self.w_out = as_weight(weights["out_proj"], mesh_device, dtype=dtype, cache_file_name=cn("w_out"))
         self.norm = TtRMSNormGated(mesh_device, W("norm"), self.eps)
 
@@ -171,6 +217,15 @@ class TtGatedDeltaNet(LightweightModule):
             )
             self._fused_scratch = None  # (out_buf, Snew_buf), allocated on first decode
 
+        # DRAM-sharded decode output projection (built from the already-loaded interleaved w_out, so no
+        # extra HF read). K=value_dim (in), N=hidden (out). Prefill still uses self.w_out (interleaved).
+        self._wout_dram = None
+        if _DRAM_SHARD:
+            K, N = self.w_out.shape[-2], self.w_out.shape[-1]
+            self._wout_dram, self._wout_amc, self._wout_omc, self._wout_pc = build_dram_shard(
+                self.w_out, K, N, _DRAM_BANKS
+            )
+
     def _conv_silu(self, mixed, conv_state=None):
         """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns (out[T,conv_dim], new_conv_state[K-1,conv_dim])."""
         T = mixed.shape[0]
@@ -198,6 +253,32 @@ class TtGatedDeltaNet(LightweightModule):
                 acc = term if acc is None else ttnn.add(acc, term)
         new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim])
         return ttnn.silu(acc, memory_config=_MC), new_state
+
+    def sync_conv_rows(self, cache):
+        """Populate the decode add-chain's K-1 separate history-row buffers from the [K-1, conv_dim]
+        conv_state (which prefill fills). Called once when entering decode (model.start_decode). rows[i]
+        = conv_state row i = x_{t-(K-1)+i} (oldest..newest). Eager, one-time (K-1 dim-0 slices)."""
+        if not (isinstance(cache, dict) and "conv_rows" in cache and "conv_state" in cache):
+            return
+        cs, rows = cache["conv_state"], cache["conv_rows"]
+        for i in range(self.conv_k - 1):
+            ttnn.copy(ttnn.slice(cs, [i, 0], [i + 1, self.conv_dim]), rows[i])
+
+    def _conv_addchain_decode(self, mixed, rows):
+        """T==1 decode conv as a bf16 add-chain over separate [1, conv_dim] history rows, then shift the
+        window in place. out = sum_{i<K-1} rows[i]*tap[i] + mixed*tap[K-1], matching the stacked path's
+        terms (rows[i] == conv_state row i == xpad[i]; tap[i] == conv_taps_stacked[i]). Removes the two
+        dispatch-bound dim-0 ops (concat + xpad slice). rows are persistent cache buffers -> the in-place
+        shift is trace-safe. Returns out [1, conv_dim]; state lives in `rows` (no copy@571)."""
+        K = self.conv_k
+        acc = ttnn.multiply(mixed, self.conv_taps[K - 1], memory_config=_MC)
+        for i in range(K - 1):
+            acc = ttnn.add(acc, ttnn.multiply(rows[i], self.conv_taps[i], memory_config=_MC), memory_config=_MC)
+        out = ttnn.silu(acc, memory_config=_MC)
+        for i in range(K - 2):  # slide the window: drop oldest, shift down
+            ttnn.copy(rows[i + 1], rows[i])
+        ttnn.copy(mixed, rows[K - 2])  # newest history row = the current token
+        return out
 
     def _ensure_chunk_masks(self):
         """Constant [1,1,C,C] masks for the chunked prep — built once (chunk_size is fixed)."""
@@ -509,24 +590,37 @@ class TtGatedDeltaNet(LightweightModule):
         # gated-delta step, since the decode path is many tiny dispatch-bound ops, not DRAM-bandwidth.
         # Prefill (T>1) stays on the default (interleaved DRAM) to avoid L1 overflow at large T.
         mc = _MC if T == 1 else None
+        V = self.num_v_heads
 
-        mixed = ttnn.linear(x2, self.w_qkv, memory_config=mc)  # [T, conv_dim]
-        conv_state = cache.get("conv_state") if cache else None
-        mixed, new_conv_state = self._conv_silu(mixed, conv_state)
-        if cache is not None:
-            if conv_state is not None:
-                ttnn.copy(new_conv_state, conv_state)  # in-place: keep persistent buffer (traceable)
-            else:
-                cache["conv_state"] = new_conv_state
+        # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). One fused input matmul (default)
+        # produces qkv|z|b|a together; slice it. z/b/a don't depend on the conv, so slice them upfront.
+        if _FUSE_IN:
+            allp = ttnn.linear(x2, self.w_in_proj, memory_config=mc)  # [T, conv_dim+value_dim+2V]
+            o0, o1, o2 = self._in_off
+            mixed = ttnn.slice(allp, [0, 0], [T, o0], memory_config=mc)  # -> conv input
+            z = ttnn.slice(allp, [0, o0], [T, o1], memory_config=mc)  # [T, value_dim]
+            ba = ttnn.slice(allp, [0, o1], [T, o2], memory_config=mc)  # [T, 2V]
+        else:
+            mixed = ttnn.linear(x2, self.w_qkv, memory_config=mc)  # [T, conv_dim]
+            z = ttnn.linear(x2, self.w_z, memory_config=mc)  # [T, value_dim]
+            ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
+
+        if _CONV_ADDCHAIN and T == 1 and cache is not None and "conv_rows" in cache:
+            # decode fast path: add-chain over separate history rows (conv_rows synced from conv_state at
+            # start_decode); state is maintained in-place in conv_rows, so no new_state / copy-back.
+            mixed = self._conv_addchain_decode(mixed, cache["conv_rows"])
+        else:
+            conv_state = cache.get("conv_state") if cache else None
+            mixed, new_conv_state = self._conv_silu(mixed, conv_state)
+            if cache is not None:
+                if conv_state is not None:
+                    ttnn.copy(new_conv_state, conv_state)  # in-place: keep persistent buffer (traceable)
+                else:
+                    cache["conv_state"] = new_conv_state
 
         q = ttnn.slice(mixed, [0, 0], [T, self.key_dim], memory_config=mc)
         k = ttnn.slice(mixed, [0, self.key_dim], [T, 2 * self.key_dim], memory_config=mc)
         v = ttnn.slice(mixed, [0, 2 * self.key_dim], [T, self.conv_dim], memory_config=mc)
-        z = ttnn.linear(x2, self.w_z, memory_config=mc)  # [T, value_dim]
-
-        # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). b|a from one fused matmul.
-        V = self.num_v_heads
-        ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
 
         # Fused single-step decode: one ttl launch for the whole step (prep + recurrence + gated-norm).
         # q/k [1,key_dim], v/z [1,value_dim] feed the kernel directly (heads along columns); raw a/b are
@@ -652,5 +746,15 @@ class TtGatedDeltaNet(LightweightModule):
             self.eps,
         )
         ttnn.copy(ttnn.reshape(snew_buf, [1, V, Dk, Dv]), state_buf)  # in-place state update (trace-safe)
-        y = ttnn.linear(out_buf, self.w_out, memory_config=_MC)  # [1, hidden]
+        if self._wout_dram is not None:
+            # DRAM-sharded output projection: L1-shard the activation, matmul, reshard back to L1.
+            osh = ttnn.linear(
+                ttnn.to_memory_config(out_buf, self._wout_amc),
+                self._wout_dram,
+                program_config=self._wout_pc,
+                memory_config=self._wout_omc,
+            )  # [1, hidden] width-sharded
+            y = ttnn.to_memory_config(osh, ttnn.L1_MEMORY_CONFIG if _GDN_L1 else ttnn.DRAM_MEMORY_CONFIG)
+        else:
+            y = ttnn.linear(out_buf, self.w_out, memory_config=_MC)  # [1, hidden]
         return ttnn.reshape(y, [1, 1, 1, hidden])
