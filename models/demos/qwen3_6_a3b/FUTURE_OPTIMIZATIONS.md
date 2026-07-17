@@ -82,7 +82,7 @@ reshard in/out (K is too small for the fixed reshard cost to amortize). Code kep
 Shared helper `common.build_dram_shard(w, K, N)` (returns w_dram, act_mc, out_mc, program_config).
 
 ### ✅/⏭ Lever 2 — MoE `sparse_matmul` overhead
-The 8-of-256 gather already shipped (see `MOE_GATHER_PLAN.md`, 74→43 ms/token) and the old "256-slot scan"
+The 8-of-256 gather already shipped (74→43 ms/token) and the old "256-slot scan"
 premise was measured-false; the real cost is the **per-K-block multicast handshake**, tuned by
 `in0_block_w` (`_sparse_pc`, env `QWEN36_SPARSE_IN0BW`).
 **DONE (2026-07-16):** raised the default `in0_block_w` 8→**16** (the only higher value dividing both
@@ -129,7 +129,7 @@ blocked by the **32-DFB budget** on the already-dense recurrence kernel (29/32; 
 reuse). NOTE: folding in-kernel fixes only the *perf* half; an in-kernel conv still rounds differently
 from ttnn's `_conv_silu`, so the §1 accuracy divergence persists — the real gate must be a quality eval
 (MMLU-Redux, `evaluation/`), not decode token-identity (this model's decode is at the bf16-determinism
-edge). Full engineering handoff in `CONV_FOLD_HANDOFF.md`. Deferred as higher-effort kernel work.
+edge). Deferred as higher-effort kernel work.
 
 ### ⏭⏭ Lever 1c (BIG, deferred) — ring matmul + DRAM prefetcher (`matmul_1d_ring_config`)
 tt_transformers' highest-performance decode matmul family (`model_config.py: matmul_1d_ring_config`,
@@ -161,6 +161,16 @@ prefetcher. Blocked by the non-matmul ops in the gated-delta path (conv, the `de
 l2norm, gated RMSNorm) that currently expect interleaved tensors — each would need a sharded-friendly
 variant. Large, higher-risk refactor of a working, coherent model; do it only when chasing the last ~2×.
 
+### ⏭ Lever 4 (cheap, deferred) — precision: lower the byte floor toward BFP4
+The one genuinely bandwidth-bound component, lm_head, already runs BFP4 (`QWEN36_LMHEAD_BF4`,
+greedy-identical, ~0.7 ms saved) — that was its only lever. The remaining cheap tier: push the
+gated-delta projections (~1 GB bf8) and the bf16 shared expert toward BFP4 where PCC holds. Each is a
+one-line dtype change + the decode test suite, accuracy-bounded and per-module PCC-gated (opt-in flags
+like `QWEN36_EXPERT_DOWN_BF8` already exist for this kind of experiment; gate quality with MMLU-Redux
+in `evaluation/`, not decode token-identity). Because decode is overhead-bound not BW-bound (see the
+key measured fact above), this shrinks the asymptote (all-bf4 ceiling ~341 tok/s) more than it moves
+the current number — the lowest-effort item left, not a big lever.
+
 ## Rough headroom summary
 
 | Lever | Effort | Est. decode gain |
@@ -178,3 +188,4 @@ variant. Large, higher-risk refactor of a working, coherent model; do it only wh
 | 3b conv fold INTO decode_step_tt | high | superseded by the add-chain (pure ttnn, no DFB fight, accuracy-safe) |
 | 2 MoE per-K-block handshake (C++) | high | small; beyond in0_block_w=16 needs kernel work |
 | 1c ring+prefetcher (+stream refactor) | very high | pushes toward the 5.8 ms BW floor |
+| 4 precision → more BFP4 (gdn proj / shared expert) | low | small now (overhead-bound); lowers the all-bf4 asymptote |

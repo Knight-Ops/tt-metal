@@ -390,8 +390,7 @@ tests in `tests/` and `tests/cross_validate_reference.py` (reference venv at `~/
 - `--op-support-count` too low silently drops ops (looks like the tail of the model vanished).
 
 ## 6. Related docs
-- `HANDOFF.md` §10 — original profiling notes (source for this guide).
-- `PREFILL.md`, `DECODE.md` — perf findings these tools produced.
+- `PREFILL.md`, `FUTURE_OPTIMIZATIONS.md` — perf findings these tools produced.
 - Upstream tt-metal docs:
   - `docs/source/tt-metalium/tools/tracy_profiler.rst` — Tracy overview / GUI setup.
   - `docs/source/tt-metalium/tools/device_program_profiler.rst` — device zones, `DeviceZoneScopedN`.

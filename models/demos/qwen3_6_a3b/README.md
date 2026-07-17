@@ -47,7 +47,13 @@ tests/                     reference smoke + cross-validation + on-device PCC pe
 > reset. Standalone repro: `tests/repro_sdpa_decode_hang.py` (hangs on affected FW, passes after the
 > upgrade). Check your version with `tt-smi -s`.
 
-Weights are expected at `~/models/qwen36` (override with `QWEN36_CKPT`). Use the tt-metal venv.
+Weights are expected at `~/models/qwen36` (override with `QWEN36_CKPT`; 72 GB, 26 safetensors
+shards). Use the tt-metal venv.
+
+> **Do not upgrade packages in the tt-metal `python_env`** — it is pinned to this build
+> (`transformers==4.53.0`, plus `ttnn` and `ttl` 1.1.3). In particular do NOT upgrade
+> `transformers` there. The reference cross-validation needs `transformers>=5.2`, so it runs in a
+> SEPARATE venv (CPU torch), never the tt-metal `python_env` (see the cross-validation note below).
 
 ```bash
 # full 40-layer text demo + perf (--trace = fast on-device decode path)
@@ -202,10 +208,12 @@ Full 40-layer decode on a single P150 (text-only, BFP4 experts), measured progre
 | + decode trace capture | 2.09 |
 | + ttnn.sparse_matmul MoE decode | 7.28 |
 | + self-contained on-device trace (argmax/rope/pos + O(1) KV) | 7.77 |
-| **+ fused gate+up MoE sparse_matmul** | **9.11** |
+| + fused gate+up MoE sparse_matmul | 9.11 |
+| **+ decode-opt levers** (8-of-256 MoE gather, fused Gated-DeltaNet decode kernel, conv add-chain, DRAM-sharded projections, MoE `in0_block_w`) | **~30** |
 
-≈17.5× faster decode, and the full model generates coherently:
+≈58× faster decode than the naive baseline, and the full model generates coherently:
 `"The capital of France is"` → `" Paris, a city renowned for its iconic landmarks such as the"`.
+The current decode levers and their measured per-layer-type breakdown live in `FUTURE_OPTIMIZATIONS.md`.
 
 Each step is PCC-gated; trace is verified correct (traced tokens == eager, `tests/test_trace.py`).
 Decode path = on-device Gated-DeltaNet recurrent scan + state cache, fixed-shape KV cache +
@@ -220,17 +228,18 @@ per token (host does only `execute_trace` + a 1-element readback). Temperature/t
 over greedy. topk is chunked into power-of-2 (≤32768) vocab pieces because a single topk over the
 full 248k vocab is single-core (~38 ms) while each power-of-2 chunk runs multicore (~0.2 ms).
 
-Profiling the 110 ms/token (real dims, per layer-type): **MoE ≈65% (dispatch-bound — the two
-sparse_matmuls each scan all 256 expert slots), Gated-DeltaNet ≈24%, lm_head ≈8%, attention ≈4%.**
-The decode is overhead/dispatch-bound, not weight-bandwidth-bound, so the next levers are op-count
-reduction (a true 8-of-256 expert-weight gather to avoid the 256-slot scan; a fused Gated-DeltaNet
-decode step) rather than DRAM-sharded matmuls.
+Decode is **overhead/dispatch-bound, not weight-bandwidth-bound** (measured ~33 ms/token, ~16% DRAM
+utilization); the largest pools are the Gated-DeltaNet step and MoE. The 8-of-256 expert-weight gather
+and the fused Gated-DeltaNet decode kernel that this analysis motivated have since shipped (both
+default-on). The remaining decode levers and the authoritative per-layer-type breakdown live in
+`FUTURE_OPTIMIZATIONS.md`.
 
 **Prefill: fused chunked Gated-DeltaNet kernel (default on; `QWEN36_FUSED_PREFILL=0` disables).** The
 sequential recurrent scan for the 30 linear layers is replaced by the chunked delta-rule — ttnn
 per-chunk prep batched over all 32 heads + a fused tt-lang `_chunk_state` kernel that runs all heads in
-one launch (8×4 grid, head-dim 128) + `[Dk×Dv]` state carry across chunks. Warm prefill: **40-layer seq
-256, 26.4 → 149 tok/s (~5.65×)**; 4-layer microbench ~11.7× (same kernel dims). Matches the chunked
+one launch (8×4 grid, head-dim 128) + `[Dk×Dv]` state carry across chunks. The fused kernel gave
+~5.65× over the 26.4 tok/s recurrent-scan baseline; with the later MoE matmul tuning + prefill tracing,
+current 40-layer prompt processing is **~331 tok/s** (see `PREFILL.md`). Matches the chunked
 reference (PCC ≥ 0.9995), decode is unaffected, and 40-layer generation stays coherent. The intra-chunk
 `(I−L)⁻¹` uses a numerically-stable recursive block inversion (the cheap `T≈I+L` and the fp32
 doubling-product approximations were both removed — they drift to gibberish on this model's O(1) `L`).

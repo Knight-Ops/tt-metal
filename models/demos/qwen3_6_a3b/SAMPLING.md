@@ -19,7 +19,7 @@ The request defaults are Qwen3's recommended **"thinking mode"** config:
 
 | field | default | applied? |
 |---|---|---|
-| `temperature` | `1.0` | yes (on device; `0` = greedy) |
+| `temperature` | `0.6` | yes (on device; `0` = greedy) |
 | `top_k` | `20` | yes (clamped to (0, 32]) |
 | `top_p` | `0.95` | yes |
 | `presence_penalty` | `1.5` | yes (on device) |
@@ -27,13 +27,13 @@ The request defaults are Qwen3's recommended **"thinking mode"** config:
 | `repetition_penalty` | `1.0` | no (accepted; no-op at 1.0) |
 | `seed` | `null` → `0` | yes (deterministic per seed) |
 
-Because the default `temperature` is `1.0`, requests that omit it **sample** (OpenAI semantics).
-Pass `"temperature": 0` for deterministic greedy.
+Because the default `temperature` is `0.6` (Qwen3's thinking-mode recommendation), requests that omit
+it **sample** rather than run greedy. Pass `"temperature": 0` for deterministic greedy.
 
 ```bash
 curl localhost:8000/v1/chat/completions -d '{
   "messages":[{"role":"user","content":"Explain attention in one paragraph."}],
-  "max_tokens":128, "temperature":1.0, "top_k":20, "top_p":0.95, "presence_penalty":1.5, "seed":1234
+  "max_tokens":128, "temperature":0.6, "top_k":20, "top_p":0.95, "presence_penalty":1.5, "seed":1234
 }'
 ```
 
@@ -43,7 +43,7 @@ curl localhost:8000/v1/chat/completions -d '{
 QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/demo/demo.py --prompt "..." --gen 64 --trace
 # sampling (recommended thinking-mode config)
 QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/demo/demo.py --prompt "..." --gen 64 --trace \
-  --temperature 1.0 --top-k 20 --top-p 0.95 --presence-penalty 1.5 --seed 1234
+  --temperature 0.6 --top-k 20 --top-p 0.95 --presence-penalty 1.5 --seed 1234
 ```
 
 ## How it works (on-device decode tail)
@@ -86,7 +86,7 @@ independent, so the absolute ms add the same way on the full 40-layer model):
 | temperature + top-k + top-p | 3.54 | **+0.43 ms** |
 | + presence_penalty (full recommended config) | 4.14 | **+1.01 ms** |
 
-On the full 40-layer model (~43 ms/token greedy) that is **~+1%** for plain sampling and **~+2%** for
+On the full 40-layer model (~33 ms/token greedy) that is **~+1%** for plain sampling and **~+3%** for
 the full thinking-mode config. The presence penalty adds ~0.6 ms (a full-vocab subtract + a one-hot
 mask update); plain temperature/top-k/top-p is nearly free. Greedy is unchanged.
 

@@ -51,6 +51,27 @@ Layout: one head per core (grid (n_heads,1)); C=64 (2 tiles); head-dim 64 or 128
 stacked on the row (M) axis. k is passed pre-transposed as kt [D, C] so the kernel uses plain block
 matmuls. chunk_state(...) with S=0 also covers the chunk-0 (initial_state=0) case, subsuming
 _chunk_apply. Run: python tt/ttl_delta.py (reports PCCs).
+
+tt-lang (ttl) authoring lessons — READ BEFORE EDITING (learned building these kernels):
+  - Pattern: `@ttl.operation(grid=(x,y))` defines the op; `@ttl.datamovement` reader/writer threads
+    (`ttl.copy(dram_slice, dfb_block).wait()`); `@ttl.compute` does block ops (`@` matmul, `+ - *`,
+    `ttl.math.*`, `.store()`); `ttl.make_dataflow_buffer_like(tensor, shape=(tiles), block_count=2)`
+    for L1 buffers. See tt/ttl_probe.py and ttl/tutorials/matmul/step_{1,2}.py.
+  - Materialize matmul chains. Reassigning `p = p @ p` in a Python loop builds an exponential
+    symbolic expression that HANGS the compiler — store each result to a DFB block instead.
+  - A matmul must be the SOLE op feeding its accumulator. No `S*g + kgt@v` or `qg@S + A@v` in one
+    `.store()`; store each matmul to its own block, then elementwise-combine in a later stage.
+  - Matmul operands must be input or materialized blocks (not arbitrary in-flight expressions).
+  - Per-matmul output tile limit: a single matmul with K=4 tiles + 8-tile output is rejected
+    ("explicitly marked illegal" / "invalid block matmul"). Keep output <=4 tiles or k-loop tile.
+  - `fp32_dest_acc_en=False` on the op gives bf16 DST (16-tile capacity); `matmul_full_fp32` (fp32
+    accumulate) is default-on but matmul INPUTS are bf16 regardless (Tensix). bf16 is fine for the
+    realistic small-magnitude gated-delta data (verified in tests/analyze_chunk_precision.py).
+  - Block values are multi-use (one block can feed several ops in one scope) — probe-confirmed.
+  - A list of transaction handles in a DM thread is rejected ("list elements must be constants") —
+    use individual variables + `.wait()` per copy.
+  - OPERATIONAL: a ttl run killed mid-compile leaves the device HUNG -> `tt-smi -r` (reset) before
+    the next run. Use generous timeouts; first-time kernel compiles can take minutes.
 """
 
 import torch

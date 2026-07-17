@@ -71,7 +71,7 @@ _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
 # populated once from conv_state at start_decode (prefill stays on the unchanged concat/stacked path).
 # Default ON (measured 40L: decode 31.5->34.6 tok/s/user, +9.8%; teacher-forced decode logit-PCC vs the
 # baseline mean 0.996, stable); QWEN36_CONV_ADDCHAIN=0 reverts to the concat/row-sum path. See
-# CONV_FOLD_HANDOFF.md / FUTURE_OPTIMIZATIONS.md Lever 3b.
+# FUTURE_OPTIMIZATIONS.md Lever 3b.
 _CONV_ADDCHAIN = os.environ.get("QWEN36_CONV_ADDCHAIN", "1") != "0"
 
 # Fused single-step (T=1) DECODE kernel: collapse the whole per-head gated-delta decode step

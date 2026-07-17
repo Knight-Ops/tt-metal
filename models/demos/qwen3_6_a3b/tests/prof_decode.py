@@ -1,7 +1,7 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
 """Instrumented prefill+decode profiling — ground-truth overhead via the tt-metal device profiler
-(Tracy). See HANDOFF.md §10 for the full workflow (this is the script it documents).
+(Tracy). See DEBUGGING.md for the full workflow (this is the script it documents).
 
 Profiles THREE signpost-bounded regions in one run: a PREFILL forward, one EAGER decode step, and one
 TRACED decode step. Eager (not traced) attributes each op by name and exposes the host-dispatch gaps;

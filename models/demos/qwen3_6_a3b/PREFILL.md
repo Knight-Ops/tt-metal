@@ -1,9 +1,10 @@
 # Qwen3.6-35B-A3B Prefill — Performance Analysis & Roadmap
 
-Companion to `HANDOFF.md` (read that first for the model, environments, and the fused-prefill
-integration). This doc covers **prefill throughput**: the current baseline, the roofline it's measured
-against, what's been optimized, and what's left — including a thorough scope for **traced incremental
-(multi-turn) prefill**. Decode is the other engineer's path; summarized here only for the roofline.
+Companion to `README.md` (read that first for the model, environments, and how to run). This doc
+covers **prefill throughput**: the current baseline, the roofline it's measured against, what's been
+optimized, and what's left — including a thorough scope for **traced incremental (multi-turn)
+prefill**. Decode is the other engineer's path (see `FUTURE_OPTIMIZATIONS.md`); summarized here only
+for the roofline.
 
 > History note: earlier revisions of this doc hypothesized prefill was purely host-dispatch-bound and
 > ranked "trace the prefill" behind everything. Per-op profiling (below) showed it's ~46% device-kernel
@@ -31,7 +32,10 @@ seq-256 traced and adds seq 128 (tracing helps more at shorter prompts: larger d
 | 128 | 627 ms / 204 tok/s | 343 ms / **374 tok/s** | **1.83×** |
 | 256 | 847 ms / 302 tok/s | 579 ms / **442 tok/s** | **1.46×** |
 
-Decode (the other engineer's path, for context): **~9.1 tok/s/user (~110 ms/token)**, captured as a
+> Current end-to-end demo/server prompt-processing throughput is **~331 tok/s**; the per-seq
+> microbench figures above isolate the eager-vs-traced kernel delta at fixed lengths.
+
+Decode (the other engineer's path, for context): **~30 tok/s/user (~33 ms/token)**, captured as a
 single replayed trace.
 
 **Shipped since the original baseline** (all additive; eager + decode paths preserved, module PCC
@@ -64,8 +68,8 @@ the **achievable dense-compute floor ≈ 135 ms** (and the MoE matmuls themselve
   **7× slower** than the dense batched matmul. Dense is the right call.
 
 **Decode roofline (context).** Per token reads the active weights (lm_head ~254 MB BFP4 + attention/
-gated-delta + top-8 experts + shared ≈ 1–2 GB) ⇒ ~2–4 ms/token bandwidth floor. Current ~110 ms/token
-is ~30–50× above it → decode is **dispatch/latency-bound**, not bandwidth-bound (it's already traced;
+gated-delta + top-8 experts + shared ≈ 1–2 GB) ⇒ ~2–4 ms/token bandwidth floor. Current ~33 ms/token
+is ~10× above it → decode is **dispatch/latency-bound**, not bandwidth-bound (it's already traced;
 further wins are op-fusion / fewer launches — the decode owner's area).
 
 **Takeaway:** prefill has ~4× of headroom to the achievable floor, concentrated in non-matmul overhead;
@@ -137,8 +141,8 @@ Effort breakdown:
 
 **Total ~1–1.5 weeks + decode coordination.** ROI is modest (~1.5× on an already-small per-turn ingest).
 **Recommendation: defer unless (a) multi-turn TTFT is a measured bottleneck, or (b) decode adopts a
-paged cache anyway** (the HANDOFF already notes decode wants `paged_update_cache` for O(1) long-context
-KV writes) — in which case the paged cache is shared infrastructure and this drops to ~2–3 days.
+paged cache anyway** (decode already uses `paged_update_cache` for O(1) long-context KV writes) — in
+which case the paged cache is shared infrastructure and this drops to ~2–3 days.
 
 ### 4b. Cut the non-matmul overhead (the ~4× gap to roofline)
 The 579→~135 ms gap is elementwise/layout/dispatch on non-matmul ops. Per-op profiling (`prof_prefill.py`)
@@ -151,8 +155,8 @@ itemizes it. Highest-value, all eager-and-traced wins:
     the prep's actual compute (cumsum/decay/β-scaling/inverse) must be **folded into the ttl
     `_chunk_state` kernel** so it is one fused launch instead of ~25 ttnn ops — this reduces device-kernel
     time, which is what the traced path is bound by. This is the **largest remaining solo (no
-    decode-overlap) traced-prefill lever**, but a sizeable ttl-kernel effort (cf. HANDOFF §8/§9 authoring
-    constraints). `QWEN36_DELTA_BF16_PREP=1` (bf16 prep) is implemented but ~neutral alone.
+    decode-overlap) traced-prefill lever**, but a sizeable ttl-kernel effort (cf. the tt-lang authoring
+    lessons in `tt/ttl_delta.py`). `QWEN36_DELTA_BF16_PREP=1` (bf16 prep) is implemented but ~neutral alone.
 - **MoE `repeat` (~69 ms/40L)** — the `[E,T,H]` activation broadcast. **MEASURED INFEASIBLE to remove**
   (2026-06-23): the only repeat-free option is in0-batch-broadcast, which requires switching the expert
   matmul from the grid-tuned `MatmulMultiCoreReuseProgramConfig` to
@@ -174,7 +178,7 @@ itemizes it. Highest-value, all eager-and-traced wins:
   bound its L1 like decode's `k_chunk_size=128` if it overflows.
 
 ### 4d. Decode (other engineer)
-Dispatch/latency-bound at ~110 ms/token, ~30–50× above its bandwidth floor; already traced. Wins are
+Dispatch/latency-bound at ~33 ms/token, ~10× above its bandwidth floor; already traced. Wins are
 op-fusion / fewer launches. Out of scope here.
 
 ---
@@ -205,5 +209,5 @@ op-fusion / fewer launches. Out of scope here.
   column is unreliable in this build; use `DEVICE KERNEL DURATION` + op counts, or ttnn-visualizer.
 - Roofline FLOP/s anchored on the measured tuned-matmul rate (~130 TFLOP/s BFP4/LoFi); refine with a
   device-spec peak if available.
-- Fused-prefill design + ttl authoring constraints: HANDOFF §8–§9. Trace-safety findings + the
-  incremental-prefill probe: memory note `qwen36-prefill-trace.md`.
+- Fused-prefill design + ttl authoring constraints: the module docstring in `tt/ttl_delta.py`.
+  Trace-safety findings + the incremental-prefill probe: memory note `qwen36-prefill-trace.md`.
