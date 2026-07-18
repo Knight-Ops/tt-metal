@@ -175,6 +175,50 @@ function_under_test()
 p.disable()
 ```
 
+#### 1.5.1 Per-component signposts (built into the model — `QWEN36_SIGNPOST=1`)
+The model is instrumented with nested signpost regions at every component boundary in **both prefill
+and decode**, via the helper `tt/signpost.py` (`sp.region("name")`). They are **off by default and a
+complete no-op** (no f-string, no call) unless `QWEN36_SIGNPOST=1` — the gate matters because on a
+Tracy-enabled build even a bare `signpost()` records a host message per call, and there are hundreds
+per decode step across 40 layers. Regions are pure host-side messages (no `synchronize_device`), so
+unlike `prof.phase` (`QWEN36_PROFILE_PHASES=1`, device-synced, prefill-only) they are trace-safe and
+work on the decode path.
+
+Region names (each brackets `name` … `name/end`, nested):
+- **model:** `embed`, `rope`, `head`(`.norm`/`.lm_head`/`.d2h`); decode: `dec.rope_idx`, `dec.embed`,
+  `dec.final_norm`, `dec.select`(→`head.lm_head` + `head.argmax` **or** `head.samp.topk`/`.sample`/
+  `.penalty`), `dec.pos_advance`, `dec.lm_head`/`dec.d2h` (vLLM logits path).
+- **per layer** (`decoder.py`, aggregated across all 40): `layer.input_norm`, `layer.mixer`,
+  `layer.residual1`, `layer.post_norm`, `layer.moe`, `layer.residual2`.
+- **gated-delta** (`delta.*`): `in_proj`, `conv`, `split`, `gate`, `qknorm`, `recurrence` (the fused
+  `decode_step_tt` kernel or the chunked/scan path), `w_out`, `norm_out`.
+- **full attention** (`attn.*`): `qkv`, `qk_norm`, `rope`, `kv_write`, `sdpa`, `out`.
+- **MoE** (`moe.*`): `shared`, `router`, `scatter`, `experts`, `combine` (+ dense-prefill
+  `repeat`/`gate_up_mm`/`swiglu`/`down_mm`/`reduce`, which also carry the matching `prof.phase`).
+
+**Decode caveat:** host signposts fire during trace **capture**, not `execute_trace` **replay**, so
+profile the **eager** step. Per-op `DEVICE KERNEL DURATION` there is identical to traced replay (same
+kernels); only the op-to-op gaps differ. Cross-check totals against `bench_decode.py::bench_components`.
+
+**Scale caveat:** the device profiler aborts (device-data readback overflow — >1M zones) above ~4–8
+layers, and **do NOT pass `-p`** (it truncates the capture before the measured window). So profile the
+signpost breakdown at a **small layer count**; per-layer op shapes are identical at any depth, so the
+component *proportions* hold for the full 40-layer model. For real 40-layer per-component ms, use the
+un-profiled traced replays in `bench_decode.py::bench_components` (also surfaced in `CURRENT_BENCHMARK.md` §2).
+
+Run + read:
+```bash
+# prof_decode.py sets QWEN36_SIGNPOST=1 by default and brackets the eager step with
+# prefill_start/stop (prefill) and eager_start/stop (decode). Keep layers small; no -p.
+QWEN36_LAYERS=4 QWEN36_SEQ=128 python -m tracy -r -v --op-support-count 20000 \
+    models/demos/qwen3_6_a3b/tests/prof_decode.py
+# Per-component device-kernel breakdown (incl + self time, aggregated over layers) per window:
+python models/demos/qwen3_6_a3b/tests/signpost_report.py --between prefill_start prefill_stop
+python models/demos/qwen3_6_a3b/tests/signpost_report.py --between eager_start eager_stop
+# Or the full end-to-end doc (throughput + real traced breakdown + signposts) in one command:
+QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/tests/gen_current_benchmark.py
+```
+
 ### 1.6 Output files
 - `generated/profiler/.logs/` — raw capture. `tracy_profile_log_host.tracy` is the file you load in the
   Tracy GUI. **This folder is wiped at the start of every profiled run** — copy off anything to keep.

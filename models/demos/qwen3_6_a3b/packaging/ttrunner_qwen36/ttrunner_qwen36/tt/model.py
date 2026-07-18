@@ -16,16 +16,16 @@ from __future__ import annotations
 import os
 
 import torch
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt import prefill_profiler as prof
+from ttrunner_qwen36.tt import signpost as sp
+from ttrunner_qwen36.tt.attention import precompute_rope
+from ttrunner_qwen36.tt.common import as_weight, from_tt, to_tt
+from ttrunner_qwen36.tt.decoder import TtDecoderLayer
+from ttrunner_qwen36.tt.gated_delta import _CONV_ADDCHAIN
+from ttrunner_qwen36.tt.rms_norm import TtRMSNorm
 
 import ttnn
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.attention import precompute_rope
-from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt
-from models.demos.qwen3_6_a3b.tt.decoder import TtDecoderLayer
-from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN
-from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
 class TtModel(LightweightModule):

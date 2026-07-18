@@ -189,3 +189,55 @@ the current number — the lowest-effort item left, not a big lever.
 | 2 MoE per-K-block handshake (C++) | high | small; beyond in0_block_w=16 needs kernel work |
 | 1c ring+prefetcher (+stream refactor) | very high | pushes toward the 5.8 ms BW floor |
 | 4 precision → more BFP4 (gdn proj / shared expert) | low | small now (overhead-bound); lowers the all-bf4 asymptote |
+
+## Deferred research-backed levers (surveyed 2026-07-17; not yet built)
+
+Candidate levers from a modern-research survey, kept here so a future session doesn't re-derive them.
+Ranked; each needs the noted open question resolved (usually a microbench) before committing.
+
+- **Norm→matmul operator fusion (helps prefill AND decode).** Fuse each RMSNorm into the matmul it
+  feeds, keeping the normalized activation in L1 (no DRAM round-trip): `input_norm→in_proj/qkv`,
+  `post_norm→moe gate`, gated-delta `qknorm` and `norm_out→w_out`. We already do matmul–matmul fusion
+  (fused `w_in_proj`) and DRAM-sharding, but NOT norm→matmul. Ref: *Operator Fusion for LLM Inference
+  on the Tensix Architecture* (arXiv:2606.09879, Wormhole N300, Qwen): measured **−37% attn, −16% MLP,
+  −7.9%/decoder-layer, PCC ≥ 98.75%**. Directly attacks the ~7% decode inter-op dispatch gap and the
+  prefill norm/glue overhead. Open Q: does ttnn expose a fused norm+matmul (LN-fused-matmul) or does it
+  need a ttl kernel? Microbench first.
+- **MoE prefill grouped-GEMM over compacted tokens.** Replace the dense broadcast (`moe.repeat`, 15%
+  self-time, 268 MB/chunk, 32× FLOP waste) with sort/compact-by-expert → one variable-M batched matmul
+  → scatter back. Refs: SonicMoE (arXiv:2512.14080), *Static Batching of Irregular Workloads*
+  (arXiv:2501.16103), PyTorch persistent cache-aware grouped-GEMM. Caveat: the dense matmul is already
+  near-roofline (§2) and the per-tile sparse path measured 5–7× slower; a true grouped-GEMM was never
+  built. Speculative — gated on whether tt-metal has an efficient variable-M grouped-GEMM primitive.
+- **Sorting-free sampling (small).** Replace the 8-chunk `topk(32768)` + `ttnn.sampling`
+  (`model.py`) with dual-pivot rejection sampling. Refs: FlashInfer sorting-free sampling (2025-03),
+  Qrita (arXiv:2602.01518). <1 ms on a ~29 ms step — only if sampling latency becomes a product concern.
+- **❌ Width-sharded decode RMSNorm (`QWEN36_NORM_SHARDED`, MEASURED WASH at 40L, 2026-07-17 — default OFF).**
+  Microbench (`tests/bench_norm_matmul_fusion.py`): the interleaved single-core `ttnn.rms_norm` on the T=1
+  full-hidden vector is ~33 µs, but an 8-core WIDTH-SHARDED `ttnn.rms_norm` is ~10 µs (**3.2×**, PCC 1.0),
+  curing decode **row-starvation** (M=1 has no rows to spread across the grid). ~81 full-hidden norms/step
+  (40 input + 40 post + 1 final) = ~2.71 ms in isolation, so the isolated microbench projected +3.8% and a
+  reshard-free stream +6.5%. **BUT the 40L A/B is a dead wash: pure `execute_trace` 28.73 ms → 28.73 ms
+  (identical); full decode_step 28.89 → 29.05.** Root cause = the **conv-fold / se_down lesson**: the norms
+  are NOT on the decode critical path — they pipeline/overlap with the matmul chain, so making each one
+  cheaper in isolation changes nothing at 40L. (Contrast the DRAM-shard *projections*, which DID help
+  because matmuls ARE the critical path.) The isolated microbench over-counts precisely because it can't
+  model pipeline overlap. Code kept flag-gated (`tt/rms_norm.py` `_norm_shard_cfg`, `x.volume()==dim`
+  guard, PCC 0.99999) as a default-OFF building block for the prefetcher stream, but it is NOT a
+  single-user lever on its own. **Implication: glue-op (norm/reshard/tilize) reduction won't move
+  single-user decode; only shortening the critical-path matmul chain will (MoE sparse kernel, ring +
+  prefetcher, gdn) — or batched decode for aggregate throughput.**
+  - **Does NOT help prefill.** Prefill norms already have S rows of real work (not row-starved) AND are
+    only ~0.6% of the prefill step (§3b: `input_norm`/`post_norm` ~0.3% each; prefill is `delta.recurrence`
+    29% + MoE matmuls ~50%). The sharded config is `block_h=1` (≤32 rows) so it doesn't even apply to S>1.
+    (The separate arXiv:2606.09879 norm→matmul *kernel* fusion / SRAM-resident stream is the prefill lever,
+    not this norm-sharding trick.)
+  - **DEFERRED — per-head qk_norm sharding (small, unproven).** `attn.qk_norm` normalizes over
+    head_dim=256 across 16 q-/2 kv-heads → ~25 µs/attn-layer × 10 = ~0.25 ms ≈ **0.9% of decode** (vs the
+    full-hidden pool's 9.4%). Currently interleaved (excluded by the `volume()==dim` guard). Uncertain win:
+    a 256-wide reduction width-sharded across 8 cores is 1 tile/core + a cross-core handshake that may cost
+    more than it saves; the better layout is probably a HEIGHT-shard over heads, a separate design. Low
+    priority — settle with a `[1,1,16,256]` microbench case before building. Prior: wash/marginal expected.
+
+Also see the memory note `qwen36-prefill-p1-deadend` and `analyze_chunk_carry_precision.py` for the
+measured reason the "fast fused chunk_state kernel" prefill lever was abandoned.

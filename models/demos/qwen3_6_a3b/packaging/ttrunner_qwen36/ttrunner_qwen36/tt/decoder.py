@@ -3,14 +3,15 @@
 """tt-nn decoder layer for Qwen3.6-35B-A3B (hybrid: linear_attention or full_attention + MoE)."""
 from __future__ import annotations
 
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt import prefill_profiler as prof
+from ttrunner_qwen36.tt import signpost as sp
+from ttrunner_qwen36.tt.attention import TtAttention
+from ttrunner_qwen36.tt.gated_delta import TtGatedDeltaNet
+from ttrunner_qwen36.tt.moe import TtMoE
+from ttrunner_qwen36.tt.rms_norm import TtRMSNorm
+
 import ttnn
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.attention import TtAttention
-from models.demos.qwen3_6_a3b.tt.gated_delta import TtGatedDeltaNet
-from models.demos.qwen3_6_a3b.tt.moe import TtMoE
-from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
 class TtDecoderLayer(LightweightModule):

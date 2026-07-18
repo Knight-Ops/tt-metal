@@ -25,14 +25,14 @@ from __future__ import annotations
 import os
 
 import torch
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt import prefill_profiler as prof
+from ttrunner_qwen36.tt import signpost as sp
+from ttrunner_qwen36.tt.common import as_weight, build_dram_shard, to_tt
+from ttrunner_qwen36.tt.rms_norm import TtRMSNormGated
+from ttrunner_qwen36.tt.ttl_delta import chunk_state_tt, decode_step_batch_tt, decode_step_tt
 
 import ttnn
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
-from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
-from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_batch_tt, decode_step_tt
 
 # Fused chunked prefill: replace the sequential recurrent scan (O(T) dispatches) with the chunked
 # delta-rule — ttnn per-chunk prep batched over heads + the fused tt-lang _chunk_state kernel (one

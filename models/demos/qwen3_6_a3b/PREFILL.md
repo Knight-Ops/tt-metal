@@ -113,6 +113,25 @@ the matmuls are essentially at roofline.
 
 ## 4. Remaining levers (ranked)
 
+> **MEASURED UPDATE (2026-07-17) — supersedes the "gated-delta kernel" framing in §4b.**
+> Two premises below were tested on the real 40-layer model and found FALSE:
+> 1. **The bf16 ttl `chunk_state` kernel is NOT a speedup** — it is **1.48× SLOWER** than the current
+>    fp32/HiFi4 ttnn recurrence (`_chunk_state_ttnn`): 40L seq256 warm eager **1114 ms (bf16 kernel) vs
+>    754 ms (fp32 ttnn)**. The old "5.4–5.7× faster" was vs the *retired sequential scan*, not the
+>    current chunked default. The ttnn path uses the full 110-core grid at HiFi4; the ttl kernel runs
+>    one head/core on 32 cores at LoFi. The "fold prep into the ttl kernel / fp32-DST accumulation"
+>    lever is therefore a **dead end** — and fp32-DST would not even fix accuracy (the bf16 error is the
+>    matmul *inputs*, not the accumulator; only HiFi4 multi-pass fixes it, which the ttl DSL doesn't
+>    surface — see `tests/analyze_chunk_carry_precision.py`).
+> 2. **Trace capture does NOT forbid the fp32 recurrence's in-graph intermediates** — only host writes
+>    (zeros/fills) are forbidden. So traced prefill now runs the SAME fp32/HiFi4 recurrence as eager
+>    (`QWEN36_TRACED_FP32_RECURRENCE`, default on). **MEASURED single-bucket traced vs eager: PCC
+>    1.00000, 1.55× @128 / 1.14× @256 / 1.01× @512** — full accuracy (removes the old bf16 caveat) and
+>    resolves the "bucket-256 wedge" for single-bucket. **Follow-up:** multi-bucket capture still
+>    corrupts the larger trace (pinned per-trace intermediate footprint exceeds free DRAM — the real
+>    nature of the wedge); fix = pool the recurrence intermediates into stable per-bucket buffers.
+
+
 ### 4a. Traced incremental (multi-turn) prefill — the next structural feature
 Eager incremental prefill (shipped, §3.5) already gives the big multi-turn win (don't re-prefill
 history). **Tracing it** would add ~1.5× on the per-turn ingest, but is the **largest remaining effort

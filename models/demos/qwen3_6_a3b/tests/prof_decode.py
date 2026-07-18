@@ -22,6 +22,13 @@ Output: generated/profiler/.logs/cpp_device_perf_report.csv (per-op device timin
 """
 import os
 
+# Enable the per-component signposts (tt/signpost.py) by default for this profiling harness — the
+# flag is read at import time, so it MUST be set before the model modules below are imported. The
+# eager step is bracketed by eager_start/eager_stop; the component regions (layer.*, moe.*, delta.*,
+# attn.*, head.*) fire inside it. Parse the resulting CSV with tests/signpost_report.py. Override with
+# QWEN36_SIGNPOST=0 to profile without component markers.
+os.environ.setdefault("QWEN36_SIGNPOST", "1")
+
 import torch
 
 import ttnn
@@ -72,13 +79,17 @@ def main():
         ttnn.synchronize_device(mesh)
 
         # --- TRACED measured step (same kernels; on-device inter-op gaps) ---
-        model.capture_decode_trace()
-        model.decode_step_traced()  # warm replay (not measured)
-        ttnn.synchronize_device(mesh)
-        signpost("trace_start")
-        model.decode_step_traced()  # measured traced step (METAL TRACE ID set in the report)
-        signpost("trace_stop")
-        ttnn.synchronize_device(mesh)
+        # Skipped when QWEN36_PROF_EAGER_ONLY=1: device-profiler + trace capture is WIP and aborts at
+        # 40-layer scale (see llms.md). The signpost per-component breakdown only needs the EAGER
+        # windows above (per-op kernel time == traced replay), so the breakdown orchestrator sets this.
+        if os.environ.get("QWEN36_PROF_EAGER_ONLY") != "1":
+            model.capture_decode_trace()
+            model.decode_step_traced()  # warm replay (not measured)
+            ttnn.synchronize_device(mesh)
+            signpost("trace_start")
+            model.decode_step_traced()  # measured traced step (METAL TRACE ID set in the report)
+            signpost("trace_stop")
+            ttnn.synchronize_device(mesh)
     finally:
         ttnn.close_mesh_device(mesh)
 

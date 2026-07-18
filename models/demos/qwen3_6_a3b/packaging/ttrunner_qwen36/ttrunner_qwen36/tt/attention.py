@@ -17,12 +17,12 @@ from __future__ import annotations
 import os
 
 import torch
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt import signpost as sp
+from ttrunner_qwen36.tt.common import as_weight, build_dram_shard, to_tt
+from ttrunner_qwen36.tt.rms_norm import TtRMSNorm
 
 import ttnn
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
-from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 # DRAM-shard the DECODE output projection (o_proj / wo): K=n_heads*head_dim, N=hidden — the K-heavy
 # narrow-N shape that DRAM sharding speeds up ~2.7x at T=1 (measured; incl. reshards). Decode-only.

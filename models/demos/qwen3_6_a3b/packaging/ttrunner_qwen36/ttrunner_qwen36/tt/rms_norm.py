@@ -11,9 +11,10 @@ from __future__ import annotations
 
 import os
 
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt.common import to_tt
+
 import ttnn
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt.common import to_tt
 
 # Decode norms are a ~2.71 ms/step (~9.4%) dispatch-bound pool: the interleaved single-core
 # ``ttnn.rms_norm`` is ~33 us/norm, but a WIDTH-SHARDED (8-core) rms_norm is ~3.2x cheaper (~10 us,

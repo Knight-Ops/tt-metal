@@ -15,6 +15,13 @@ ttnn-visualizer; filter to prefill_eager_* / prefill_traced_*). 4 layers is an e
 """
 import os
 
+# Enable the per-component signposts (tt/signpost.py) by default for this profiling harness — the
+# flag is read at import time, so it MUST be set before the model modules below are imported. The
+# eager prefill is bracketed by prefill_eager_start/stop; the component regions (embed, rope, layer.*,
+# moe.*, delta.*, attn.*, head.*) fire inside it. Parse the CSV with tests/signpost_report.py.
+# Override with QWEN36_SIGNPOST=0 to profile without component markers.
+os.environ.setdefault("QWEN36_SIGNPOST", "1")
+
 import torch
 
 import ttnn

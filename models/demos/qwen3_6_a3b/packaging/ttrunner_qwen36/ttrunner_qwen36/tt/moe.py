@@ -35,13 +35,13 @@ from __future__ import annotations
 import os
 
 import torch
+from ttrunner_qwen36._vendor import moe_gather
+from ttrunner_qwen36._vendor.lightweightmodule import LightweightModule
+from ttrunner_qwen36.tt import prefill_profiler as prof
+from ttrunner_qwen36.tt import signpost as sp
+from ttrunner_qwen36.tt.common import as_weight, build_dram_shard, to_tt
 
 import ttnn
-from models.common import moe_gather
-from models.common.lightweightmodule import LightweightModule
-from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
-from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
 
 # DRAM-shard the DECODE shared-expert down projection se_down (K=se_inter, N=hidden). Microbench showed
 # 1.46x per op, but at 40L it is a WASH: se_down's ~6us matmul saving is eaten by the ~8us reshard in/out
