@@ -577,22 +577,27 @@ class TtModel(LightweightModule):
         src = to_tt(t, self.mesh_device, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
         ttnn.copy(src, self.t_tok)  # in place, stable address (trace-safe)
 
-    def decode_forward_logits(self):
-        """Run one decode step and return host logits [B, vocab] WITHOUT selecting a token on device.
+    def decode_forward_logits(self, read_from_device: bool = True):
+        """Run one decode step and return logits [B, vocab] WITHOUT selecting a token on device.
         This is the vLLM continuous-batching contract: vLLM's sampler consumes the logits (per-request
         temperature/top-p/penalties/logprobs/stops) and writes the chosen token(s) back via
         set_decode_tokens() before the next call. Positions still advance on device, exactly as in the
-        greedy path. (B==1 today; A3 threads the batch axis.)"""
+        greedy path. (B==1 today; A3 threads the batch axis.)
+
+        read_from_device=True (default) returns HOST logits (D2H here). read_from_device=False returns
+        the on-DEVICE ttnn logits tensor and defers the readback to the caller — the vLLM async-decode
+        path (read_decode_output does an async cpu() so the D2H overlaps the next step's host work)."""
         x = self._decode_hidden()
         with sp.region("dec.lm_head"):
             logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]  (all rows kept; no last-token slice)
-        with sp.region("dec.d2h"):
-            out = from_tt(logits, self.mesh_device)
         with sp.region("dec.pos_advance"):
             ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
             ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
         self.pos += 1
-        return out
+        if not read_from_device:
+            return logits  # on-device ttnn tensor; caller reads it (async D2H) later
+        with sp.region("dec.d2h"):
+            return from_tt(logits, self.mesh_device)
 
     def _select_token(self, x):
         """Run lm_head on the post-norm hidden state and write the next token id into self.t_tok.
@@ -645,10 +650,14 @@ class TtModel(LightweightModule):
                 ttnn.maximum(self.t_presence, onehot, output_tensor=self.t_presence)  # in-place OR
         ttnn.plus_one(self.t_seed)  # fresh RNG next step (trace-safe; validated)
 
-    def decode_step_eager(self):
-        """Run one decode step eagerly (compiles kernels for trace capture). Returns the next token."""
+    def decode_step_eager(self, read_from_device: bool = True):
+        """Run one decode step eagerly (compiles kernels for trace capture). Returns the next token id
+        (int) when read_from_device=True, else the on-DEVICE token tensor (cloned) for the vLLM async
+        path to read later."""
         self._decode_graph()
         self.pos += 1
+        if not read_from_device:
+            return ttnn.clone(self.t_tok)  # device token; async read happens later
         return int(from_tt(self.t_tok, self.mesh_device).flatten()[0])
 
     def _state_tensors(self):
@@ -685,9 +694,66 @@ class TtModel(LightweightModule):
         for orig, s in zip(self._state_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
 
-    def decode_step_traced(self):
+    def decode_step_traced(self, read_from_device: bool = True):
         """Replay the captured decode trace for one real step. Host work: kick off the trace and
-        read back only the single next-token id (no per-token input rebuild, no full-logit D2H)."""
+        read back only the single next-token id (no per-token input rebuild, no full-logit D2H).
+        read_from_device=False returns the on-DEVICE token tensor (cloned so the next replay can't
+        overwrite it before the vLLM async path reads it)."""
         ttnn.execute_trace(self.mesh_device, self.trace_id, cq_id=0, blocking=False)
         self.pos += 1
+        if not read_from_device:
+            return ttnn.clone(self.t_tok)
         return int(from_tt(self.t_tok, self.mesh_device).flatten()[0])
+
+    def capture_decode_logits_trace(self):
+        """Record the LOGITS-returning decode step (embed -> layers -> norm -> lm_head) as a trace,
+        for the vLLM host-sampling path: replay computes logits into a persistent buffer and the host
+        samples from them (per-request temperature/top-p/penalties/logprobs stay in vLLM's sampler).
+        Unlike capture_decode_trace, this does NOT select a token on device — no _select_token — so the
+        chosen token must be written back via set_decode_tokens() before each decode_step_logits_traced().
+
+        Mirrors capture_decode_trace: releases any prior logits trace, snapshots/restores the decode
+        state around the dummy recording step (the recorded step advances positions on device, so it
+        would perturb generation otherwise). PRECONDITION: one eager decode_forward_logits() has run so
+        all kernels are compiled (capture must not JIT)."""
+        if getattr(self, "logits_trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.logits_trace_id)
+        snap = [ttnn.clone(t) for t in self._state_tensors()]
+        self.logits_trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+        x = self._decode_hidden()
+        with sp.region("dec.lm_head"):
+            self._traced_logits = ttnn.linear(x, self.lm_head_w)  # persistent output buffer (read after replay)
+        with sp.region("dec.pos_advance"):
+            ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
+            ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
+        ttnn.end_trace_capture(self.mesh_device, self.logits_trace_id, cq_id=0)
+        for orig, s in zip(self._state_tensors(), snap):
+            ttnn.copy(s, orig)  # undo the mutation done while recording
+
+    def decode_step_logits_traced(self, read_from_device: bool = True):
+        """Replay the captured logits trace for one real step. The 40-layer compute is replayed from
+        the trace (no per-op host dispatch); the only per-step host work is the full-vocab readback.
+
+        read_from_device=True returns HOST logits [B, vocab] (blocking D2H here). read_from_device=False
+        returns the on-DEVICE persistent logits buffer and defers the readback to the vLLM async path
+        (read_decode_output does an async cpu() so the D2H overlaps the next step's scheduling/detok)."""
+        ttnn.execute_trace(self.mesh_device, self.logits_trace_id, cq_id=0, blocking=False)
+        self.pos += 1
+        if not read_from_device:
+            # The trace always writes the SAME persistent buffer, so under vLLM async decode the next
+            # step's replay would overwrite it before this step's deferred read. Hand back an
+            # independent clone (cheap ~0.5 MB D2D on cq 0, ordered before the next replay) so the
+            # async cpu() reads a stable tensor. No clone needed on the sync path (read below is immediate).
+            return ttnn.clone(self._traced_logits)
+        return from_tt(self._traced_logits, self.mesh_device)
+
+    def process_output_decode(self, tt_out, B=1, S=1, is_tokens=False, is_log_probs=False, **kwargs):
+        """Convert a decode output from a (host) ttnn tensor to a host torch tensor. Called by the
+        inherited Generator.process_decode_output_host on the vLLM async-decode path (after
+        read_decode_output's async cpu()). is_tokens=True -> [B] token ids (on-device sampling path);
+        else -> [B, S, vocab] logits (host-sampling path). On-device log-probs are not produced."""
+        assert not is_log_probs, "on-device log-probs unsupported (host sampling only)"
+        if is_tokens:
+            return ttnn.to_torch(tt_out).to(torch.int64).reshape(-1)[:B]  # [B] sampled token ids
+        out = ttnn.to_torch(tt_out).float()
+        return out.reshape(B, S, -1)[..., : self.args.vocab_size]
