@@ -527,6 +527,154 @@ class TtModel(LightweightModule):
         self.t_curpos = mk(torch.full((B,), self.pos, dtype=torch.int32), ttnn.int32)
         self.t_ropepos = mk(torch.full((B,), self.pos, dtype=torch.int32), ttnn.uint32)
 
+    # ── vLLM CONTINUOUS BATCHING (V2, per-slot) ───────────────────────────────────
+    def alloc_batch_caches(self, batch_size):
+        """Allocate [B,...] per-slot caches for continuous batching, plus a [1,...] scratch used to run
+        the validated single-request prefill before copying its state into a slot. Rows are decode slots
+        (0..B-1); dead slots (no active request) just hold zeros. Call once at batch setup."""
+        a = self.args
+        self.batch_size = batch_size
+        self.max_seq = a.max_seq_len
+        self._scratch_caches = [self._alloc_cache(layer) for layer in self.layers]
+        self._pf_caches_ready = True  # scratch is the prefill target; _prefill_single reuses + resets it
+        z = lambda shape: ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+        self.caches = []
+        for layer in self.layers:
+            if layer.is_linear:
+                c = {"recurrent_state": z([batch_size, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim])}
+                if _CONV_ADDCHAIN:
+                    c["conv_rows"] = [z([batch_size, a.lin_conv_dim]) for _ in range(a.conv_kernel_size - 1)]
+                self.caches.append(c)
+            else:
+                shape = [batch_size, a.n_kv_heads, self.max_seq, a.head_dim]
+                self.caches.append([z(shape), z(shape)])
+        self.slot_pos = [0] * batch_size
+
+    def prefill_into_slot(self, input_ids, slot):
+        """Prefill ONE request (torch [1,T]) into batch row `slot`, reusing the validated B=1 prefill:
+        run it into the [1,...] scratch, then copy K/V + GDN state into row `slot` of the [B,...] caches.
+        Returns last-token host logits [1,1,vocab] (the plugin host-samples the first token). Positions
+        for this slot recorded in self.slot_pos[slot].
+
+        VERIFY-ON-DEVICE: the per-slot writes below. KV uses ttnn.fill_cache(dst[B,...], src[1,...], slot)
+        (its native batch-index write). The GDN recurrent_state + conv_rows sliced writes are the ones to
+        confirm/fix on-device (fill_cache may not accept the [B,Vh,Dk,Dv] / [B,conv_dim] shapes)."""
+        batch = self.caches
+        self.caches = self._scratch_caches  # _prefill_single writes here (+ resets scratch linear state)
+        logits = self._prefill_single(input_ids)  # fills scratch [1,...], sets self.pos = T
+        T = self.pos
+        if _CONV_ADDCHAIN:  # sync scratch conv_state -> scratch conv_rows [1,conv_dim] (as start_decode does)
+            for layer, sc in zip(self.layers, self._scratch_caches):
+                if layer.is_linear:
+                    layer.mixer.sync_conv_rows(sc)
+        self.caches = batch
+        for bl, sc in zip(self.caches, self._scratch_caches):
+            if isinstance(bl, list):  # attention KV: native fill_cache batch-index write
+                ttnn.fill_cache(bl[0], sc[0], slot)
+                ttnn.fill_cache(bl[1], sc[1], slot)
+            else:  # GDN recurrent + conv history — VERIFY these device ops on-device
+                ttnn.fill_cache(bl["recurrent_state"], sc["recurrent_state"], slot)
+                if "conv_rows" in bl:
+                    D = self.args.lin_conv_dim
+                    for i in range(self.args.conv_kernel_size - 1):
+                        dst = ttnn.reshape(bl["conv_rows"][i], [self.batch_size, 1, 1, D])
+                        src = ttnn.reshape(sc["conv_rows"][i], [1, 1, 1, D])
+                        ttnn.fill_cache(dst, src, slot)
+        self.slot_pos[slot] = T
+        return logits
+
+    def setup_batch_decode(self, first_token_ids):
+        """Seed batched decode from the per-slot prefills (self.caches already [B,...] populated by
+        prefill_into_slot). first_token_ids: length-B list of each slot's host-sampled first token
+        (dead slots pass any id, e.g. 0). Per-slot positions come from self.slot_pos. Allocates the
+        stable-address device state tensors; after this, drive each step with set_decode_state([B],[B])
+        + decode_forward_logits() -> [B, vocab] (host sampling)."""
+        B = self.batch_size
+        mk = lambda t, dt: to_tt(t, self.mesh_device, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT)
+        self.t_tok = mk(torch.tensor(list(first_token_ids), dtype=torch.int32), ttnn.uint32)
+        self.t_curpos = mk(torch.tensor(self.slot_pos, dtype=torch.int32), ttnn.int32)
+        self.t_ropepos = mk(torch.tensor(self.slot_pos, dtype=torch.int32), ttnn.uint32)
+        # Per-slot presence mask for batched repetition control, built once when the sampling tail is
+        # active so the captured graph includes the presence ops. t_presence_b accumulates generated
+        # tokens per slot (reset on slot reuse); the penalty strength is a uniform baked scalar (below).
+        self._presence_on_batch = self.sampling is not None and os.environ.get("QWEN36_BATCH_PRESENCE", "1") != "0"
+        if self._presence_on_batch:
+            V = self.args.vocab_size
+            # Per-SLOT presence mask (each request's own generated tokens). The penalty STRENGTH is a
+            # uniform scalar baked into the trace — per-request strength would need a W-broadcast tensor
+            # multiply (unreliable in TILE); a server-wide default is simpler and fixes the small-model
+            # repetition loops. Default 1.5 matches demo/server; QWEN36_PRESENCE_PENALTY overrides (0=off).
+            self._presence_penalty_batch = float(os.environ.get("QWEN36_PRESENCE_PENALTY", "1.5"))
+            if self._presence_penalty_batch <= 0:
+                self._presence_on_batch = False  # disabled -> skip the presence ops entirely
+            else:
+                self.t_presence_b = ttnn.zeros(
+                    [1, 1, B, V], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+                )
+
+    def set_decode_state(self, token_ids, positions):
+        """Overwrite the batched decode state (token + absolute position, per slot) from the plugin's
+        per-step inputs, IN THIS MODEL'S SLOT ORDER. Makes batched decode fully plugin-driven: no
+        reliance on internal position advancing, so a slot reused by a new request mid-stream gets that
+        request's fresh position (not a stale advanced one), and vLLM's compaction is irrelevant.
+        token_ids / positions: length-B lists (dead slots pass anything)."""
+        mk = lambda t, dt: to_tt(t, self.mesh_device, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT)
+        tok = torch.as_tensor(list(token_ids), dtype=torch.int32).flatten()
+        pos = torch.as_tensor(list(positions), dtype=torch.int32).flatten()
+        ttnn.copy(mk(tok, ttnn.uint32), self.t_tok)  # in-place into the stable-address decode buffers
+        ttnn.copy(mk(pos, ttnn.int32), self.t_curpos)
+        ttnn.copy(mk(pos, ttnn.uint32), self.t_ropepos)
+
+    def set_sampling_params_batch(self, top_ks, top_ps, temps, seeds):
+        """Write PER-SLOT sampling params in place into the 32-lane sampling buffers (trace-safe: the
+        captured graph reads these exact addresses each replay, so per-request params take effect with
+        no re-capture — the batched analogue of set_decode_state). All lists are length nslot (lane b =
+        slot b); lanes past nslot are padded harmlessly. temp<=0 is greedy-equivalent (top_k=1, temp=1
+        -> argmax over the topk candidates). `seeds` are the ABSOLUTE per-slot values for THIS step (the
+        caller folds the position in so each request's RNG differs AND advances per step; this replaces
+        the single global seed)."""
+        B, nslot, K = self.SAMP_USERS, self.batch_size, self.SAMP_K
+        ks, ps, ts, ss = [], [], [], []
+        for i in range(nslot):
+            t = temps[i]
+            if t is None or float(t) <= 0.0:  # greedy-equivalent lane
+                ks.append(1)
+                ts.append(1.0)
+            else:
+                k = int(top_ks[i]) if top_ks[i] else K
+                ks.append(k if 0 < k <= K else K)
+                ts.append(1.0 / float(t))  # ttnn.sampling scales by 1/T
+            p = top_ps[i]
+            ps.append(min(max(float(p) if p is not None else 1.0, 0.0), 1.0))
+            ss.append(int(seeds[i]) & 0x7FFFFFFF)
+        ks += [K] * (B - nslot)
+        ps += [1.0] * (B - nslot)
+        ts += [1.0] * (B - nslot)
+        ss += [0] * (B - nslot)
+        mk = lambda arr, td, dt: to_tt(
+            torch.tensor(arr, dtype=td), self.mesh_device, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT
+        )
+        ttnn.copy(mk(ks, torch.int32, ttnn.uint32), self.t_k)
+        ttnn.copy(mk(ps, torch.float32, ttnn.bfloat16), self.t_p)
+        ttnn.copy(mk(ts, torch.float32, ttnn.bfloat16), self.t_temp)
+        ttnn.copy(mk(ss, torch.int32, ttnn.uint32), self.t_seed)
+
+    def reset_presence_slots(self, slots):
+        """Clear the presence-mask rows for `slots` (a new request took the slot -> empty generated-token
+        history). Done EAGERLY outside the trace via an in-place multiply by a per-slot keep-mask (0 for
+        the reused rows, 1 elsewhere), broadcast over the vocab ([1,1,nslot,1] against [1,1,nslot,V] — a
+        size-1 W dim, which ttnn broadcasts), so the persistent mask is zeroed for the reused rows without
+        disturbing the others and without materializing a full-width host tensor."""
+        if getattr(self, "t_presence_b", None) is None or not slots:
+            return
+        nslot = self.batch_size
+        keep = torch.ones(nslot, dtype=torch.float32)
+        for s in slots:
+            if 0 <= s < nslot:
+                keep[s] = 0.0
+        keep_t = to_tt(keep.view(1, 1, nslot, 1), self.mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+        ttnn.multiply(self.t_presence_b, keep_t, output_tensor=self.t_presence_b)
+
     def _rope_for(self, rope_pos):
         """Index the RoPE tables at the current position(s) -> (cos, sin) of [1,1,B,rotary_dim].
         rope_pos: [B] per-user positions (B=1 single-user). The B users become B positions along the
@@ -650,6 +798,99 @@ class TtModel(LightweightModule):
                 ttnn.maximum(self.t_presence, onehot, output_tensor=self.t_presence)  # in-place OR
         ttnn.plus_one(self.t_seed)  # fresh RNG next step (trace-safe; validated)
 
+    # ── vLLM CONTINUOUS BATCHING: per-slot ON-DEVICE token selection (removes host sampling) ──────
+    def _select_token_batch(self, x):
+        """Batched on-device token selection over ALL B slots (B = self.batch_size <= SAMP_USERS=32) —
+        the B>1 generalization of _select_token (which is row-0 only). Writes the next token id into
+        every row of self.t_tok [B]. Greedy = per-row argmax; sampling = per-row chunked topk +
+        ttnn.sampling across the 32 user lanes. A per-slot presence mask (t_presence_b) times a uniform
+        baked penalty discourages repeats when enabled.
+
+        VERIFY-ON-DEVICE: the per-row reshapes/pads and the 32-lane ttnn.sampling with B<32 real rows."""
+        Bm = self.batch_size
+        if self.sampling is None:  # greedy: per-row argmax over [B, vocab]
+            with sp.region("head.lm_head"):
+                logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]
+            with sp.region("head.argmax"):
+                logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
+                tok = ttnn.argmax(logits, dim=-1, keepdim=False, use_multicore=True)  # [B]
+                ttnn.copy(ttnn.to_layout(tok, ttnn.ROW_MAJOR_LAYOUT), self.t_tok)
+            return
+        V, CW, K, U, nc = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self.SAMP_USERS, self._samp_nc
+        with sp.region("head.lm_head"):
+            logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]
+        logits = ttnn.reshape(logits, [1, 1, Bm, V])
+        if getattr(self, "_presence_on_batch", False):  # subtract per-slot presence mask * uniform penalty
+            logits = ttnn.sub(logits, ttnn.multiply(self.t_presence_b, self._presence_penalty_batch))
+        # Per-row chunked topk via the VALIDATED single-row path (avoids the TILE-layout cross-row
+        # reshape that scrambled candidates). B slices + topks unroll into the trace (static B).
+        cand_v_rows, cand_i_rows = [], []
+        with sp.region("head.samp.topk"):
+            for b in range(Bm):
+                row = ttnn.reshape(ttnn.slice(logits, [0, 0, b, 0], [1, 1, b + 1, V]), [1, 1, 1, V])  # row b logits
+                row = ttnn.pad(row, [(0, 0), (0, 0), (0, 0), (0, nc * CW - V)], value=self.SAMP_NEG)
+                chunks = ttnn.reshape(row, [1, 1, nc, CW])
+                vals, idxs = ttnn.topk(chunks, k=K, dim=-1, sorted=False, indices_tensor=self._samp_local_idx)
+                gidx = ttnn.add(ttnn.typecast(idxs, ttnn.int32), self._samp_offsets, dtype=ttnn.int32)  # global ids
+                cand_v_rows.append(ttnn.reshape(vals, [1, 1, 1, nc * K]))
+                cand_i_rows.append(ttnn.reshape(gidx, [1, 1, 1, nc * K]))
+        with sp.region("head.samp.sample"):
+            cand_v = ttnn.concat(cand_v_rows, dim=2)  # [1,1,B,nc*K]  each row = its own candidates
+            cand_i = ttnn.concat(cand_i_rows, dim=2)
+            if Bm < U:  # ttnn.sampling wants 32 lanes; pad the unused rows
+                cand_v = ttnn.pad(cand_v, [(0, 0), (0, 0), (0, U - Bm), (0, 0)], value=self.SAMP_NEG)
+                cand_i = ttnn.pad(cand_i, [(0, 0), (0, 0), (0, U - Bm), (0, 0)], value=0)
+            cand_i = ttnn.untilize(ttnn.to_memory_config(cand_i, ttnn.DRAM_MEMORY_CONFIG), use_multicore=True)
+            ttnn.manual_seed(seeds=self.t_seed, user_ids=self._samp_uids)
+            ttnn.sampling(cand_v, cand_i, k=self.t_k, p=self.t_p, temp=self.t_temp, output_tensor=self.t_tok32)
+            toks = ttnn.reshape(ttnn.slice(self.t_tok32, [0, 0, 0, 0], [1, 1, 1, Bm]), [Bm])  # first B lanes
+            ttnn.copy(toks, self.t_tok)
+        if getattr(self, "_presence_on_batch", False):  # mark each slot's sampled token present (in-place OR)
+            with sp.region("head.samp.presence"):
+                # One-shot per-slot one-hot: reshape the sampled tokens to a [1,1,Bm,1] COLUMN in ROW-MAJOR
+                # first (avoids the TILE cross-row reshape scramble), then a single mutual-broadcast
+                # eq(iota[1,1,1,V], tokens[1,1,Bm,1]) -> [1,1,Bm,V] (ttnn broadcasts size-1 dims in either
+                # operand). Replaces the Bm-way eq loop + concat -> far fewer kernels (faster JIT + step).
+                idx = ttnn.reshape(ttnn.slice(self.t_tok32, [0, 0, 0, 0], [1, 1, 1, Bm]), [1, 1, Bm, 1])  # RM col
+                idx = ttnn.to_layout(ttnn.typecast(idx, ttnn.int32), ttnn.TILE_LAYOUT)
+                onehot = ttnn.typecast(ttnn.eq(self._samp_iota, idx), ttnn.bfloat16)  # [1,1,Bm,V]
+                ttnn.maximum(self.t_presence_b, onehot, output_tensor=self.t_presence_b)
+        ttnn.plus_one(self.t_seed)  # fresh RNG next step
+
+    def _decode_graph_batch(self):
+        """Traceable batched decode step: embed -> layers -> norm -> batched on-device select (writes
+        t_tok [B]) -> advance positions. Batched analogue of _decode_graph."""
+        x = self._decode_hidden()
+        with sp.region("dec.select"):
+            self._select_token_batch(x)
+        with sp.region("dec.pos_advance"):
+            ttnn.plus_one(self.t_curpos)
+            ttnn.plus_one(self.t_ropepos)
+
+    def capture_decode_trace_batch(self):
+        """Capture the batched device-select decode graph (analogue of capture_decode_trace). PRECONDITION:
+        one decode_step_eager_batch() has run (kernels compiled). Snapshots/restores decode state around
+        the dummy recording step."""
+        if getattr(self, "batch_trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.batch_trace_id)
+        snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
+        self.batch_trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+        self._decode_graph_batch()
+        ttnn.end_trace_capture(self.mesh_device, self.batch_trace_id, cq_id=0)
+        for orig, s in zip(self._trace_snapshot_tensors(), snap):
+            ttnn.copy(s, orig)
+
+    def decode_step_eager_batch(self):
+        """One eager batched device-select decode step (compiles kernels); returns [B] host token ids."""
+        self._decode_graph_batch()
+        return from_tt(self.t_tok, self.mesh_device).flatten()[: self.batch_size]
+
+    def decode_step_traced_batch(self):
+        """Replay the batched device-select decode trace; returns [B] host token ids (only the single
+        [B]-token readback per step — no full-vocab D2H, no host sampling)."""
+        ttnn.execute_trace(self.mesh_device, self.batch_trace_id, cq_id=0, blocking=False)
+        return from_tt(self.t_tok, self.mesh_device).flatten()[: self.batch_size]
+
     def decode_step_eager(self, read_from_device: bool = True):
         """Run one decode step eagerly (compiles kernels for trace capture). Returns the next token id
         (int) when read_from_device=True, else the on-DEVICE token tensor (cloned) for the vLLM async
@@ -675,6 +916,28 @@ class TtModel(LightweightModule):
                 ts.append(self.t_presence)  # presence mask accumulates each step
         return ts
 
+    def _trace_snapshot_tensors(self):
+        """State the dummy trace-capture step mutates and that must be restored, EXCLUDING the
+        position-indexed KV caches. The dummy decode writes K/V only at the CURRENT position (which is
+        restored), and the first traced replay rewrites that exact position with the same token → the
+        KV cache ends up identical either way, so it needs no snapshot. Cloning it would transiently
+        DOUBLE KV memory (e.g. +7.5 GB at pool=3 × 128K → OOM in capture). The gated-delta
+        recurrent_state + conv rows ARE running accumulators (not position-indexed) so they must be
+        restored, along with the on-device generation state (token/positions/seed/presence)."""
+        ts = []
+        for c in self.caches:
+            if isinstance(c, dict):  # gated-delta running state (recurrent_state + conv_rows); NOT KV
+                for v in c.values():
+                    ts += v if isinstance(v, list) else [v]
+        ts += [self.t_tok, self.t_curpos, self.t_ropepos]
+        if self.sampling is not None:
+            ts.append(self.t_seed)
+            if self._presence_penalty > 0:
+                ts.append(self.t_presence)
+            if getattr(self, "t_presence_b", None) is not None:  # batched presence mask accumulates in-graph
+                ts.append(self.t_presence_b)
+        return ts
+
     def capture_decode_trace(self):
         """Record the self-contained decode graph as a trace. PRECONDITION: at least one
         decode_step_eager() has run so all kernels are compiled (capture must not JIT). The decode
@@ -687,11 +950,11 @@ class TtModel(LightweightModule):
         (reused across requests) + this release keep device memory flat."""
         if self.trace_id is not None:
             ttnn.release_trace(self.mesh_device, self.trace_id)
-        snap = [ttnn.clone(t) for t in self._state_tensors()]
+        snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
         self.trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         self._decode_graph()
         ttnn.end_trace_capture(self.mesh_device, self.trace_id, cq_id=0)
-        for orig, s in zip(self._state_tensors(), snap):
+        for orig, s in zip(self._trace_snapshot_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
 
     def decode_step_traced(self, read_from_device: bool = True):
@@ -718,7 +981,7 @@ class TtModel(LightweightModule):
         all kernels are compiled (capture must not JIT)."""
         if getattr(self, "logits_trace_id", None) is not None:
             ttnn.release_trace(self.mesh_device, self.logits_trace_id)
-        snap = [ttnn.clone(t) for t in self._state_tensors()]
+        snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
         self.logits_trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         x = self._decode_hidden()
         with sp.region("dec.lm_head"):
@@ -727,7 +990,7 @@ class TtModel(LightweightModule):
             ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
             ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
         ttnn.end_trace_capture(self.mesh_device, self.logits_trace_id, cq_id=0)
-        for orig, s in zip(self._state_tensors(), snap):
+        for orig, s in zip(self._trace_snapshot_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
 
     def decode_step_logits_traced(self, read_from_device: bool = True):

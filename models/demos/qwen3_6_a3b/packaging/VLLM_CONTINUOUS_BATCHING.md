@@ -118,6 +118,18 @@ Flip `supports_async_decode` back to `True` in the adapter to resume this line o
 Measured against the actual code 2026-07-18. The surprise: the batched **decode** is done; the
 one real blocker is **per-slot prefill**.
 
+### The single-device contract — CAPTURED ON-DEVICE (probe, max-num-seqs=8)
+- **Prefill**: one call packs ALL newly-scheduled requests. `tokens [num_new, max_T]`,
+  `prompt_lens [num_new]`, `page_table [num_new, blocks]`, `start_pos [num_new]` (0 for new).
+  **`empty_slots=None`** on single-device — the model self-assigns rows; each request's `page_table`
+  (distinct `block_ids`) is its stable identity.
+- **Decode**: always at the **padded wire batch = max-num-seqs** (e.g. 8), even for 1 active request.
+  `tokens [B,1]`, `start_pos [B]` (`-1` = dead slot), `page_table [B, blocks]`, `slot_remap [B]`
+  (compaction when a request finishes), `device_sampling=True`.
+- **Sampling**: plugin sets `device_sampling=True` at B>1, but our `_select_token` is **row-0 only**,
+  so V2 must run **host-sampling** batched decode (`supports_sample_on_device=False` for the V2 build;
+  single-user drops to ~16 tok/s until per-slot device sampling is added back).
+
 ### Already WORKS at B>1 (reuse as-is)
 - Batched decode compute with **independent per-slot positions**: `_decode_hidden`/`_rope_for`
   (`tt/model.py:540-555, 530-538`), attention `forward_decode` per-slot `current_pos [B]`
