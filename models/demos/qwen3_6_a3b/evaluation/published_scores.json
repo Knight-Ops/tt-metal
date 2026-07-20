@@ -1,0 +1,23 @@
+{
+  "_comment": "Reference/target accuracy for Qwen3.6-35B-A3B and the recorded single-P150 sweep. Fill 'reference' from the official Qwen model card (do not guess); 'measured' rows are populated by run_mmlu_bench.py runs so the BFP4 accuracy cost is tracked over time.",
+  "model": "Qwen3.6-35B-A3B",
+  "reference": {
+    "source": "https://huggingface.co/Qwen (official model card — fill in verified numbers)",
+    "mmlu_redux": null,
+    "mmlu_pro": null,
+    "gpqa_diamond": null
+  },
+  "measured": {
+    "_note": "One entry per (expert_dtype, lmhead_dtype, n_layers) config. Append after each run.",
+    "example": {
+      "expert_weight_dtype": "DataType.BFLOAT4_B",
+      "lmhead_dtype": "DataType.BFLOAT4_B",
+      "n_layers": 40,
+      "dataset": "MMLU-Redux",
+      "num_samples": null,
+      "overall_accuracy": null,
+      "avg_ttft_ms": null,
+      "avg_decode_tps": null
+    }
+  }
+}

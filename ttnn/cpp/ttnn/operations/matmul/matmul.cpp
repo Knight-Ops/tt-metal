@@ -543,7 +543,8 @@ Tensor sparse_matmul(
     const std::optional<const tt::tt_metal::Tile>& output_tile,
     const std::optional<Tensor>& optional_output_tensor,
     const std::optional<const GlobalCircularBuffer>& global_cb,
-    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id) {
+    const std::optional<tt::tt_metal::SubDeviceId>& sub_device_id,
+    const std::optional<Tensor>& indices) {
     std::optional<CoreCoord> user_core_coord =
         core_grid.has_value() ? std::make_optional(CoreCoord(core_grid->x, core_grid->y)) : std::nullopt;
 
@@ -562,7 +563,8 @@ Tensor sparse_matmul(
                user_core_coord,
                output_tile,
                global_cb,
-               sub_device_id)
+               sub_device_id,
+               indices)
         .at(0);
 }
 
