@@ -80,6 +80,41 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
     const auto& input_tensor_b = tensor_args.input_tensors.at(1);
     const auto& sparsity = tensor_args.input_tensors.at(2);
 
+    TT_FATAL(
+        input_tensor_a.storage_type() == ttnn::StorageType::DEVICE &&
+            input_tensor_b.storage_type() == ttnn::StorageType::DEVICE &&
+            sparsity.storage_type() == ttnn::StorageType::DEVICE,
+        "All sparse matmul inputs must be on device");
+    TT_FATAL(
+        input_tensor_a.buffer() != nullptr && input_tensor_b.buffer() != nullptr && sparsity.buffer() != nullptr,
+        "All sparse matmul inputs must be allocated in buffers");
+    TT_FATAL(
+        input_tensor_a.device() == input_tensor_b.device() && input_tensor_a.device() == sparsity.device(),
+        "All sparse matmul inputs must be on the same device");
+    TT_FATAL(
+        input_tensor_a.layout() == ttnn::Layout::TILE,
+        "Input tensor A must be TILE layout, got {}",
+        input_tensor_a.layout());
+    TT_FATAL(
+        input_tensor_b.layout() == ttnn::Layout::TILE,
+        "Input tensor B must be TILE layout, got {}",
+        input_tensor_b.layout());
+    TT_FATAL(
+        is_floating_point(input_tensor_a.dtype()),
+        "Input tensor A must be a floating point type, got {}",
+        input_tensor_a.dtype());
+    TT_FATAL(
+        is_floating_point(input_tensor_b.dtype()),
+        "Input tensor B must be a floating point type, got {}",
+        input_tensor_b.dtype());
+    TT_FATAL(
+        sparsity.layout() == ttnn::Layout::ROW_MAJOR,
+        "Sparsity tensor must be ROW_MAJOR layout, got {}",
+        sparsity.layout());
+    TT_FATAL(
+        operation_attributes.is_input_a_sparse || operation_attributes.is_input_b_sparse,
+        "sparse_matmul requires at least one of is_input_a_sparse or is_input_b_sparse to be true");
+
     const auto& a_shape_padded = get_matmul_tensor_padded_shape(input_tensor_a, /*transpose=*/false);
     const auto& b_shape_padded = get_matmul_tensor_padded_shape(input_tensor_b, /*transpose=*/false);
     auto in0_tile = get_matmul_tile(input_tensor_a, /*transpose=*/false);
@@ -128,7 +163,9 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
         b_shape_padded,
         in1_tile);
     TT_FATAL(
-        operation_attributes.nnz.value_or(1) > 0, "nnz ({}) must be greater than 0", operation_attributes.nnz.value());
+        operation_attributes.nnz.value_or(1) > 0,
+        "nnz ({}) must be greater than 0",
+        operation_attributes.nnz.value_or(1));
 
     // Check that nnz is less than or equal to the length of all batch dimensions
     uint32_t batch_length_A = 1;
@@ -157,41 +194,27 @@ void SparseMatmulDeviceOperation::validate_on_program_cache_miss(
     // Check that sparsity has enough entries
     TT_FATAL(
         sparsity.logical_volume() == batch_length,
-        "sparsity.logical_volume() ({}) must be equal to the product of all batch dimensions ({})",
+        "sparsity logical_volume ({}) must equal batch_length ({}) "
+        "[sparsity_shape={}, is_input_a_sparse={}, is_input_b_sparse={}]",
         sparsity.logical_volume(),
-        batch_length);
+        batch_length,
+        sparsity.logical_shape(),
+        operation_attributes.is_input_a_sparse,
+        operation_attributes.is_input_b_sparse);
 
     TT_FATAL(
         operation_attributes.nnz.value_or(1) <= batch_length,
         "nnz ({}) must be less than or equal to the length of all batch dimensions ({})",
-        operation_attributes.nnz,
+        operation_attributes.nnz.value_or(1),
         batch_length);
 
-    // Indexed/gather mode validation. `indices` (optional_input_tensors[0]) is a compacted list of
-    // active expert ids; the kernels iterate it directly (bB = indices[i]) instead of scanning all
-    // batch slots, and the output expert axis becomes num_active = indices.logical_volume().
-    if (operation_attributes.use_indices) {
-        TT_FATAL(
-            !tensor_args.optional_input_tensors.empty() && tensor_args.optional_input_tensors.at(0).has_value(),
-            "use_indices is set but no indices tensor was provided");
-        const auto& indices = tensor_args.optional_input_tensors.at(0).value();
-        TT_FATAL(
-            operation_attributes.is_input_b_sparse,
-            "Indexed/gather mode requires is_input_b_sparse=true (the indexed operand is the expert "
-            "weight tensor B, laid out as [..., E, K, N]).");
-        TT_FATAL(
-            indices.layout() == tt::tt_metal::Layout::ROW_MAJOR,
-            "indices must be ROW_MAJOR layout, got {}",
-            indices.layout());
-        TT_FATAL(
-            indices.dtype() == tt::tt_metal::DataType::UINT16, "indices must be UINT16 dtype, got {}", indices.dtype());
-        TT_FATAL(indices.is_allocated(), "indices tensor must be allocated on device");
-        TT_FATAL(
-            indices.logical_volume() <= batch_length,
-            "indices length / num_active ({}) must be <= the length of all batch dimensions ({})",
-            indices.logical_volume(),
-            batch_length);
-    }
+    // When nnz is supplied, the receiver and compute kernels loop exactly nnz times while the in0 sender
+    // only multicasts once per non-zero sparsity entry. The op therefore requires
+    // count_nonzero(sparsity) == nnz; a mismatch deadlocks the device (see issue #45943).
+    // count_nonzero(sparsity) is data-dependent and lives on device, so it cannot be checked here on the
+    // host -- it is the caller's responsibility to pass an exact nnz, and the contract is validated
+    // on-device in reader_bmm_tile_layout_in0_sender_padding.cpp (asserts loudly under watcher instead of
+    // hanging).
 }
 
 SparseMatmulDeviceOperation::spec_return_value_t SparseMatmulDeviceOperation::compute_output_specs(
