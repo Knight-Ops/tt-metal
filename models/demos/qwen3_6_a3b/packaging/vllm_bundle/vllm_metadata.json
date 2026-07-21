@@ -1,0 +1,63 @@
+{
+  "arch": "Qwen3_5MoeForConditionalGeneration",
+  "main_class": "generator_vllm:Qwen36ForCausalLM",
+  "hf_weights": "Qwen/Qwen3.6-35B-A3B",
+  "launch": {
+    "blackhole": {
+      "command": [
+        "python3",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        "Qwen/Qwen3.6-35B-A3B",
+        "--max-num-seqs",
+        "2",
+        "--block-size",
+        "64",
+        "--additional-config",
+        "{\"tt\": {\"sample_on_device_mode\": \"decode_only\"}}",
+        "--reasoning-parser",
+        "qwen3",
+        "--port",
+        "8000"
+      ],
+      "env": {
+        "MESH_DEVICE": "P150",
+        "VLLM_USE_V1": "1",
+        "HF_MODEL": "Qwen/Qwen3.6-35B-A3B",
+        "QWEN36_EXPERT_DTYPE": "bf4",
+        "VLLM_RPC_TIMEOUT": "100000",
+        "QWEN36_MAX_SEQ": "49152",
+        "QWEN36_CB_SLOT_MARGIN": "1"
+      }
+    },
+    "default": {
+      "command": [
+        "python3",
+        "-m",
+        "vllm.entrypoints.openai.api_server",
+        "--model",
+        "Qwen/Qwen3.6-35B-A3B",
+        "--max-num-seqs",
+        "2",
+        "--block-size",
+        "64",
+        "--additional-config",
+        "{\"tt\": {\"sample_on_device_mode\": \"decode_only\"}}",
+        "--reasoning-parser",
+        "qwen3",
+        "--port",
+        "8000"
+      ],
+      "env": {
+        "MESH_DEVICE": "P150",
+        "VLLM_USE_V1": "1",
+        "HF_MODEL": "Qwen/Qwen3.6-35B-A3B",
+        "QWEN36_EXPERT_DTYPE": "bf4",
+        "VLLM_RPC_TIMEOUT": "100000",
+        "QWEN36_MAX_SEQ": "49152",
+        "QWEN36_CB_SLOT_MARGIN": "1"
+      }
+    }
+  }
+}
