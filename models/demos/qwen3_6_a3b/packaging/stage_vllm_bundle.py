@@ -118,10 +118,14 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    # 1. adapter files (skip caches), with imports rewritten to the vendored root
+    # 1. adapter files (skip caches), with imports rewritten to the vendored root.
+    #    vllm_metadata.json is deliberately NOT staged: with a v4 --manifest, tt-kernel is the
+    #    source of truth and RENDERS that file on pull (cli.py: write_vllm_metadata(render_...)),
+    #    overwriting anything shipped. Shipping the checked-in copy only publishes a stale env
+    #    that contradicts the manifest.
     n_adapter = 0
     for src in sorted(bundle_src.iterdir()):
-        if src.is_dir() or src.name.endswith(".pyc"):
+        if src.is_dir() or src.name.endswith(".pyc") or src.name == "vllm_metadata.json":
             continue
         text = src.read_text()
         (out / src.name).write_text(rewrite_imports(text) if src.suffix == ".py" else text)
