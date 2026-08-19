@@ -10,7 +10,7 @@
     "topology": "1x1"
   },
   "entrypoint": {
-    "class": "generator_vllm:Qwen36ForCausalLM",
+    "class": "models.autoports.qwen3_6_a3b.generator_vllm:Qwen36ForCausalLM",
     "arch_name": "Qwen3_5MoeForConditionalGeneration"
   },
   "weights": {

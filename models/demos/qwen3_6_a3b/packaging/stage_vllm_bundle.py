@@ -1,24 +1,38 @@
 # SPDX-FileCopyrightText: © 2026 Tenstorrent AI ULC
 # SPDX-License-Identifier: Apache-2.0
-"""Stage a SELF-CONTAINED tt-kernel vLLM bundle: the adapter plus a vendored copy of the
-model code it imports.
+"""Stage a self-contained tt-kernel vLLM bundle for Qwen3.6-35B-A3B.
 
-Why this exists
----------------
+What ships, and why
+-------------------
 ``tt-kernel push --backend vllm`` ships only the ``--bundle-dir`` subtree. The checked-in
-``vllm_bundle/`` holds just the adapter, which does ``from models.demos.qwen3_6_a3b...`` --
-resolved on the serve host from *its* tt-metal checkout. So a pushed bundle inherits whatever
-model code that host happens to have, and a fix in this repo does not travel with the artifact.
+``vllm_bundle/`` holds just the adapter, whose ``from models.demos.qwen3_6_a3b...`` imports
+resolve on the serve host from *its* tt-metal checkout -- so a fix in this repo does not travel
+with the published artifact.
 
-Vendoring under the name ``models`` does NOT work: the plugin deliberately *appends* the bundle
-folder to ``sys.path`` ("never insert(0), so an installed package of the same name always wins"),
-while ``tt-kernel serve`` *prepends* the tt-metal checkout to ``PYTHONPATH``. The host's
-``models`` would therefore always shadow ours -- silently.
+We therefore vendor **our model package** into the bundle and host-resolve **the platform**:
 
-So we vendor under a unique root (``qwen36_vendored``) and rewrite ``from models.`` ->
-``from qwen36_vendored.models.`` in every staged file, including the adapter. The rewrite happens
-only in the staging output, never in the repo, so in-repo development keeps using the plain
-``models.`` imports.
+  * vendored: everything under ``models/demos/qwen3_6_a3b/`` that the adapter's import closure
+    reaches, laid down as ``models/autoports/qwen3_6_a3b/`` with the adapter moved inside it.
+  * host-resolved: ``models.common.*`` (lightweightmodule, moe_gather) and
+    ``models.tt_transformers.*`` (the ``Generator`` base class). These are upstream tt-metal
+    code we do not modify, so depending on the host for them is exactly as safe as depending on
+    it for ``ttnn`` -- and vendoring the ``Generator`` import alone would drag in 32 extra
+    modules / ~890 KB, three quarters of the bundle, to inherit one base class.
+
+Why ``models/autoports/qwen3_6_a3b`` and not ``models/demos/qwen3_6_a3b``
+------------------------------------------------------------------------
+``models/`` has no ``__init__.py`` anywhere, in this repo or in the bundle, so it is a PEP 420
+namespace package: Python MERGES it across every ``sys.path`` entry. That is what lets the
+host's ``models.common`` and our ``models.autoports.qwen3_6_a3b`` coexist. It also means the
+vendored path must not collide with a path the host already provides -- a vendored
+``models/demos/qwen3_6_a3b`` would lose to the host's copy, because ``tt-kernel serve``
+*prepends* the tt-metal checkout to ``PYTHONPATH`` while the plugin *appends* the bundle folder
+("never insert(0), so an installed package of the same name always wins"). ``autoports/`` does
+not exist in tt-metal, so there is nothing to shadow it. This mirrors the convention used by
+the shipped ``models.autoports.poolside_laguna_s_2_1`` bundle.
+
+Do not write ``models/__init__.py`` or ``models/autoports/__init__.py`` into the bundle -- that
+would turn them into regular packages and break the namespace merge.
 
 Usage
 -----
@@ -37,18 +51,22 @@ import shutil
 import sys
 from pathlib import Path
 
-VENDOR_ROOT = "qwen36_vendored"
-# Entry modules the adapter imports; the closure is walked from here.
-ENTRY_MODULES = [
-    "models.demos.qwen3_6_a3b.tt.model",
-    "models.demos.qwen3_6_a3b.tt.model_config",
-    "models.demos.qwen3_6_a3b.tt.load_checkpoints",
-    "models.tt_transformers.tt.generator",
-]
-BUNDLE_SUBDIR = Path("models/demos/qwen3_6_a3b/packaging/vllm_bundle")
-# `from models.X import ...` / `import models.X` -> vendored root. Anchored so a bare
-# "models" elsewhere in the line (a string, a comment) is untouched.
-_IMPORT_RE = re.compile(r"^(\s*)(from|import)(\s+)models\b", re.MULTILINE)
+SRC_PKG = "models.demos.qwen3_6_a3b"  # in-repo package name
+DST_PKG = "models.autoports.qwen3_6_a3b"  # name inside the bundle
+SRC_DIR = Path(SRC_PKG.replace(".", "/"))
+DST_DIR = Path(DST_PKG.replace(".", "/"))
+ADAPTER = "generator_vllm.py"
+BUNDLE_SUBDIR = SRC_DIR / "packaging" / "vllm_bundle"
+# Entry modules of the adapter's closure. `models.tt_transformers.tt.generator` is deliberately
+# absent: it is host-resolved (see the module docstring).
+ENTRY_MODULES = [f"{SRC_PKG}.tt.model", f"{SRC_PKG}.tt.model_config", f"{SRC_PKG}.tt.load_checkpoints"]
+# Namespace-package levels that must NOT get an __init__.py.
+NAMESPACE_DIRS = {Path("models"), Path("models/autoports")}
+# `vllm_metadata.json` is not staged: with a v4 --manifest, tt-kernel renders it on pull from the
+# authoritative manifest and overwrites anything shipped, so shipping the checked-in copy only
+# publishes a stale env that contradicts the manifest.
+SKIP_BUNDLE_FILES = {"vllm_metadata.json"}
+_SRC_RE = re.compile(rf"\b{re.escape(SRC_PKG)}\b")
 
 
 def _module_to_path(repo: Path, mod: str) -> str | None:
@@ -59,13 +77,15 @@ def _module_to_path(repo: Path, mod: str) -> str | None:
     return None
 
 
-def compute_closure(repo: Path, entries: list[str]) -> list[str]:
-    """Transitive closure of ``models.*`` modules reachable from ``entries`` (static AST walk)."""
+def compute_closure(repo: Path, entries: list[str], within: str = SRC_PKG) -> list[str]:
+    """Modules under ``within`` reachable from ``entries`` (static AST walk, relative imports
+    included). Imports that leave ``within`` are recorded by :func:`external_imports`, not
+    followed -- they are host-resolved."""
     seen: set[str] = set()
     queue = collections.deque(entries)
     while queue:
         mod = queue.popleft()
-        if mod in seen:
+        if mod in seen or not mod.startswith(within):
             continue
         seen.add(mod)
         path = _module_to_path(repo, mod)
@@ -76,7 +96,6 @@ def compute_closure(repo: Path, entries: list[str]) -> list[str]:
         except (SyntaxError, UnicodeDecodeError) as exc:
             print(f"  warn: could not parse {path}: {exc}", file=sys.stderr)
             continue
-        # Package of `mod`, for resolving relative imports.
         parts = mod.split(".")
         pkg = parts if path.endswith("__init__.py") else parts[:-1]
         for node in ast.walk(tree):
@@ -90,16 +109,32 @@ def compute_closure(repo: Path, entries: list[str]) -> list[str]:
                     target = node.module
                 else:
                     continue
-                if not target.startswith("models."):
-                    continue
                 queue.append(target)
                 # `from pkg import mod` may name a submodule rather than an attribute.
                 queue.extend(f"{target}.{a.name}" for a in node.names)
     return sorted({p for m in seen if (p := _module_to_path(repo, m))})
 
 
-def rewrite_imports(text: str) -> str:
-    return _IMPORT_RE.sub(rf"\1\2\3{VENDOR_ROOT}.models", text)
+def external_imports(repo: Path, files: list[str]) -> set[str]:
+    """`models.*` imports in the staged set that fall OUTSIDE SRC_PKG (i.e. host-resolved)."""
+    out: set[str] = set()
+    for rel in files:
+        for node in ast.walk(ast.parse((repo / rel).read_text())):
+            mod = None
+            if isinstance(node, ast.ImportFrom) and node.module:
+                mod = node.module
+            elif isinstance(node, ast.Import):
+                for a in node.names:
+                    if a.name.startswith("models.") and not a.name.startswith(SRC_PKG):
+                        out.add(a.name)
+                continue
+            if mod and mod.startswith("models.") and not mod.startswith(SRC_PKG):
+                out.add(mod)
+    return out
+
+
+def rewrite(text: str) -> str:
+    return _SRC_RE.sub(DST_PKG, text)
 
 
 def main() -> int:
@@ -118,71 +153,72 @@ def main() -> int:
         shutil.rmtree(out)
     out.mkdir(parents=True)
 
-    # 1. adapter files (skip caches), with imports rewritten to the vendored root.
-    #    vllm_metadata.json is deliberately NOT staged: with a v4 --manifest, tt-kernel is the
-    #    source of truth and RENDERS that file on pull (cli.py: write_vllm_metadata(render_...)),
-    #    overwriting anything shipped. Shipping the checked-in copy only publishes a stale env
-    #    that contradicts the manifest.
-    n_adapter = 0
+    # 1. bundle-level files. The adapter moves INSIDE the vendored package so it is addressed by
+    #    a dotted path (models.autoports.qwen3_6_a3b.generator_vllm:Class), matching the
+    #    convention; everything else (README) stays at the bundle root.
+    pkg_root = out / DST_DIR
+    pkg_root.mkdir(parents=True)
+    staged_docs = 0
     for src in sorted(bundle_src.iterdir()):
-        if src.is_dir() or src.name.endswith(".pyc") or src.name == "vllm_metadata.json":
+        if src.is_dir() or src.suffix == ".pyc" or src.name in SKIP_BUNDLE_FILES:
             continue
-        text = src.read_text()
-        (out / src.name).write_text(rewrite_imports(text) if src.suffix == ".py" else text)
-        n_adapter += 1
+        dst = (pkg_root / src.name) if src.name == ADAPTER else (out / src.name)
+        dst.write_text(rewrite(src.read_text()) if src.suffix == ".py" else src.read_text())
+        staged_docs += src.name != ADAPTER
 
-    # 2. vendored model code
+    # 2. the model package, remapped SRC_DIR -> DST_DIR
     closure = compute_closure(repo, ENTRY_MODULES)
-    vroot = out / VENDOR_ROOT
     for rel in closure:
-        dst = vroot / rel
+        dst = out / DST_DIR / Path(rel).relative_to(SRC_DIR)
         dst.parent.mkdir(parents=True, exist_ok=True)
-        dst.write_text(rewrite_imports((repo / rel).read_text()))
+        dst.write_text(rewrite((repo / rel).read_text()))
 
-    # 3. non-.py data files that vendored modules load by path at import time
-    data_dirs = {Path(rel).parent for rel in closure}
+    # 3. non-.py data files those modules load by path
     n_data = 0
-    for d in sorted(data_dirs):
+    for d in sorted({Path(rel).parent for rel in closure}):
         for src in (repo / d).rglob("*"):
             if not src.is_file() or src.suffix in (".py", ".pyc") or "__pycache__" in src.parts:
                 continue
-            dst = vroot / src.relative_to(repo)
+            dst = out / DST_DIR / src.relative_to(repo / SRC_DIR)
             dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(src, dst)
             n_data += 1
 
-    # 4. __init__.py for every package level (tt-metal leans on PEP 420 namespace packages;
-    #    make the vendored tree explicit so it cannot half-resolve against a host package)
-    (vroot / "__init__.py").write_text(f'"""Vendored model code for the {VENDOR_ROOT} bundle."""\n')
-    n_init = 1
-    for rel in closure:
-        d = (vroot / rel).parent
-        while d != vroot:
-            init = d / "__init__.py"
-            if not init.exists():
-                init.write_text("")
-                n_init += 1
-            d = d.parent
+    # 4. __init__.py for real package levels only -- never for the namespace levels
+    n_init = 0
+    for d in {p.parent for p in out.rglob("*.py")}:
+        rel = d.relative_to(out)
+        if rel in NAMESPACE_DIRS or rel == Path("."):
+            continue
+        init = d / "__init__.py"
+        if not init.exists():
+            init.write_text("")
+            n_init += 1
+    for ns in NAMESPACE_DIRS:
+        assert not (out / ns / "__init__.py").exists(), f"{ns} must stay a namespace package"
 
-    total_kb = sum(f.stat().st_size for f in out.rglob("*.py")) / 1024
+    py = sorted(out.rglob("*.py"))
     print(f"staged {out}")
-    print(f"  adapter files      : {n_adapter}")
-    print(f"  vendored modules   : {len(closure)}")
+    print(f"  bundle docs        : {staged_docs}")
+    print(f"  vendored modules   : {len(closure)} (+ adapter)")
     print(f"  data files         : {n_data}")
     print(f"  __init__.py created: {n_init}")
-    print(f"  total python       : {total_kb:.0f} KB")
+    print(f"  total python       : {sum(f.stat().st_size for f in py) / 1024:.0f} KB in {len(py)} files")
+    print(f"  main_class         : {DST_PKG}.{ADAPTER[:-3]}:Qwen36ForCausalLM")
+
     leaked = [
         f"{f.relative_to(out)}:{i}"
-        for f in out.rglob("*.py")
+        for f in py
         for i, line in enumerate(f.read_text().splitlines(), 1)
-        if re.match(r"^\s*(from|import)\s+models\b", line)
+        if SRC_PKG in line
     ]
     if leaked:
-        print(f"  ERROR: {len(leaked)} un-rewritten 'models' imports remain:", file=sys.stderr)
+        print(f"  ERROR: {len(leaked)} reference(s) to {SRC_PKG} remain:", file=sys.stderr)
         for x in leaked[:10]:
             print(f"    {x}", file=sys.stderr)
         return 1
-    print("  no un-rewritten 'models' imports remain")
+    ext = external_imports(repo, closure)
+    print(f"  host-resolved      : {', '.join(sorted(ext)) or '(none)'}")
     return 0
 
 
