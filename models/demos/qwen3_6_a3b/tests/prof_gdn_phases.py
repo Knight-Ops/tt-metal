@@ -93,8 +93,8 @@ def main():
             t, dt = ck(mesh, t)
             acc["prep_slices_proj"] += dt
 
-            q = gd._l2norm_scale_lastdim(ttnn.reshape(q, [1, m.num_k_heads, Dk]), scale=m.qk_scale)
-            k = gd._l2norm_scale_lastdim(ttnn.reshape(k, [1, m.num_k_heads, Dk]))
+            q = gd._l2norm_scale_lastdim(ttnn.reshape(q, [1, m.num_k_heads, Dk]), scale=m.qk_scale, mc=gd._MC)
+            k = gd._l2norm_scale_lastdim(ttnn.reshape(k, [1, m.num_k_heads, Dk]), mc=gd._MC)
             t, dt = ck(mesh, t)
             acc["prep_qk_l2norm"] += dt
 

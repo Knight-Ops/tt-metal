@@ -163,10 +163,13 @@ _HIFI4 = ttnn.WormholeComputeKernelConfig(
 )
 
 
-def _l2norm_scale_lastdim(x, scale=None, eps=1e-6):
-    sq = ttnn.sum(ttnn.multiply(x, x, memory_config=_MC), dim=-1, keepdim=True, memory_config=_MC)
-    y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(sq, eps, memory_config=_MC), memory_config=_MC), memory_config=_MC)
-    return ttnn.multiply(y, scale, memory_config=_MC) if scale is not None else y
+def _l2norm_scale_lastdim(x, scale=None, eps=1e-6, mc=None):
+    """mc: memory config for the intermediates. Callers pass _MC only for DECODE (T==1), where the
+    L1 residency is a measured win. Prefill must leave it None — at T=1711 the two calls here hold
+    ~42 MB of L1 whose floor collides with the fused recurrence's CBs (see _conv_silu)."""
+    sq = ttnn.sum(ttnn.multiply(x, x, memory_config=mc), dim=-1, keepdim=True, memory_config=mc)
+    y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(sq, eps, memory_config=mc), memory_config=mc), memory_config=mc)
+    return ttnn.multiply(y, scale, memory_config=mc) if scale is not None else y
 
 
 class TtGatedDeltaNet(LightweightModule):
@@ -297,7 +300,11 @@ class TtGatedDeltaNet(LightweightModule):
                 term = ttnn.multiply(xj, self.conv_taps[j])
                 acc = term if acc is None else ttnn.add(acc, term)
         new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim])
-        return ttnn.silu(acc, memory_config=_MC), new_state
+        # Same T==1 gate as the concat above: at prefill T this is [T, conv_dim] (28 MB at T=1711),
+        # and because ttnn defaults memory_config to the INPUT's config, an L1 result here silently
+        # propagates to the q/k/v slices and everything downstream of them — pinning ~700 KB/core and
+        # clashing with the fused-recurrence CBs (which occupy 1.07 MB of the 1.5 MB L1 on their cores).
+        return ttnn.silu(acc, memory_config=(_MC if T == 1 else None)), new_state
 
     def sync_conv_rows(self, cache):
         """Populate the decode add-chain's K-1 separate history-row buffers from the [K-1, conv_dim]
@@ -866,8 +873,8 @@ class TtGatedDeltaNet(LightweightModule):
             q = ttnn.reshape(q, [T, self.num_k_heads, Dk])
             k = ttnn.reshape(k, [T, self.num_k_heads, Dk])
             v = ttnn.reshape(v, [T, Vh, Dv])
-            q = _l2norm_scale_lastdim(q, scale=self.qk_scale)
-            k = _l2norm_scale_lastdim(k)
+            q = _l2norm_scale_lastdim(q, scale=self.qk_scale, mc=mc)
+            k = _l2norm_scale_lastdim(k, mc=mc)
             if self.n_rep > 1:
                 q = ttnn.repeat_interleave(q, self.n_rep, dim=1)
                 k = ttnn.repeat_interleave(k, self.n_rep, dim=1)
@@ -914,8 +921,8 @@ class TtGatedDeltaNet(LightweightModule):
                 memory_config=mc,
             )  # [B,Vh]
         with sp.region("delta.qknorm"):
-            q = _l2norm_scale_lastdim(ttnn.reshape(q, [B, Kh, Dk]), scale=self.qk_scale)
-            k = _l2norm_scale_lastdim(ttnn.reshape(k, [B, Kh, Dk]))
+            q = _l2norm_scale_lastdim(ttnn.reshape(q, [B, Kh, Dk]), scale=self.qk_scale, mc=mc)
+            k = _l2norm_scale_lastdim(ttnn.reshape(k, [B, Kh, Dk]), mc=mc)
             v = ttnn.reshape(v, [B, Vh, Dv])
             if self.n_rep > 1:
                 q = ttnn.repeat_interleave(q, self.n_rep, dim=1)
