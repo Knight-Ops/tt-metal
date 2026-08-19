@@ -546,6 +546,7 @@ models/tt_transformers/tt/generator*.py @gwangTT @cglagovichTT @yieldthought @mt
 models/demos/qwen25_vl @gwangTT @ssanjayTT @yieldthought @uaydonat @tenstorrent/codeowner-bypass
 models/demos/qwen3_vl @ssanjayTT @gwangTT @tenstorrent/codeowner-bypass
 models/demos/blackhole/qwen36 @atupe-tt @tenstorrent/cse-developer-ttnn @tenstorrent/codeowner-bypass
+models/demos/qwen3_6_a3b @tenstorrent/codeowner-bypass
 models/demos/falcon7b_common @gwangTT @djordje-tt @uaydonat @tenstorrent/codeowner-bypass
 models/demos/wormhole/mamba @esmalTT @uaydonat @kpaigwar @tenstorrent/codeowner-bypass
 models/demos/wormhole/falcon7b @djordje-tt @uaydonat @tenstorrent/codeowner-bypass
