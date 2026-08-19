@@ -9,6 +9,12 @@ batching (that's V2 — see [../VLLM_CONTINUOUS_BATCHING.md](../VLLM_CONTINUOUS_
 - `vllm_metadata.json` — tt-kernel bundle descriptor (`arch`, `main_class`, `hf_weights`, per-machine `launch`).
 - `generator_vllm.py` — `Qwen36ForCausalLM(Generator)`: model-owned GDN state, bespoke prefill/decode driving this model's own `forward`/`start_decode`/`decode_forward_logits`/`set_decode_tokens` loop.
 - `server_example_tt.py` — thin launcher → vLLM OpenAI API server (TT plugin auto-registers).
+- `qwen36_vendored/` — **staged only, not in the repo**: a vendored copy of the model code the
+  adapter imports, produced by `../stage_vllm_bundle.py`. The plugin *appends* the bundle folder
+  to `sys.path` while `tt-kernel serve` *prepends* the tt-metal checkout, so a vendored `models/`
+  would be shadowed by the host's — hence the unique root and the build-time `models.` →
+  `qwen36_vendored.models.` rewrite. Push the *staged* dir, not this folder, so the artifact
+  carries its own model code.
 
 ## Push & serve
 ```bash
@@ -20,7 +26,7 @@ tt-kernel serve <ns>/qwen3.6-a3b-blackhole            # pulls, sets EXTRA_MODELS
 tt-kernel serve <ns>/qwen3.6-a3b-blackhole --print    # print the launch command instead
 ```
 `tt-kernel serve` runs the bundle's `launch.command` verbatim with `EXTRA_MODELS_DIR=<bundle
-parent>` + `launch.env`. Kernels-less: the plugin JITs at first-run warmup. Needs the TT vLLM
+parent>` + the manifest's `launch.<machine>.env`. Kernels-less: the plugin JITs at first-run warmup. Needs the TT vLLM
 fork/plugin on the serve host (present here per `tt-kernel doctor`); **`tt-api` is NOT needed**
 (that's only the dispatch backend). Then hit `POST http://localhost:8000/v1/chat/completions`.
 
@@ -28,12 +34,14 @@ fork/plugin on the serve host (present here per `tt-kernel doctor`); **`tt-api` 
 
 Both are set in `vllm_metadata.json`'s `launch` and are tunable per deploy without code changes:
 
-- **Concurrency (slots)** = `--max-num-seqs N` in `launch.command` (default `4`). Max requests decoded
+- **Concurrency (slots)** = `--max-num-seqs N` in `launch.command` (shipped bundle sets `1`). Max requests decoded
   concurrently. `N == 1` routes to the fast single-user V1 path (no batching); `N > 1` uses the batched
   continuous-batching path.
-- **Per-slot context** = `QWEN36_MAX_SEQ` in `launch.env` (default `49152` = 48K), capped by vLLM's
-  `--max-model-len`. Bounds the **contiguous** KV each slot reserves.
-- **Slot margin** = `QWEN36_CB_SLOT_MARGIN` in `launch.env` (default `1`, shipped bundle sets `4`). Spare
+- **Per-slot context** = `QWEN36_MAX_SEQ` in the launch env (code default `8192`; shipped bundle sets
+  `131072`). Bounds the **contiguous** KV each slot reserves, capped by vLLM's `--max-model-len`.
+  ⚠️ It is only applied when `--max-num-seqs > 1`, so at the shipped `1` it has **no effect** and KV
+  is sized from `--max-model-len` alone (262144 if that flag is unset).
+- **Slot margin** = `QWEN36_CB_SLOT_MARGIN` in the launch env (shipped bundle sets `0`). Spare
   slots that absorb the transient where finished requests' replacements are prefilled before the next
   decode's reconcile frees them.
 
@@ -112,7 +120,7 @@ supports) but loses logprobs, `min_p`, `frequency_penalty`, and guided/structure
   B=1. Real paged KV is V2.
 - **`decode_forward` ignores `start_pos`/`page_table`** — the model tracks positions internally;
   correct only for B=1 continuing from its own prefill.
-- **`launch.env`** — `MESH_DEVICE=P150`, `--block-size 64` confirmed working on this host.
+- **launch env** — `MESH_DEVICE=P150`, `--block-size 64` confirmed working on this host.
 
 ## Prerequisites
 Same tt-metal build (`ttnn` + `ttl` 1.1.3) as pushed; Blackhole FW ≥ 19.5.0; weights at
