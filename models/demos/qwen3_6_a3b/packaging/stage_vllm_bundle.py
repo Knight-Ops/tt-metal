@@ -19,20 +19,19 @@ We therefore vendor **our model package** into the bundle and host-resolve **the
     it for ``ttnn`` -- and vendoring the ``Generator`` import alone would drag in 32 extra
     modules / ~890 KB, three quarters of the bundle, to inherit one base class.
 
-Why ``models/autoports/qwen3_6_a3b`` and not ``models/demos/qwen3_6_a3b``
-------------------------------------------------------------------------
+Why ``models/qwen3_6_a3b`` and not ``models/demos/qwen3_6_a3b``
+--------------------------------------------------------------
 ``models/`` has no ``__init__.py`` anywhere, in this repo or in the bundle, so it is a PEP 420
 namespace package: Python MERGES it across every ``sys.path`` entry. That is what lets the
-host's ``models.common`` and our ``models.autoports.qwen3_6_a3b`` coexist. It also means the
-vendored path must not collide with a path the host already provides -- a vendored
-``models/demos/qwen3_6_a3b`` would lose to the host's copy, because ``tt-kernel serve``
-*prepends* the tt-metal checkout to ``PYTHONPATH`` while the plugin *appends* the bundle folder
-("never insert(0), so an installed package of the same name always wins"). ``autoports/`` does
-not exist in tt-metal, so there is nothing to shadow it. This mirrors the convention used by
-the shipped ``models.autoports.poolside_laguna_s_2_1`` bundle.
+host's ``models.common`` and our ``models.qwen3_6_a3b`` coexist. It also means the vendored path
+must not collide with one the host already provides -- a vendored ``models/demos/qwen3_6_a3b``
+would lose to the host's copy, because ``tt-kernel serve`` *prepends* the tt-metal checkout to
+``PYTHONPATH`` while the plugin *appends* the bundle folder ("never insert(0), so an installed
+package of the same name always wins"). tt-metal has no ``models/qwen3_6_a3b``, so there is
+nothing to shadow it.
 
-Do not write ``models/__init__.py`` or ``models/autoports/__init__.py`` into the bundle -- that
-would turn them into regular packages and break the namespace merge.
+Do not write ``models/__init__.py`` into the bundle -- that would turn it into a regular package
+and break the namespace merge.
 
 Usage
 -----
@@ -52,7 +51,7 @@ import sys
 from pathlib import Path
 
 SRC_PKG = "models.demos.qwen3_6_a3b"  # in-repo package name
-DST_PKG = "models.autoports.qwen3_6_a3b"  # name inside the bundle
+DST_PKG = "models.qwen3_6_a3b"  # name inside the bundle
 SRC_DIR = Path(SRC_PKG.replace(".", "/"))
 DST_DIR = Path(DST_PKG.replace(".", "/"))
 ADAPTER = "generator_vllm.py"
@@ -61,7 +60,7 @@ BUNDLE_SUBDIR = SRC_DIR / "packaging" / "vllm_bundle"
 # absent: it is host-resolved (see the module docstring).
 ENTRY_MODULES = [f"{SRC_PKG}.tt.model", f"{SRC_PKG}.tt.model_config", f"{SRC_PKG}.tt.load_checkpoints"]
 # Namespace-package levels that must NOT get an __init__.py.
-NAMESPACE_DIRS = {Path("models"), Path("models/autoports")}
+NAMESPACE_DIRS = {Path("models")}
 # `vllm_metadata.json` is not staged: with a v4 --manifest, tt-kernel renders it on pull from the
 # authoritative manifest and overwrites anything shipped, so shipping the checked-in copy only
 # publishes a stale env that contradicts the manifest.

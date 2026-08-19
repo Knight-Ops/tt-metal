@@ -18,12 +18,12 @@ batching (that's V2 — see [../VLLM_CONTINUOUS_BATCHING.md](../VLLM_CONTINUOUS_
 ```
 README.md
 server_example_tt.py
-models/autoports/qwen3_6_a3b/          <- vendored: OUR model, carrying our fixes
+models/qwen3_6_a3b/                    <- vendored: OUR model, carrying our fixes
   generator_vllm.py                       (the adapter, addressed as a dotted path)
   tt/…  reference/…
 ```
 
-`main_class` is `models.autoports.qwen3_6_a3b.generator_vllm:Qwen36ForCausalLM`.
+`main_class` is `models.qwen3_6_a3b.generator_vllm:Qwen36ForCausalLM`.
 
 Two rules make this work:
 
@@ -32,14 +32,13 @@ Two rules make this work:
   code we do not modify, so depending on the host for them is as safe as depending on it for
   `ttnn`. Vendoring the `Generator` import alone would pull in 32 extra modules / ~890 KB to
   inherit one base class.
-- **`autoports/`, not `demos/`.** `models/` has no `__init__.py` anywhere, so it is a PEP 420
-  namespace package that Python *merges* across `sys.path` — which is how the host's
-  `models.common` and our `models.autoports.qwen3_6_a3b` coexist. The vendored path must not
-  collide with one the host already provides: a vendored `models/demos/qwen3_6_a3b` would lose,
-  because `tt-kernel serve` *prepends* the tt-metal checkout to `PYTHONPATH` while the plugin
-  *appends* the bundle folder. `autoports/` does not exist in tt-metal, so nothing shadows it.
-  Never write `models/__init__.py` or `models/autoports/__init__.py` into the bundle — that
-  breaks the merge.
+- **`models/qwen3_6_a3b/`, not `models/demos/qwen3_6_a3b/`.** `models/` has no `__init__.py`
+  anywhere, so it is a PEP 420 namespace package that Python *merges* across `sys.path` — which
+  is how the host's `models.common` and our `models.qwen3_6_a3b` coexist. The vendored path must
+  not collide with one the host already provides: a vendored `models/demos/qwen3_6_a3b` would
+  lose, because `tt-kernel serve` *prepends* the tt-metal checkout to `PYTHONPATH` while the
+  plugin *appends* the bundle folder. tt-metal has no `models/qwen3_6_a3b`, so nothing shadows
+  it. Never write `models/__init__.py` into the bundle — that breaks the merge.
 
 `vllm_metadata.json` is **not** staged: with a v4 `--manifest`, tt-kernel renders it on pull from
 the manifest and overwrites anything shipped.
