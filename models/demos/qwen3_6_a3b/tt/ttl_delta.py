@@ -862,6 +862,269 @@ def decode_step_batch_tt(
     )
 
 
+# ============================================================================================
+# CHAINED fused multi-step decode kernel — K SEQUENTIAL tokens of ONE sequence (MTP verify).
+#
+# Same grid and identical per-step math as _decode_step_batch, but the K steps share ONE recurrent
+# state chained through the loop instead of K independent ones. That is the whole difference:
+#   * read()    fetches S ONCE instead of K times, and `Sd` doubles as the step-to-step CARRY, so the
+#               dataflow-buffer budget is unchanged (no new DFB, which matters: the batched kernel
+#               already sits at 29/32 + 2 compiler-allocated).
+#   * compute() is PEELED — ttl forbids conditionals in kernel source, so "store the carry unless this
+#               is the last step" cannot be expressed as an `if`; the first K-1 steps re-store their
+#               state into `Sd` and the final one does not (else a reserved block dangles).
+#   * write()   still emits `out` and `Snew` PER STEP: verify needs every intermediate state so accept
+#               can roll back to the accepted prefix by slot index.
+#
+# Why this exists at all: it is not about kernel time. Driving the per-step recurrence from Python
+# costs 7 ttnn ops per step per layer (2 gating-tile slices + 4 operand slices + the launch), and the
+# verify trace is dispatch-bound — measured excess marginal 3.1 ms/token against 7 ops x 30 layers x
+# ~14.8 us/op = 3.1 ms, an exact match. Folding the loop on-core deletes 6 of those 7.
+#
+# Tensor contract is the batched kernel's, with the batch axis reinterpreted as the TIME axis:
+#   q/kr   [K*TILE, key_dim]        step t on tile-row t, key-head hk=h//rep column slab
+#   v/z    [K*TILE, value_dim]      step t on tile-row t, value-head h column slab
+#   araw/braw/negA/dtb [K*nv*TILE, TILE]   per-(t,h) uniform tile at tile-row (t*nv+h)*ct
+#   S      [nv*Dk, Dv]              ONE state in (head-major), read once
+#   Snew   [K*nv*Dk, Dv]            per-step states out, (t,h) at tile-rows (t*nv+h)*kt_t
+#   out    [K*TILE, value_dim]      step t on tile-row t
+# ============================================================================================
+_decode_chain_ops = {}
+
+
+def _get_decode_op_chain(n_v_heads, n_k_heads, scale, norm_eps, K):
+    key = (n_v_heads, n_k_heads, scale, norm_eps, K)
+    if key in _decode_chain_ops:
+        return _decode_chain_ops[key]
+    gn, gm = _grid_dims(n_v_heads)
+    rep = n_v_heads // n_k_heads
+    nv = n_v_heads
+    EPS, NEPS = _GDN_EPS, norm_eps
+
+    @ttl.operation(grid=(gn, gm), fp32_dest_acc_en=False)
+    def _decode_step_chain(
+        q: ttnn.Tensor,  # [B*TILE, key_dim]    raw q (heads along columns)
+        kr: ttnn.Tensor,  # [B*TILE, key_dim]    raw k
+        v: ttnn.Tensor,  # [B*TILE, value_dim]
+        z: ttnn.Tensor,  # [B*TILE, value_dim]  w_z projection (gate)
+        araw: ttnn.Tensor,  # [B*nv*TILE, TILE]  raw a (uniform per (b,h))
+        braw: ttnn.Tensor,  # [B*nv*TILE, TILE]  raw b
+        negA: ttnn.Tensor,  # [B*nv*TILE, TILE]  -exp(A_log) const (per head, repeated over b)
+        dtb: ttnn.Tensor,  # [B*nv*TILE, TILE]  dt_bias const
+        S: ttnn.Tensor,  # [B*nv*Dk, Dv]
+        nweight: ttnn.Tensor,  # [TILE, Dv]  gated-norm weight (replicated rows; same all (b,h))
+        out: ttnn.Tensor,  # [B*TILE, value_dim]  final (normed+gated) output
+        Snew: ttnn.Tensor,  # [B*nv*Dk, Dv]
+    ) -> None:
+        Dk, Dv = q.shape[1] // n_k_heads, v.shape[1] // n_v_heads
+        ct, kt_t, vt = 1, Dk // TILE, Dv // TILE
+        inv_dv = 1.0 / Dv
+
+        def mk(t, s):
+            return ttl.make_dataflow_buffer_like(t, shape=s, block_count=2)
+
+        qd, krd, vd, zd = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t)), mk(v, (ct, vt)), mk(z, (ct, vt))
+        ard, brd, nAd, dtd = mk(araw, (ct, 1)), mk(braw, (ct, 1)), mk(negA, (ct, 1)), mk(dtb, (ct, 1))
+        Sd = mk(S, (kt_t, vt))
+        # No dedicated carry buffer: the kernel is ONE DFB index over budget with one (33 vs 32), and
+        # `outer` is free the moment `st = Sg + outer` is formed, so it doubles as the state carry.
+        # Both of its producers are in compute(), which matters — a DFB may have only ONE producer
+        # THREAD ("dataflow buffer cb_index=N has multiple producer threads"), which is why the carry
+        # cannot live in `Sd` (produced by read()). FIFO order per step is
+        #   wait(state) ... reserve(outer-product) wait(outer-product) reserve(next state)
+        # so the CB never holds more than one block and the roles never alias.
+        nwd = mk(nweight, (ct, vt))
+        od, Snd = mk(out, (ct, vt)), mk(Snew, (kt_t, vt))
+        gbd, bbd = mk(S, (kt_t, vt)), mk(out, (ct, vt))
+        # shared sum/norm temps (reused for q-l2norm, k-l2norm, and core gated-norm — DFB budget)
+        sq_t, ss_t, cp_t, onesm = mk(q, (ct, kt_t)), mk(q, (ct, 1)), mk(q, (ct, kt_t)), mk(S, (kt_t, 1))
+        qn_d, kn_d = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t))  # persist: qn to end, kn to transpose
+        kn2, kcol = mk(kr, (ct, kt_t)), mk(S, (kt_t, ct))
+        # DFB budget: the B-loop costs +2 compiler-allocated buffers vs the single-user kernel, so 2
+        # user buffers are dropped by reusing freed ones — gbd (free after the S*g decay) holds the Sg
+        # copy (was Sg2), and dl (free after the outer product) holds the core (was core_d).
+        Sg, kv, dl, outer, st = (
+            mk(S, (kt_t, vt)),
+            mk(out, (ct, vt)),
+            mk(out, (ct, vt)),
+            mk(S, (kt_t, vt)),
+            mk(S, (kt_t, vt)),
+        )
+
+        @ttl.datamovement()
+        def read():
+            node_n, node_m = ttl.node(dims=2)
+            h = node_n * gm + node_m
+            hk = h // rep
+            cq, cv = hk * kt_t, h * vt  # COLUMN slabs into [K*TILE, key/value_dim]
+            # ONE state fetch for the whole chain (the batched kernel reads K INDEPENDENT states).
+            # `Sd` then doubles as the step-to-step carry: compute() re-stores the updated state into
+            # it, so the chain needs NO extra dataflow buffer and the DFB budget is unchanged.
+            with Sd.reserve() as s0:
+                ttl.copy(S[h * kt_t : h * kt_t + kt_t, 0:vt], s0).wait()
+            for b in range(K):
+                rMv, rKv, rb = (b * nv + h) * ct, (b * nv + h) * kt_t, b * ct
+                with (
+                    qd.reserve() as a0,
+                    krd.reserve() as a1,
+                    vd.reserve() as a2,
+                    zd.reserve() as az,
+                    ard.reserve() as a3,
+                    brd.reserve() as a4,
+                    nAd.reserve() as a5,
+                    dtd.reserve() as a6,
+                    nwd.reserve() as a11,
+                ):
+                    t0 = ttl.copy(q[rb : rb + ct, cq : cq + kt_t], a0)
+                    t1 = ttl.copy(kr[rb : rb + ct, cq : cq + kt_t], a1)
+                    t2 = ttl.copy(v[rb : rb + ct, cv : cv + vt], a2)
+                    tz = ttl.copy(z[rb : rb + ct, cv : cv + vt], az)
+                    t3 = ttl.copy(araw[rMv : rMv + ct, 0:1], a3)
+                    t4 = ttl.copy(braw[rMv : rMv + ct, 0:1], a4)
+                    t5 = ttl.copy(negA[rMv : rMv + ct, 0:1], a5)
+                    t6 = ttl.copy(dtb[rMv : rMv + ct, 0:1], a6)
+                    t11 = ttl.copy(nweight[0:ct, 0:vt], a11)
+                    t0.wait()
+                    t1.wait()
+                    t2.wait()
+                    tz.wait()
+                    t3.wait()
+                    t4.wait()
+                    t5.wait()
+                    t6.wait()
+                    t11.wait()
+
+        @ttl.compute()
+        def compute():
+            # ttl forbids conditionals in kernel source, so "store the carry unless this is the last
+            # step" cannot be an `if`. The obvious fix — peel the final step and duplicate the body —
+            # does NOT fit: duplicating doubles the compiler's temporaries and the kernel then needs 37
+            # DFB indices against a hardware limit of 32. So the carry is stored UNCONDITIONALLY and the
+            # last step's block is simply left unconsumed. That is safe: `Sd` is reserved K+1 times
+            # (once by read(), once per step) and waited K times, so the CB never holds more than one
+            # entry at a time and cannot deadlock against block_count=2.
+            with Sd.wait() as Sb:  # the one DRAM state read seeds the chain (into `outer`)
+                with outer.reserve() as o:
+                    o.store(Sb)
+            for _ in range(K):
+                # ---- gating: beta = sigmoid(b) ; g_exp = exp(negA * softplus(a + dt_bias)) ----
+                with brd.wait() as bb:
+                    with bbd.reserve() as o:
+                        o.store(ttl.block.broadcast(ttl.math.sigmoid(bb), dims=[-1], shape=(ct, vt)))
+                with ard.wait() as ab, dtd.wait() as dtbk, nAd.wait() as nAk:
+                    sp = ttl.math.log(ttl.math.exp(ab + dtbk) + ttl.block.fill(1.0, shape=(ct, 1)))
+                    ge = ttl.math.exp(nAk * sp)
+                    with gbd.reserve() as o:
+                        o.store(ttl.block.broadcast(ge, dims=[-2, -1], shape=(kt_t, vt)))
+                # ---- l2norm(q) * scale  (shared temps) ----
+                with onesm.reserve() as o:
+                    o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+                with qd.wait() as qb:
+                    with sq_t.reserve() as o:
+                        o.store(qb * qb)
+                    with cp_t.reserve() as o:
+                        o.store(qb)
+                with sq_t.wait() as sqb, onesm.wait() as oc:
+                    with ss_t.reserve() as o:
+                        o.store(sqb @ oc)
+                with ss_t.wait() as ssb, cp_t.wait() as qcb:
+                    rq = ttl.block.broadcast(
+                        ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                    )
+                    with qn_d.reserve() as o:
+                        o.store((qcb * rq) * scale)
+                # ---- l2norm(k)  (reuse shared temps) ----
+                with onesm.reserve() as o:
+                    o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+                with krd.wait() as kb:
+                    with sq_t.reserve() as o:
+                        o.store(kb * kb)
+                    with cp_t.reserve() as o:
+                        o.store(kb)
+                with sq_t.wait() as sqb, onesm.wait() as oc:
+                    with ss_t.reserve() as o:
+                        o.store(sqb @ oc)
+                with ss_t.wait() as ssb, cp_t.wait() as kcb:
+                    rk = ttl.block.broadcast(
+                        ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                    )
+                    with kn_d.reserve() as o:
+                        o.store(kcb * rk)
+                with kn_d.wait() as knb:
+                    with kcol.reserve() as o:
+                        o.store(ttl.block.transpose(knb))
+                    with kn2.reserve() as o:
+                        o.store(knb)
+                # ---- rank-1 recurrence ----
+                with outer.wait() as Sb, gbd.wait() as gb:
+                    with Sg.reserve() as o:
+                        o.store(Sb * gb)
+                with kn2.wait() as knb, Sg.wait() as Sgb:
+                    with kv.reserve() as o:
+                        o.store(knb @ Sgb)
+                    with gbd.reserve() as o:  # reuse gbd (free after decay) as the Sg copy
+                        o.store(Sgb)
+                with vd.wait() as vb, kv.wait() as kvb, bbd.wait() as betab:
+                    with dl.reserve() as o:
+                        o.store((vb - kvb) * betab)
+                with kcol.wait() as kcolb, dl.wait() as dlb:
+                    with outer.reserve() as o:
+                        o.store(kcolb @ dlb)
+                with gbd.wait() as Sgb, outer.wait() as ob:
+                    with st.reserve() as o:
+                        o.store(Sgb + ob)
+                with qn_d.wait() as qnb, st.wait() as stb:
+                    with dl.reserve() as o:  # reuse dl (free after outer product) as the core
+                        o.store(qnb @ stb)
+                    with Snd.reserve() as o:
+                        o.store(stb)
+                    with outer.reserve() as o:
+                        o.store(stb)  # CARRY: this step's state becomes the next step's input
+                # ---- gated RMSNorm: out = (core * rsqrt(mean(core^2,Dv)+eps) * weight) * silu(z) ----
+                with onesm.reserve() as o:
+                    o.store(ttl.block.fill(1.0, shape=(vt, 1)))
+                with dl.wait() as cb:  # dl holds the core (reused)
+                    with sq_t.reserve() as o:
+                        o.store(cb * cb)
+                    with cp_t.reserve() as o:
+                        o.store(cb)
+                with sq_t.wait() as csqb, onesm.wait() as ocn:
+                    with ss_t.reserve() as o:
+                        o.store(csqb @ ocn)
+                with ss_t.wait() as ssnb, cp_t.wait() as cb, nwd.wait() as nwb, zd.wait() as zb:
+                    rms = ttl.block.broadcast(
+                        ttl.math.rsqrt(ssnb * inv_dv + ttl.block.fill(NEPS, shape=(ct, 1))), dims=[-1], shape=(ct, vt)
+                    )
+                    y = (cb * rms) * nwb
+                    with od.reserve() as o:
+                        o.store(y * ttl.math.silu(zb))
+
+        @ttl.datamovement()
+        def write():
+            node_n, node_m = ttl.node(dims=2)
+            h = node_n * gm + node_m
+            cv = h * vt
+            for b in range(K):
+                rKv, rb = (b * nv + h) * kt_t, b * ct
+                with od.wait() as ob:
+                    ttl.copy(ob, out[rb : rb + ct, cv : cv + vt]).wait()  # COLUMN slab into [B*TILE, value_dim]
+                with Snd.wait() as snb:
+                    ttl.copy(snb, Snew[rKv : rKv + kt_t, 0:vt]).wait()
+
+    _decode_chain_ops[key] = _decode_step_chain
+    return _decode_step_chain
+
+
+def decode_step_chain_tt(
+    q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew, n_v_heads, n_k_heads, scale, norm_eps, K
+):
+    """ttnn-native entry for the CHAINED fused decode kernel (K sequential tokens, one shared state).
+    Shapes per the contract above. Writes `out` (K tile-rows) and `Snew` (K per-step states)."""
+    _get_decode_op_chain(n_v_heads, n_k_heads, scale, norm_eps, K)(
+        q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew
+    )
+
+
 def chunk_state(q, kt, w, kcd, decay, qg, kgt, glast, S, dev, n_heads=1):
     """q,kcd,qg: [n_heads*C, Dk]; kt,kgt: [n_heads*Dk, C]; w: [n_heads*C, Dv]; decay: [n_heads*C, C];
     glast,S: [n_heads*Dk, Dv]. Returns out [n_heads*C, Dv], Snew [n_heads*Dk, Dv] (head-major)."""

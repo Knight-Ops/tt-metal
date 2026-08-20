@@ -66,6 +66,12 @@ class ModelArgs:
         self.moe_intermediate_size = c.moe_intermediate_size
         self.shared_expert_intermediate_size = c.shared_expert_intermediate_size
 
+        # MTP (multi-token prediction) head — one full-attention+MoE decoder layer shipped under the
+        # checkpoint's `mtp.*` prefix, sharing embed_tokens and lm_head with the backbone. Only used
+        # when speculative decode is enabled; the backbone ignores it. See MTP.md.
+        self.mtp_num_hidden_layers = c.mtp_num_hidden_layers
+        self.mtp_use_dedicated_embeddings = c.mtp_use_dedicated_embeddings
+
         # --- device config ---
         self.num_devices = mesh_device.get_num_devices() if mesh_device is not None else 1
         self.is_blackhole = mesh_device is not None and ttnn.device.is_blackhole(mesh_device)

@@ -6,76 +6,100 @@ optimized, and what's left — including a thorough scope for **traced increment
 prefill**. Decode is the other engineer's path (see `FUTURE_OPTIMIZATIONS.md`); summarized here only
 for the roofline.
 
-> History note: earlier revisions of this doc hypothesized prefill was purely host-dispatch-bound and
-> ranked "trace the prefill" behind everything. Per-op profiling (below) showed it's ~46% device-kernel
-> / ~54% dispatch, and tracing turned out to be a real ~1.5× lever. The doc below reflects the measured
-> state, superseding that earlier ranking.
+> History note, in order, because each revision of this doc was superseded by measurement:
+> (1) "prefill is host-dispatch-bound, tracing is the lever" — was true at ~54% dispatch, and tracing
+> did buy ~1.5x; (2) "the MoE matmuls are at roofline, no clean MoE win remains" — the conclusion held
+> but the roofline was self-referential (see §1.1); (3) once `ttnn.transformer.chunk_gated_delta_rule`
+> removed the gated-delta op count, **tracing the prefill is worth only ~1.02x** and prefill is ~75%
+> MoE, DRAM-bandwidth-bound. The doc below is state (3).
 
 ---
 
-## 1. Current baseline state (single P150, 40 layers, BFP4 experts)
+## 1. Current baseline state (single P150, 40 layers, BFP4 experts, tt-metal v0.77.0)
 
-All numbers warm, seq 256, one model load. Reproduce with `tests/bench_prefill.py` (prefill) and the
-decode owner's `bench_decode.py`.
+Measured 2026-08-20, eager prefill, warm, real text, best-of-3 (`scratchpad/final_bench.py`; the
+standing harness is `tests/bench_prefill.py`).
 
-| prefill (40L, seq 256, warm) | time | tok/s | vs original |
-|------------------------------|------|-------|-------------|
-| original baseline (fused-scan prefill, pre-opt) | 1720 ms | 149 | 1.00× |
-| **eager** (current default) | **867 ms** | **295** | **1.98×** |
-| **traced** (replay; per-length trace) | **579 ms** | **442** | **2.97×** |
+| config | T=256 | T=512 | T=1024 |
+|---|--:|--:|--:|
+| v0.77.0 defaults (GDN fused op off, bf16 MoE activations) | 672.3 ms / 381 tok/s | 1277.3 ms / 401 tok/s | 2489.4 ms / 411 tok/s |
+| + `ttnn.transformer.chunk_gated_delta_rule` **default on** | 450.3 ms / 568 tok/s | 837.3 ms / 611 tok/s | 1607.4 ms / 637 tok/s |
+| + BFP8 MoE matmul in0 & `in0_block_w=8` **default on** | **336.5 ms / 761 tok/s** | **614.3 ms / 833 tok/s** | **1162.4 ms / 881 tok/s** |
+| **total speedup** | **2.00x** | **2.08x** | **2.14x** |
 
-Latest authoritative run, `bench_prefill.py --seqs 128,256` at 40 layers (warm, best-of-3) — confirms
-seq-256 traced and adds seq 128 (tracing helps more at shorter prompts: larger dispatch fraction):
+> **Read prefill tok/s at a FIXED length.** `tests/benchmark.py` reports `T / TTFT` per prompt and then
+> takes an unweighted MEAN over prompts of 24-220 tokens, where that ratio measures fixed per-call cost
+> rather than throughput (same run: 37.7 tok/s at 24 tokens, 257 tok/s at 220). The old "~200 tok/s
+> prefill" headline was that mean. Steady-state is the table above.
 
-| seq | eager | traced | tracing speedup |
-|-----|-------|--------|-----------------|
-| 128 | 627 ms / 204 tok/s | 343 ms / **374 tok/s** | **1.83×** |
-| 256 | 847 ms / 302 tok/s | 579 ms / **442 tok/s** | **1.46×** |
+### 1.1 Where the time goes now
 
-> Current end-to-end demo/server prompt-processing throughput is **~331 tok/s**; the per-seq
-> microbench figures above isolate the eager-vs-traced kernel delta at fixed lengths.
+Device-synced per-phase (`QWEN36_PROFILE_PHASES=1`), T=512, 40 layers, warm. Absolute ms are inflated
+~2x by the per-phase sync (see `tt/prefill_profiler.py`); read the shares.
 
-Decode (the other engineer's path, for context): **~30 tok/s/user (~33 ms/token)**, captured as a
-single replayed trace.
+| phase | x | before (bf16 MoE) | after (shipped) | share, after |
+|---|--:|--:|--:|--:|
+| `moe` | 40 | 18.68 ms | **13.78 ms** | ~44% |
+| `delta` | 30 | 6.60 ms | 6.57 ms | ~16% |
+| `attn` | 10 | 2.97 ms | 2.89 ms | ~2% |
+| `head` | 1 | 15.5 ms | 9.6 ms | ~1% |
+| `norm` | 80 | 0.16 ms | 0.15 ms | ~1% |
 
-**Shipped since the original baseline** (all additive; eager + decode paths preserved, module PCC
-tests pass): MoE matmul program-config tuning, last-token lm_head, MoE routing-fold, **prefill tracing
-+ bucketing**, **eager incremental (from-cache) prefill**, MoE large-T chunking. Details in §3.
+MoE expert stages, per layer per 256-token chunk (`before -> after`, sum **8.27 -> 5.62 ms = 1.47x**):
+`gate_up` 2.18 -> 1.70, `swiglu` 2.13 -> 1.40, `down` 1.63 -> 1.14, `repeat` 1.38 -> 0.86,
+`reduce` 0.95 -> 0.52.
 
-**Functional envelope:** from-scratch prefill and incremental prefill both work for any length up to
-`max_seq_len` (KV-cache limit). Lengths bucket to multiples of 64; incremental advances the context in
-64-token-aligned steps.
+**Prefill is the MoE, and the MoE is DRAM-bandwidth-bound.** Per layer per 256-token chunk the dense
+expert stages move ~2.48 GB — `repeat` 269 MB, gate_up 705, swiglu ~738, down 487, reduce 269 — of
+which only ~0.45 GB is weights. Against the measured 8.27 ms of per-op time that is **~330 GB/s, i.e.
+~76% of the P150's 432 GB/s DRAM peak**, and the individual stages sit at 45-80% of it.
+
+A previous revision of this doc concluded "the matmuls are essentially at roofline… no clean MoE win
+remains" by anchoring the roofline on its own measured 130 TFLOP/s. That number is only **22% of the
+card's ~594 TFLOP/s LoFi peak** (110 cores x 5.4 TFLOP/s, `tech_reports/GEMM_FLOPS`); the wall is
+bandwidth, not compute. The conclusion was right, the mechanism was not — and the mechanism is what
+says which levers can work.
 
 ---
 
 ## 2. Roofline — where the silicon ceiling is
 
-Estimates; assumptions stated so they can be refined. Prefill reuses each weight across all T tokens,
-so it is **compute-bound** (high arithmetic intensity); decode reads weights per token, so it is
-**bandwidth/latency-bound**.
+- **Compute:** ~594 TFLOP/s LoFi (110 Tensix x 5.4 TFLOP/s at 1.35 GHz).
+- **DRAM:** **432 GB/s** (8 controllers x 54, tt-npe Blackhole model).
+- **Dense MoE FLOPs**, all 256 experts x all tokens: `E*T*(H*2I + I*H)*2` = 16.5 TFLOP at T=256 over
+  40 layers — 32x the `top_k=8` requirement, but only ~28 ms of compute at peak. **Irrelevant**: the
+  same work needs 99 GB of DRAM traffic, i.e. **>=230 ms**. The MoE is ~1.3x off that floor and cannot
+  be tuned closer; the only lever is fewer bytes.
+- **Gated-delta**, by contrast, moves ~250 MB/layer at T=256 (a 0.58 ms floor) against several ms
+  measured — ~12% of DRAM peak. It is op-count/occupancy-bound, which is exactly why one fused op
+  bought 1.5x and why byte-shaving there is pointless.
 
-**Prefill compute (40L, seq 256).** The dense MoE computes all 256 experts × 256 tokens:
-`E·T·(H·2I + I·H)·2 ≈ 16.5 TFLOP` over 40 layers, plus attention/gated-delta (~1–2 TFLOP) ⇒ **~17.5
-TFLOP**. The tuned MoE matmul measures **~130 TFLOP/s** (BFP4/LoFi; gate_up 0.275 TFLOP in 2.1 ms), so
-the **achievable dense-compute floor ≈ 135 ms** (and the MoE matmuls themselves already run at it:
-~3.6 ms/layer × 40 ≈ 144 ms). Weight-bandwidth floor: 17.5 GB / ~512 GB/s ≈ **34 ms** (not binding).
+### 2.1 Two structural MoE fixes were built and measured. Both are SLOWER. {#dead-ends}
 
-- **Current traced prefill 579 ms ≈ 4× the ~135 ms dense-compute floor.** The gap is **non-matmul
-  overhead** — gated-delta fp32 chunk-prep, MoE `repeat`/`reduce`/tilize, layout churn, and per-op
-  dispatch on the long tail of small ops (see §3 levers b).
-- A *sparse-ideal* floor (only top-8 of 256 experts) would be ~4× lower again, but is **unreachable
-  here**: at seq 256 nearly all experts are touched, and `ttnn.sparse_matmul` over all experts measured
-  **7× slower** than the dense batched matmul. Dense is the right call.
+Recorded so they are not re-attempted; details in `tt/moe.py`'s module docstring.
 
-**Decode roofline (context).** Per token reads the active weights (lm_head ~254 MB BFP4 + attention/
-gated-delta + top-8 experts + shared ≈ 1–2 GB) ⇒ ~2–4 ms/token bandwidth floor. Current ~33 ms/token
-is ~10× above it → decode is **dispatch/latency-bound**, not bandwidth-bound (it's already traced;
-further wins are op-fusion / fewer launches — the decode owner's area).
+1. **Per-expert token gathering** — permute tokens into an `[E, C, *]` capacity tile so each expert
+   sees only its own tokens. Correct (PCC 0.99998 vs dense) and fast in isolation: **1.83x at T=256,
+   3.08x at T=512, 4.60x at T=1024** on the MoE block. It is nevertheless unusable, because of what
+   the router actually does. Measured tokens-per-expert over 40 layers at T=512 on real text:
 
-**Takeaway:** prefill has ~4× of headroom to the achievable floor, concentrated in non-matmul overhead;
-the matmuls are essentially at roofline.
+   | | mean | max | experts touched |
+   |---|--:|--:|--:|
+   | random token ids | 16 | 163-510 (median 491) | 112-239 of 256 |
+   | real text | 16 | 138-508 (median 255) | 100-181 of 256 |
 
----
+   A few **sink experts take nearly every token**, so a uniform capacity must be `C ~ T` and saves
+   nothing. In the 40-layer model the gather fired on **1 layer out of 40** and the path came out
+   1.05x SLOWER (the routing readback costs 0.43 ms/layer for nothing).
+2. **Union-indexed sparse** — `ttnn.sparse_matmul` gather mode over only the experts some token
+   selected (the other tail of the same skew: 30-60% of experts are selected by nobody). ~2.7x fewer
+   bytes, no permutation needed, and it deletes the `repeat`. Measured end to end: **0.44-0.50x** at
+   T=256/512/1024. The 1D sparse program config assigns one N-tile per core, so it runs on `Nt` = 32
+   cores (gate_up) or 64 (down) of 110; the grid loss beats the byte saving. This also explains the
+   older per-32-token-tile result (0.22-0.37x) — same cause, worse constant.
+
+**So the dense batched matmul over the full 11x10 grid is the right shape on this hardware.** What is
+left is narrowing the bytes it moves, which is §3.8.
 
 ## 3. Shipped optimizations (what moved the numbers)
 
@@ -98,7 +122,61 @@ the matmuls are essentially at roofline.
 6. **MoE large-T chunking** (`_DENSE_TMAX=256`) — the tuned matmul holds each core's full `[T,N]` output
    in L1, overflowing past T≈320; chunk over T in ≤256 blocks (same fast config per chunk). Restores
    arbitrary length; validated T=256/384/512/768.
-7. **Batched gated-delta chunk-prep** (`tt/gated_delta.py` `_forward_prefill_chunked`, default on;
+7. **`ttnn.transformer.chunk_gated_delta_rule` default ON** (`tt/gated_delta.py` `_GDN_FUSED_OP`,
+   `QWEN36_GDN_FUSED_OP=0` reverts) — tt-metal v0.77.0's native fused chunked gated-delta op replaces
+   the in-tree chunk prep + chunk-state loop. **Measured 40-layer eager prefill 676.6 -> 452.8 ms at
+   T=256, 1281.7 -> 840.0 ms at T=512, 2492.5 -> 1610.4 ms at T=1024 (1.49-1.55x)**; core/state PCC
+   ~0.999998. It had been implemented but left opt-in; only the vLLM bundle manifest set it, so a plain
+   `demo.py` run did not get it. Eager only — the traced path keeps its pre-allocated buffer pool, and
+   that costs nothing now that tracing the prefill is worth ~1.02x. Gotcha: it hangs the device
+   silently below `head_dim=128`, hence `_FUSED_OP_MIN_HEAD_DIM`.
+8. **BFP8 dense-MoE matmul in0 + `in0_block_w=8`** (`tt/moe.py` `_MOE_ACT_DT` / `_DENSE_IN0BW`,
+   `QWEN36_MOE_ACT_BF16=1` / `QWEN36_DENSE_IN0BW=1` revert) — the only remaining MoE lever once §2.1
+   ruled out both sparse formulations: narrow the two tensors that FEED a matmul (`xe`, the E-fold
+   activation broadcast, and `h`, the down projection's input) from BFLOAT16 to BFLOAT8_B. **Measured
+   1.43x on the MoE block at tc=256 (8.91 -> 6.22 ms) and 40-layer prefill 450.3 -> 336.5 ms at T=256,
+   837.3 -> 614.3 ms at T=512, 1607.4 -> 1162.4 ms at T=1024 (1.34-1.38x).** Because `ttnn.matmul`
+   inherits its output dtype from in0, `ye = down(h)` narrows too, so three of the four big
+   `[E, tc, *]` intermediates shrink for one knob.
+
+   Numerics: final-logits PCC vs the bf16 path is 0.984 / 0.984 / 0.993 at T=256 / 512 / 1024, with
+   **argmax matching at all three** and top-5 overlap 4-5/5. Paired MMLU-Redux over the same 200
+   questions: **79.0% bf16 vs 78.0%** with BFP8 forced on every chunk — 2 questions out of 200, i.e.
+   noise at that sample count, and a strict upper bound on the cost, because prompts shorter than one
+   full chunk are **bit-identical to the previous default** under the chunk gate below and every MMLU
+   prompt (53-115 tokens) is in that regime. Both short and long (323-token) chat generations are
+   coherent and on topic.
+
+   The two knobs only work as a PAIR, and the L1 limits are sharp — measured CB size for the down
+   projection at tc=256 (`per_core_M=8, per_core_N=64`) against a 1.5 MB budget:
+
+   | in0 dtype | `in0_block_w` | static CBs | |
+   |---|--:|--:|---|
+   | BFLOAT16 | 1 | 1.16 MB | fits (the old default) |
+   | BFLOAT16 | 4 | 1.59 MB | TT_THROW |
+   | BFP8 | 1 / 2 / 4 | 1.81 / 1.90 / 2.08 MB | TT_THROW |
+   | BFP8 | 8 | fits | **the shipped pair** |
+
+   Everything else must stay BFLOAT16: a block-float matmul *output* makes the op allocate a bf16
+   intermediate CB on top of the packed output CB, and `ttnn.slice` over a block-float
+   `[E, tc, 2*inter]` tensor overflows L1 outright. `MatmulMultiCoreReuseProgramConfig` also
+   hard-requires `per_core_N == Nt`, so the output block can only be shrunk by halving the token chunk
+   — which doubles the number of chunks and therefore doubles the 453 MB/layer weight read, costing
+   more than it saves.
+
+   Two guards, because L1 fit is **not monotonic in the chunk size** — measured, bf16 in0 with block 8
+   fits at tc=128 but TT_THROWs at tc=200 and tc=256: (a) the fast pair is used only at
+   `tc == _DENSE_TMAX`, the one shape it was validated at, which is every chunk of a prefill except a
+   short tail; (b) a tri-state probe (`_FAST_DENSE_OK`) still runs that shape once on the live device
+   and falls back to (BFLOAT16, 1) for the process if it does not fit. `QWEN36_MOE_ACT_BF16=1` also
+   reverts `in0_block_w`, so the invalid pair cannot be selected by accident. Validated across
+   T in {53, 128, 200, 256, 300, 512, 640} x {shipped, reverted, invalid} — no raise, and the fast
+   path is retained at every T >= 256 including ragged ones.
+
+   One bug this shook out, worth remembering: `ye` inherits in0's dtype, so it is BFP8 for full chunks
+   and BFLOAT16 for a short tail, and `ttnn.concat` **rejects mixed dtypes** — every multi-chunk
+   prefill with a tail (e.g. T=640) failed until the per-chunk reduce was pinned to BFLOAT16.
+9. **Batched gated-delta chunk-prep** (`tt/gated_delta.py` `_forward_prefill_chunked`, default on;
    `QWEN36_DELTA_BATCH_PREP=0` reverts) — the per-chunk delta-rule prep (cumsum/decay/β-scaling/inverse
    T/w/kcd, ~25 ttnn ops) does NOT depend on the recurrent state S, so all Nc chunks' prep now runs in
    ONE batched set of ops over the stacked `[1, Nc·Vh, C, *]` axis (masks `[1,1,C,C]` broadcast over
@@ -113,24 +191,34 @@ the matmuls are essentially at roofline.
 
 ## 4. Remaining levers (ranked)
 
-> **MEASURED UPDATE (2026-07-17) — supersedes the "gated-delta kernel" framing in §4b.**
-> Two premises below were tested on the real 40-layer model and found FALSE:
-> 1. **The bf16 ttl `chunk_state` kernel is NOT a speedup** — it is **1.48× SLOWER** than the current
->    fp32/HiFi4 ttnn recurrence (`_chunk_state_ttnn`): 40L seq256 warm eager **1114 ms (bf16 kernel) vs
->    754 ms (fp32 ttnn)**. The old "5.4–5.7× faster" was vs the *retired sequential scan*, not the
->    current chunked default. The ttnn path uses the full 110-core grid at HiFi4; the ttl kernel runs
->    one head/core on 32 cores at LoFi. The "fold prep into the ttl kernel / fp32-DST accumulation"
->    lever is therefore a **dead end** — and fp32-DST would not even fix accuracy (the bf16 error is the
->    matmul *inputs*, not the accumulator; only HiFi4 multi-pass fixes it, which the ttl DSL doesn't
->    surface — see `tests/analyze_chunk_carry_precision.py`).
-> 2. **Trace capture does NOT forbid the fp32 recurrence's in-graph intermediates** — only host writes
->    (zeros/fills) are forbidden. So traced prefill now runs the SAME fp32/HiFi4 recurrence as eager
->    (`QWEN36_TRACED_FP32_RECURRENCE`, default on). **MEASURED single-bucket traced vs eager: PCC
->    1.00000, 1.55× @128 / 1.14× @256 / 1.01× @512** — full accuracy (removes the old bf16 caveat) and
->    resolves the "bucket-256 wedge" for single-bucket. **Follow-up:** multi-bucket capture still
->    corrupts the larger trace (pinned per-trace intermediate footprint exceeds free DRAM — the real
->    nature of the wedge); fix = pool the recurrence intermediates into stable per-bucket buffers.
+> **MEASURED UPDATE (2026-08-20) — supersedes everything previously ranked here.** With
+> `chunk_gated_delta_rule` on, **tracing the prefill is worth ~1.02x** (650 vs 663 ms at T=256; 1243 vs
+> 1259 ms at T=512), so every "remove dispatch" lever below is dead: prefill is large-op and
+> DRAM-bound, not dispatch-bound. Wiring the fused op into the traced path was also tried and **hangs**
+> during capture — and eager+fused beats traced-unfused outright, so the traced prefill path is
+> redundant rather than a gap to close. `demo/server.py` already prefers eager (`forward()`), with the
+> traced path behind `QWEN36_SERVER_PREFILL_TRACE=1`; leave it there.
+>
+> Two earlier framings in §4b were also refuted: the bf16 ttl `chunk_state` kernel is **1.48x SLOWER**
+> than the fp32/HiFi4 ttnn recurrence (and both are now obsolete — the native fused op supersedes
+> them), and "MoE `repeat` is infeasible to remove" is true but was the wrong target; see §2.1.
 
+### Ranked, after §3.7 and §3.8
+
+1. **MoE, remaining ~1.3x to the bandwidth floor.** 99 GB per 256 tokens against a 432 GB/s peak is a
+   ~230 ms floor; the stages run at 45-80% of peak, with `repeat` (194 GB/s, 45%) the worst. Nothing
+   structural is left (§2.1) — this is pure per-op bandwidth tuning, and `repeat` is where to start.
+2. **Gated-delta glue, now ~20% of prefill.** Occupancy-bound, not bandwidth-bound (~12% of DRAM
+   peak), so the lever is fewer/larger ops: `delta.conv`, `in_proj`, `norm_out`. Same shape of win the
+   fused op just delivered for the recurrence.
+3. **`head` costs 15.5 ms of a ~614 ms prefill** for one token's logits. `_head` already slices to the
+   last position before the 248k-vocab matmul, and decode's identical matmul is 1.23 ms, so the extra
+   ~14 ms is the D2H: `[1, 248320]` in TILE layout is physically `[32, 248320]` = 15.9 MB over PCIe.
+   `ttnn.to_layout(logits, ROW_MAJOR)` before `from_tt` should move 0.5 MB instead. Untested.
+4. **Bigger token chunks are NOT a lever** — measured 2.63 -> 2.50 -> 2.43 ms/token at T=256 -> 512 ->
+   1024 (v0.77 defaults). Fixed per-call cost is already amortized by T=256; per-token cost is real
+   work. Note `_DENSE_TMAX=256` chunking means a SMALLER chunk is strictly worse (each chunk re-reads
+   all 453 MB of a layer's expert weights), so never lower it to buy L1 headroom.
 
 ### 4a. Traced incremental (multi-turn) prefill — the next structural feature
 Eager incremental prefill (shipped, §3.5) already gives the big multi-turn win (don't re-prefill

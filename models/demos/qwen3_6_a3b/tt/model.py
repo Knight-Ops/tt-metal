@@ -33,6 +33,7 @@ class TtModel(LightweightModule):
         super().__init__()
         self.mesh_device = mesh_device
         self.args = args
+        self.loader = loader  # kept for lazily-built extras (e.g. the MTP draft head)
         self.n_layers = num_layers if num_layers is not None else args.n_layers
 
         cp = args.weight_cache_path
@@ -726,6 +727,346 @@ class TtModel(LightweightModule):
         with sp.region("dec.pos_advance"):
             ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
             ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
+
+    # ================================================================= MTP / speculative decode
+    # Round structure (gamma drafts -> K = gamma+1 verify rows), see MTP.md:
+    #   state: the backbone has consumed positions < pos; `t_tok` is the token AT `pos`, and `h_prev`
+    #   is the backbone hidden that predicted it.
+    #   draft : d_j = MTP(h, embed(tok)) for j=1..gamma, chaining the head's PRE-mtp.norm output.
+    #   verify: run the backbone over [t_tok, d_1..d_gamma] at positions [pos .. pos+gamma] -> K rows
+    #           of logits. Row i's argmax a_i is the TRUE token following the first i+1 of them.
+    #   accept: a_0 is always correct; additionally accept while d_{i+1} == a_i. n accepted tokens.
+    #   commit: advance the recurrent state by n (commit_verify) and pos by n. Rejected attention KV
+    #           and MTP KV sit past the new pos and are overwritten next round.
+
+    def build_mtp_head(self, gamma=None):
+        """Build the MTP draft head + its own KV cache. Requires a checkpoint that ships `mtp.*`."""
+        from models.demos.qwen3_6_a3b.tt.mtp import TtMtpHead
+
+        if not self.loader.has_mtp():
+            raise RuntimeError("checkpoint has no mtp.* head; speculative decode unavailable")
+        self.mtp_gamma = int(os.environ.get("QWEN36_MTP_GAMMA", "2")) if gamma is None else int(gamma)
+        if getattr(self, "mtp", None) is not None:
+            # gamma-only change: never rebuild the head (845M params) just to sweep gamma
+            self.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
+            self._mtp_hidden = None
+            return self.mtp
+        self.mtp = TtMtpHead(self.mesh_device, self.args, self.loader, self.embed_weight, self.lm_head_w)
+        # self.max_seq is only set by a prefill; fall back so the head can be built up front
+        max_seq = getattr(self, "max_seq", self.args.max_seq_len)
+        shape = [1, self.args.n_kv_heads, max_seq, self.args.head_dim]
+        self.mtp_kv = [
+            ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device) for _ in range(2)
+        ]
+        self._mtp_hidden = None  # backbone hidden that predicted the pending token
+        self.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
+        return self.mtp
+
+    def setup_mtp_decode(self):
+        """Allocate the persistent, stable-address buffers a captured speculative round needs.
+
+        Trace capture forbids HOST writes, not device allocation — so everything the host has to
+        refresh between rounds (the K candidate tokens, their positions, the seed hidden) must live in
+        a buffer written via `ttnn.copy` OUTSIDE the trace, and everything the round produces must land
+        in a buffer the host can read after `execute_trace`."""
+        K = self.mtp_gamma + 1
+        dim = self.args.dim
+        z = lambda shp, dt: ttnn.zeros(shp, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device)
+        self._m_tok = z([K], ttnn.uint32)  # slot 0 = pending token, 1..gamma = drafts
+        self._m_pos_i32 = z([K], ttnn.int32)  # absolute positions (attention / kv writes)
+        self._m_pos_u32 = z([K], ttnn.uint32)  # same, for the RoPE table lookup
+        self._m_argmax = z([K], ttnn.uint32)  # verify's per-row argmax (what the host reads back)
+        self._m_hidden = ttnn.zeros(
+            [1, 1, 1, dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+        )
+        self._m_vhidden = ttnn.zeros(
+            [1, 1, K, dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+        )
+        if self.mtp_gamma > 0:
+            self._m_draft = z([self.mtp_gamma], ttnn.uint32)  # the gamma drafted ids
+            self._m_dtok = z([1], ttnn.uint32)  # chain's current token
+            self._m_dhidden = ttnn.zeros(
+                [1, 1, 1, dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+            )
+        self.mtp_verify_trace = None
+        self.mtp_draft_trace = None
+        self.mtp_commit_traces = None
+        self._mtp_cur = None  # re-seed the python-tracked pending token from t_tok on the next round
+        return K
+
+    def _h2d(self, values, dtype, dst):
+        """Write a small python/torch vector into an EXISTING device buffer.
+
+        `copy_host_to_device_tensor` writes into the already-allocated `dst`; the obvious
+        `ttnn.copy(to_tt(...), dst)` instead allocates a fresh device buffer per call and frees it
+        again. A speculative round does ~9 of these, so at 40 layers that allocation churn is a real
+        share of the round's host time — the same reason gemma4 keeps persistent traced inputs."""
+        t = torch.as_tensor(list(values), dtype=torch.int32).flatten()
+        ttnn.copy_host_to_device_tensor(ttnn.from_torch(t, dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT), dst)
+
+    def _mtp_write_round(self, tokens, positions):
+        """Host -> device refresh of the round's inputs. Runs BETWEEN trace replays, never inside."""
+        self._h2d(tokens, ttnn.uint32, self._m_tok)
+        self._h2d(positions, ttnn.int32, self._m_pos_i32)
+        self._h2d(positions, ttnn.uint32, self._m_pos_u32)
+
+    def sync_mtp_state(self):
+        """Push the python-tracked pending token/position back into the device decode state, so a caller
+        can hand off from speculative rounds to plain `decode_step_*` without a stale `t_tok`."""
+        if getattr(self, "_mtp_cur", None) is not None:
+            self.set_decode_state([self._mtp_cur], [self.pos])
+
+    def _mtp_verify_graph(self):
+        """The traceable verify body: reads the persistent token/position buffers, writes the
+        persistent argmax + hidden buffers. No host writes, no return value."""
+        K = self._m_tok.shape[0]
+        cos, sin = self._rope_for(self._m_pos_u32)
+        x = ttnn.reshape(
+            ttnn.embedding(self._m_tok, self.embed_weight, layout=ttnn.TILE_LAYOUT), [1, 1, K, self.args.dim]
+        )
+        for layer, cache in zip(self.layers, self.caches):
+            x = layer.forward_verify(x, cos, sin, cache, self._m_pos_i32)
+        x = self.final_norm.forward(x)
+        ttnn.copy(x, self._m_vhidden)
+        logits = ttnn.linear(ttnn.reshape(x, [K, self.args.dim]), self.lm_head_w)  # [K, vocab]
+        am = ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1)
+        ttnn.copy(ttnn.reshape(am, [K]), self._m_argmax)
+
+    def _mtp_draft_graph(self):
+        """Traceable gamma-step draft chain, fully on device.
+
+        Everything the chain needs per step already lives in a persistent buffer, so no host write and
+        no per-step readback: the token is fed back with `ttnn.copy` into `_m_dtok`, the hidden with a
+        copy into `_m_dhidden` (the PRE-`mtp.norm` state, which is what A5 measured), and the position
+        is a slice of the round's `_m_pos_*` buffers. The gamma argmax results are concatenated once at
+        the end into `_m_draft` — ttnn has no slice-assign, so accumulating into one buffer per step is
+        not expressible; a single concat+copy is."""
+        gamma, dim = self.mtp_gamma, self.args.dim
+        drafts = []
+        for j in range(gamma):
+            pos_u = ttnn.slice(self._m_pos_u32, [j], [j + 1])
+            pos_i = ttnn.slice(self._m_pos_i32, [j], [j + 1])
+            cos = ttnn.reshape(
+                ttnn.embedding(pos_u, self.cos_table, layout=ttnn.TILE_LAYOUT), [1, 1, 1, self.args.rotary_dim]
+            )
+            sin = ttnn.reshape(
+                ttnn.embedding(pos_u, self.sin_table, layout=ttnn.TILE_LAYOUT), [1, 1, 1, self.args.rotary_dim]
+            )
+            out, pre = self.mtp.forward_decode(self._m_dhidden, self._m_dtok, cos, sin, self.mtp_kv, pos_i)
+            logits = ttnn.linear(ttnn.reshape(out, [1, dim]), self.lm_head_w)  # [1, vocab]
+            am = ttnn.reshape(ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1), [1])
+            drafts.append(am)
+            if j < gamma - 1:  # feed back for the next step; the last step needs neither
+                ttnn.copy(am, self._m_dtok)
+                ttnn.copy(pre, self._m_dhidden)
+        ttnn.copy(drafts[0] if gamma == 1 else ttnn.concat(drafts, dim=0), self._m_draft)
+
+    def capture_mtp_draft_trace(self):
+        """Capture the draft chain. Prime `_m_dtok`/`_m_dhidden`/`_m_pos_*` first (as with verify): the
+        warm+capture runs write the MTP head's OWN KV cache, so those writes must be idempotent with
+        the first replay — they land at positions >= pos, which the next round overwrites anyway."""
+        if self.mtp_draft_trace is not None:
+            ttnn.release_trace(self.mesh_device, self.mtp_draft_trace)
+            self.mtp_draft_trace = None
+        self._mtp_draft_graph()  # warm: compile + build constants
+        ttnn.synchronize_device(self.mesh_device)
+        tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+        self._mtp_draft_graph()
+        ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        self.mtp_draft_trace = tid
+        return tid
+
+    def draft_step_traced(self, hidden, cur_token):
+        """Replay the draft chain. `hidden` is [1,1,1,dim] (verify's accepted-prefix row); positions
+        come from the already-written `_m_pos_*`. Returns the gamma drafted ids."""
+        ttnn.copy(hidden, self._m_dhidden)
+        self._h2d([cur_token], ttnn.uint32, self._m_dtok)
+        ttnn.execute_trace(self.mesh_device, self.mtp_draft_trace, cq_id=0, blocking=False)
+        return from_tt(self._m_draft, self.mesh_device).reshape(-1).tolist()
+
+    def capture_mtp_verify_trace(self, tokens, positions):
+        """Capture the verify pass. Verify is ~90% of a round's op count, so this is the bulk of the
+        eager->traced win.
+
+        `tokens`/`positions` MUST be the first round's real inputs. Two reasons:
+          * a warm run before capture is load-bearing — it forces every lazily-built constant (MoE
+            ROWSEL/sparsity, the ttl op compile, sharded configs) to exist BEFORE capture, since
+            building one DURING capture is a host write and fatals;
+          * the warm and capture runs both WRITE the attention KV cache, and the KV cache is
+            deliberately outside `_trace_snapshot_tensors()` (snapshotting it would transiently double
+            KV memory). So those writes must be IDEMPOTENT with the first real replay — same tokens at
+            the same positions. Capturing with the buffers still zeroed writes token 0 at position 0
+            and silently corrupts the prompt's first KV row, which then perturbs every verify row.
+        """
+        if self.mtp_verify_trace is not None:
+            ttnn.release_trace(self.mesh_device, self.mtp_verify_trace)
+            self.mtp_verify_trace = None
+        self._mtp_write_round(tokens, positions)
+        self._mtp_verify_graph()  # warm: compile + build constants, and prime the KV rows
+        ttnn.synchronize_device(self.mesh_device)
+        snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
+        tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+        self._mtp_verify_graph()
+        ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+        for src, dst in zip(snap, self._trace_snapshot_tensors()):
+            ttnn.copy(src, dst)  # undo the warm/capture runs' effect on the accumulators
+        self.mtp_verify_trace = tid
+        return tid
+
+    def verify_step_traced(self, tokens, positions):
+        """Replay the verify trace for one round. Returns the K per-row argmax token ids (host)."""
+        self._mtp_write_round(tokens, positions)
+        ttnn.execute_trace(self.mesh_device, self.mtp_verify_trace, cq_id=0, blocking=False)
+        return from_tt(self._m_argmax, self.mesh_device).reshape(-1).tolist()
+
+    def _pos_tensor(self, positions, dtype=ttnn.uint32):
+        return to_tt(
+            torch.tensor(list(positions), dtype=torch.int32),
+            self.mesh_device,
+            dtype=dtype,
+            layout=ttnn.ROW_MAJOR_LAYOUT,
+        )
+
+    def verify_forward(self, token_ids, positions):
+        """Run the backbone over K tokens of ONE sequence at `positions`. Returns
+        (logits [K, vocab], hidden [1,1,K,dim]). Leaves every recurrent state untouched — call
+        `commit_verify(n)` afterwards with the accepted count."""
+        K = len(token_ids)
+        assert K == len(positions), (K, len(positions))
+        ids = self._pos_tensor(token_ids)
+        pos_i32 = self._pos_tensor(positions, dtype=ttnn.int32)
+        cos, sin = self._rope_for(self._pos_tensor(positions))
+        x = ttnn.reshape(ttnn.embedding(ids, self.embed_weight, layout=ttnn.TILE_LAYOUT), [1, 1, K, self.args.dim])
+        for layer, cache in zip(self.layers, self.caches):
+            x = layer.forward_verify(x, cos, sin, cache, pos_i32)
+        x = self.final_norm.forward(x)
+        logits = ttnn.linear(ttnn.reshape(x, [K, self.args.dim]), self.lm_head_w)  # [K, vocab]
+        return logits, x
+
+    def commit_verify(self, n):
+        """Accept the first n verify tokens: advance the recurrent states and `pos` by n.
+
+        Uses a captured trace when one exists. `n` varies per round and a trace is a fixed op sequence,
+        so there is one trace PER possible accept count (1..K) rather than one parameterised trace —
+        `n` cannot be a runtime input without device-side dynamic indexing."""
+        tr = getattr(self, "mtp_commit_traces", None)
+        if tr is not None and n in tr:
+            ttnn.execute_trace(self.mesh_device, tr[n], cq_id=0, blocking=False)
+        else:
+            for layer, cache in zip(self.layers, self.caches):
+                layer.commit_verify(cache, n)
+        self.pos += n
+
+    def _mtp_commit_graph(self, n):
+        for layer, cache in zip(self.layers, self.caches):
+            layer.commit_verify(cache, n)
+
+    def capture_mtp_commit_traces(self):
+        """Capture one commit trace per accept count 1..K (~120 device copies each at 40 layers, which
+        is 12-24 ms of eager dispatch per round — worth capturing).
+
+        Each capture MUTATES the recurrent/conv state, and successive captures would stack on top of
+        each other, so every one is bracketed by a snapshot/restore of `_trace_snapshot_tensors()`
+        (which covers recurrent_state, conv_state and conv_rows — but not the KV caches, by design).
+        Requires a verify to have run first, so `_verify_pending` and the persistent conv buffer exist."""
+        K = self._m_tok.shape[0]
+        for tid in (getattr(self, "mtp_commit_traces", None) or {}).values():
+            ttnn.release_trace(self.mesh_device, tid)
+        self.mtp_commit_traces = {}
+        # ONE snapshot for the whole loop (~30 MB at 40 layers): every warm run and every capture run
+        # mutates the state, so each is followed by a restore from the same baseline.
+        snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
+
+        def restore():
+            for src, dst in zip(snap, self._trace_snapshot_tensors()):
+                ttnn.copy(src, dst)
+
+        for n in range(1, K + 1):
+            self._mtp_commit_graph(n)  # warm/compile
+            restore()
+            ttnn.synchronize_device(self.mesh_device)
+            tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
+            self._mtp_commit_graph(n)
+            ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
+            restore()
+            self.mtp_commit_traces[n] = tid
+        return self.mtp_commit_traces
+
+    def mtp_draft(self, hidden, first_token, gamma):
+        """Chain `gamma` draft steps from the backbone hidden `hidden` ([1,1,1,dim]) and the pending
+        token `first_token`. Each step feeds back the head's PRE-`mtp.norm` output (what A5 measured).
+        Returns the list of drafted token ids."""
+        drafts, h, tok = [], hidden, first_token
+        for j in range(gamma):
+            p = self.pos + j
+            cos, sin = self._rope_for(self._pos_tensor([p]))
+            out, pre = self.mtp.forward_decode(
+                h, self._pos_tensor([tok]), cos, sin, self.mtp_kv, self._pos_tensor([p], dtype=ttnn.int32)
+            )
+            tok = int(
+                from_tt(ttnn.linear(ttnn.reshape(out, [1, self.args.dim]), self.lm_head_w), self.mesh_device)
+                .reshape(-1)
+                .argmax()
+            )
+            drafts.append(tok)
+            h = pre
+        return drafts
+
+    def spec_decode_step(self):
+        """One speculative round. Returns the list of newly emitted token ids (1..gamma+1 of them).
+        `self.t_tok` is left holding the last emitted token so the next round continues seamlessly."""
+        gamma = self.mtp_gamma
+        # The pending token is tracked in PYTHON. Reading it back off `t_tok` every round costs a
+        # blocking D2H sync, and nothing in the verify path consumes t_tok/t_curpos (verify reads the
+        # `_m_*` buffers). `sync_mtp_state()` pushes it back if the caller returns to plain decode.
+        if getattr(self, "_mtp_cur", None) is None:
+            self._mtp_cur = int(from_tt(self.t_tok, self.mesh_device).reshape(-1)[0])
+        cur = self._mtp_cur
+        if self._mtp_hidden is None:
+            # first round: no backbone hidden yet for the pending token, so take one plain decode step.
+            # Always eager — the captured trace is shaped for K = gamma+1 rows, not 1.
+            logits, hid = self.verify_forward([cur], [self.pos])
+            a0 = int(from_tt(logits, self.mesh_device).reshape(1, -1)[0].argmax())
+            self.commit_verify(1)
+            self._mtp_hidden = hid
+            self._mtp_cur = a0
+            self.mtp_stats["rounds"] += 1
+            self.mtp_stats["tokens"] += 1
+            return [a0]
+
+        if getattr(self, "mtp_draft_trace", None) is not None:
+            # positions must already be on device for the traced chain to slice them
+            self._mtp_write_round([cur] * (gamma + 1), [self.pos + i for i in range(gamma + 1)])
+            drafts = self.draft_step_traced(self._mtp_hidden, cur)
+        else:
+            drafts = self.mtp_draft(self._mtp_hidden, cur, gamma)
+        toks = [cur] + drafts
+        positions = [self.pos + i for i in range(len(toks))]
+        if getattr(self, "mtp_verify_trace", None) is not None:
+            # traced verify: bit-exact vs the eager path (test_mtp_trace) and ~90% of the round's ops
+            a = self.verify_step_traced(toks, positions)
+            hid = self._m_vhidden
+        else:
+            logits, hid = self.verify_forward(toks, positions)
+            a = from_tt(logits, self.mesh_device).reshape(len(toks), -1).argmax(dim=-1).tolist()
+
+        n = 1
+        for i in range(gamma):
+            if drafts[i] == a[i]:
+                n += 1
+            else:
+                break
+        emitted = a[:n]
+        self.commit_verify(n)
+        # seed the next round from the accepted prefix's last hidden and last emitted token
+        self._mtp_hidden = ttnn.slice(hid, [0, 0, n - 1, 0], [1, 1, n, self.args.dim])
+        self._mtp_cur = emitted[-1]
+        st = self.mtp_stats
+        st["rounds"] += 1
+        st["tokens"] += n
+        st["accepted"] += n - 1
+        st["drafted"] += gamma
+        return emitted
 
     def set_decode_tokens(self, token_ids):
         """Host->device write of the next input token(s) into the device-resident decode state.

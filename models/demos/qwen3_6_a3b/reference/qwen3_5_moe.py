@@ -9,7 +9,7 @@ This is a faithful, dependency-light port of the HuggingFace ``transformers`` mo
 that PCC unit tests for the tt-nn implementation do not require ``transformers>=5.2`` to be
 installed in the tt-metal python_env.
 
-Scope: text-only (no vision tower, no MTP head). Implements the no-cache prefill path and the
+Scope: text-only (no vision tower). Implements the no-cache prefill path and the
 single-step (seq_len==1) decode path with explicit conv/recurrent state, which is all the tt-nn
 PCC tests need. Numerics mirror the HF torch fallback kernels exactly (fp32 internal compute in
 the gated-delta rule, l2-norm on q/k, etc.).
@@ -17,7 +17,7 @@ the gated-delta rule, l2-norm on q/k, etc.).
 from __future__ import annotations
 
 import json
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 import torch
@@ -59,6 +59,10 @@ class Qwen35MoeConfig:
     # hybrid layout
     full_attention_interval: int = 4
     layer_types: list = field(default_factory=list)
+    # multi-token prediction (MTP) head — one full-attention+MoE decoder layer shipped in the
+    # checkpoint under the `mtp.*` prefix. Ignored by the backbone; consumed by Qwen35MoeMTP.
+    mtp_num_hidden_layers: int = 0
+    mtp_use_dedicated_embeddings: bool = False
 
     def __post_init__(self):
         if not self.layer_types:
@@ -99,6 +103,8 @@ class Qwen35MoeConfig:
             shared_expert_intermediate_size=tc["shared_expert_intermediate_size"],
             full_attention_interval=tc.get("full_attention_interval", 4),
             layer_types=tc.get("layer_types", []),
+            mtp_num_hidden_layers=tc.get("mtp_num_hidden_layers", 0),
+            mtp_use_dedicated_embeddings=tc.get("mtp_use_dedicated_embeddings", False),
         )
         return cls(**kw)
 
@@ -607,3 +613,66 @@ class Qwen35MoeForCausalLM(nn.Module):
     def forward(self, input_ids, position_ids=None, caches=None):
         hidden_states = self.model(input_ids, position_ids, caches)
         return self.lm_head(hidden_states)
+
+
+# ---------------------------------------------------------------------------
+# Multi-token prediction (MTP) head
+# ---------------------------------------------------------------------------
+class Qwen35MoeMTP(nn.Module):
+    """The `mtp.*` head shipped in the Qwen3.6-35B-A3B checkpoint (`mtp_num_hidden_layers: 1`).
+
+    Structure (19 tensors, verified against model.safetensors.index.json): two pre-FC RMSNorms, an
+    fc that halves a [2*hidden] concat back to [hidden], ONE ordinary decoder layer that is
+    dimensionally identical to a main full-attention layer (q_proj [8192,2048] = Q+gate fused,
+    q_norm/k_norm over head_dim=256, 256-expert MoE with a 512-wide shared expert), and a final
+    norm. `mtp_use_dedicated_embeddings: false`, so embed_tokens and lm_head are SHARED with the
+    backbone and are NOT part of this module.
+
+    Contract: at position i the backbone produces hidden h_i and predicts token t_{i+1}; this head
+    consumes (h_i, t_{i+1}) and predicts t_{i+2}.
+
+    `concat_order` selects which half of `mtp.fc` sees which operand. The two prior in-tree MTP
+    attempts disagreed, and getting it wrong yields garbage (the halves multiply distinct column
+    blocks), so it is a constructor knob to be resolved empirically -- see
+    tests/probe_mtp_acceptance.py. "token_first" matches the DeepSeek-V3 MTP convention.
+    """
+
+    def __init__(self, config: Qwen35MoeConfig, concat_order: str = "token_first"):
+        super().__init__()
+        assert concat_order in ("token_first", "hidden_first"), concat_order
+        self.config = config
+        self.concat_order = concat_order
+        self.pre_fc_norm_embedding = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.pre_fc_norm_hidden = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.fc = nn.Linear(2 * config.hidden_size, config.hidden_size, bias=False)
+        # one full-attention decoder layer, whatever the backbone's layout says at that index
+        lcfg = replace(config, layer_types=["full_attention"])
+        self.layers = nn.ModuleList([Qwen35MoeDecoderLayer(lcfg, 0)])
+        self.norm = Qwen3NextRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        self.rotary_emb = Qwen35TextRotaryEmbedding(config)
+
+    def combine(self, hidden, token_embeds):
+        """fc(concat(norm_emb(embed(t_{i+1})), norm_hidden(h_i))) -> [*, hidden]."""
+        e = self.pre_fc_norm_embedding(token_embeds)
+        h = self.pre_fc_norm_hidden(hidden)
+        parts = (e, h) if self.concat_order == "token_first" else (h, e)
+        return self.fc(torch.cat(parts, dim=-1))
+
+    def forward(self, hidden, token_embeds, position_ids=None, return_prenorm=False):
+        """hidden/token_embeds: [B, S, hidden] (teacher-forced over a whole captured sequence, so the
+        head's own attention builds its KV over the sequence exactly as it would incrementally).
+        Returns the pre-lm_head hidden [B, S, hidden] -- apply the SHARED lm_head to get logits.
+
+        return_prenorm also returns the layer output BEFORE `mtp.norm`, which is what a multi-step
+        (gamma>1) draft chain feeds back as the next step's `hidden` -- the head predicts exactly ONE
+        token ahead (mtp_num_hidden_layers=1), so deeper drafts run it on its own output."""
+        x = self.combine(hidden, token_embeds)
+        bsz, seq = x.shape[:2]
+        if position_ids is None:
+            position_ids = torch.arange(seq, device=x.device).unsqueeze(0).expand(bsz, -1)
+        pe = self.rotary_emb(x, position_ids)
+        causal_mask = torch.full((seq, seq), float("-inf"), device=x.device).triu(1)[None, None]
+        for layer in self.layers:
+            x = layer(x, pe, causal_mask, None)
+        out = self.norm(x)
+        return (out, x) if return_prenorm else out

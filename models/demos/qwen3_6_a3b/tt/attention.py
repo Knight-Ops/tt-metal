@@ -279,6 +279,62 @@ class TtAttention(LightweightModule):
                 scale=self.scale,
                 program_config=self.sdpa_decode_pc,
             )  # [1, B, nh, hd]
+        return self._out_decode(attn, gate, B)
+
+    def forward_verify(self, x, cos, sin, kv_cache, positions):
+        """Speculative VERIFY of K tokens of ONE sequence: x [1,1,K,hidden]; `positions` is a DEVICE
+        int32 tensor of shape [K] holding the K absolute positions (contiguous). Returns [1,1,K,hidden]
+        — row j is the output for position j, attending 0..positions[j] inclusive (exact causal).
+
+        `positions` must be a device tensor, not a python list: this runs inside a captured trace, and
+        building an index tensor per step with `to_tt` would be a host write during capture
+        ("Writes are not supported during trace capture"). Slicing a persistent [K] buffer is a pure
+        device op, so the caller just refreshes that one buffer between replays.
+
+        Why not one batched sdpa_decode: `sdpa_decode` derives its output batch from the KV cache's
+        batch dim, so a batch-1 cache always returns ONE row (`share_cache=True` does not change
+        that — it has no in-tree users and cannot express this). A batch-K cache DOES work (verified
+        PCC 1.0) but costs K x the KV memory. It is unnecessary: attention's cost is ~0.27 ms of
+        PROJECTIONS vs ~0.022 ms of SDPA per layer, so running `_qkv`/`wo` ONCE over the K rows and
+        looping only the (kv-write, sdpa) pair is already flat in the expensive part — no extra
+        memory, and correct at any context length."""
+        K = x.shape[2]
+        assert positions.shape[-1] == K, (positions.shape, K)
+        # projections + RoPE + q/k norms over all K rows at once (M=K is free: per_core_M=1)
+        q, k, v, gate = self._qkv(x, cos, sin)  # q [1,nh,K,hd]; k,v [1,n_kv,K,hd]
+        nkv, hd = self.n_kv_heads, self.head_dim
+        rows = []
+        for j in range(K):
+            idx = ttnn.slice(positions, [j], [j + 1])  # device-side; no host write
+            with sp.region("attn.kv_write"):
+                # token j must be visible to rows j..K-1, so write it BEFORE row j's sdpa; rows
+                # already-computed are unaffected (they read a shorter cur_pos window).
+                kj = ttnn.slice(k, [0, 0, j, 0], [1, nkv, j + 1, hd])
+                vj = ttnn.slice(v, [0, 0, j, 0], [1, nkv, j + 1, hd])
+                ttnn.experimental.paged_update_cache(
+                    kv_cache[0], self._kv_update_input(kj, 1), update_idxs_tensor=idx, page_table=None
+                )
+                ttnn.experimental.paged_update_cache(
+                    kv_cache[1], self._kv_update_input(vj, 1), update_idxs_tensor=idx, page_table=None
+                )
+            with sp.region("attn.sdpa"):
+                qj = ttnn.transpose(ttnn.slice(q, [0, 0, j, 0], [1, self.n_heads, j + 1, hd]), 1, 2)
+                rows.append(
+                    ttnn.transformer.scaled_dot_product_attention_decode(
+                        qj,
+                        kv_cache[0],
+                        kv_cache[1],
+                        cur_pos_tensor=idx,
+                        scale=self.scale,
+                        program_config=self.sdpa_decode_pc,
+                    )  # [1, 1, nh, hd]
+                )
+        attn = rows[0] if K == 1 else ttnn.concat(rows, dim=1)  # [1, K, nh, hd]
+        return self._out_decode(attn, gate, K)
+
+    def _out_decode(self, attn, gate, B):
+        """Shared tail of decode/verify: attn [1,B,nh,hd] (already head-minor, unlike the prefill
+        `_out` which takes [1,nh,S,hd]) -> gate -> o_proj -> [1,1,B,hidden]."""
         with sp.region("attn.out"):
             attn = ttnn.reshape(attn, [1, 1, B, self.n_heads * self.head_dim])
             attn = ttnn.multiply(attn, ttnn.sigmoid(gate))

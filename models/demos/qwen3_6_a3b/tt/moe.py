@@ -8,10 +8,30 @@ Matches HF ``Qwen3_5MoeSparseMoeBlock``:
   shared expert: an always-on MLP gated by ``sigmoid(shared_expert_gate)``;
   output = routed + shared.
 
-PREFILL (default) computes ALL experts for ALL tokens via a single batched matmul and masks by the
-(scattered) routing weights. This is ~num_experts/top_k x the needed FLOPs but, at this expert size,
-the MoE prefill is dispatch-bound not FLOP-bound, so dense is measured faster than the sparse per-tile
-path and is the default. DECODE (T=1) uses the sparse/gather path (only the top_k active experts).
+PREFILL (default) is DENSE: all num_experts experts against all T tokens via one batched matmul per
+stage, masked by the (scattered) routing weights. DECODE (T=1) uses the sparse/gather
+``sparse_matmul`` path (only the top_k active experts).
+
+WHY DENSE, GIVEN IT IS 32x THE NEEDED FLOPS. Because FLOPs are not what binds: at T=256 the dense
+expert stages move ~2.5 GB per layer at ~299 GB/s = ~69% of a P150's 432 GB/s DRAM peak, and only
+~0.45 GB of that is weights. It is a bandwidth wall, not a compute roofline, so no program config
+moves it — the bytes have to go. Both textbook ways to remove them were built and MEASURED on the
+real 40-layer model, and both are SLOWER:
+
+1. **Per-expert token gathering** (permute tokens into a [E, C, *] capacity tile, so each expert sees
+   only its own tokens). Correct and fast in isolation — 1.8x at T=256 rising to 4.6x at T=1024, PCC
+   0.99998 vs dense. Useless here anyway, because of what the router actually does: measured over 40
+   layers at T=512 on real text, tokens/expert has mean 16 but max 255-510, i.e. a few sink experts
+   take nearly every token. A uniform capacity must therefore be C ~ T, which computes no less than
+   dense. It fired on 1 layer in 40 and cost 0.4 ms/layer in routing readback for nothing.
+2. **Union-indexed sparse** (``sparse_matmul`` gather mode over just the experts some token selected —
+   the other tail of the same skew: only 100-181 of 256 experts are selected at all). Moves ~2.7x
+   fewer bytes and needs no permutation, but measured **0.44-0.50x** end to end at T=256/512/1024: the
+   1D sparse program config puts one N-tile per core, so it runs on Nt = 32 cores (gate_up) or 64
+   (down) out of 110, and the grid loss beats the byte saving.
+
+So the dense batched matmul over the full 11x10 grid is the right shape on this hardware, and what is
+left is narrowing the bytes it moves — see ``_MOE_ACT_DT`` / ``_DENSE_IN0BW`` (worth ~1.43x).
 
 An optional SPARSE per-tile prefill path (``forward_sparse_prefill``, opt-in via
 ``QWEN36_SPARSE_PREFILL=1``) processes tokens in 32-row tiles and computes, per tile, only the
@@ -22,19 +42,17 @@ It is PCC-identical to the dense path (experts not in the union were selected by
 E-length sparsity per call, which is why tiles are processed one at a time rather than as one batched
 cross-product matmul.)
 
-PERF NOTE — it is OFF by default because it is currently SLOWER, not faster, at this model's expert
-size. Measured on a single P150 (E=256, inter=512, bf4 experts): dense prefill ~30-35ms and nearly
-flat in T (one batched matmul over all experts), while the per-tile sparse path costs ~82ms at T=128
-and ~164ms at T=256 (0.37x / 0.22x) — its per-tile host-dispatch overhead grows linearly with T.
-MoE prefill here is dispatch/overhead-bound, not FLOP-bound, so cutting the ~32x expert-FLOP waste
-buys nothing and the loop overhead dominates. Kept as a correct reference / for larger-expert configs
-where prefill becomes FLOP-bound. Dense is the default and recommended path.
+PERF NOTE — that per-tile path stays OFF: it is SLOWER than dense (~82ms at T=128, ~164ms at T=256,
+0.37x / 0.22x). It is variant 2 above with an even worse constant: a 32-token tile's union already
+covers ~63% of 256 experts, so it barely reduces work while serializing the tiles. Kept as a correct
+reference.
 """
 from __future__ import annotations
 
 import os
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.common import moe_gather
@@ -52,6 +70,43 @@ _SE_DRAM_SHARD = os.environ.get("QWEN36_MOE_SE_DRAM_SHARD", "0") == "1"
 # expert's full [tc, N] output in L1 (per_core_M = tc/32); tc=256 (per_core_M=8) is proven to fit,
 # tc~384 overflows. Prefill chunks T into <=256 blocks so any sequence length stays L1-bounded.
 _DENSE_TMAX = 256
+
+# Dtype of the dense-prefill expert matmul INPUTS: the broadcast activation `xe` and the down
+# projection's input `h` (BFLOAT8_B by default; QWEN36_MOE_ACT_BF16=1 reverts to BFLOAT16). The dense MoE
+# prefill is DRAM-bandwidth-bound and ~80% of the bytes it moves are intermediates, not weights (see
+# the note on forward()); `xe` at [E, tc, hidden] is the single largest tensor in the block, so
+# BFLOAT8_B's 1.0625 B/element vs 2 removes ~13% of the block's traffic. The routed sum is typecast
+# back up before leaving the block, and the expert weights are BFP4 at LoFi anyway (~5 mantissa bits
+# into the matmul), so an 8-bit-mantissa activation is well inside the precision the math carries.
+#
+# Set on the two tensors that FEED a matmul: `xe` (gate_up's in0, the E-fold activation broadcast and
+# the single largest tensor in the block) and `h` (the down projection's in0). `ttnn.matmul` inherits
+# its output dtype from in0, so `ye` = down(h) is carried along too and three of the four big
+# intermediates narrow for one knob. The remaining one, the [E, tc, 2*inter] gate_up output, must stay
+# BFLOAT16: it is consumed by `ttnn.slice`, which overflows L1 on a block-float tensor of that shape.
+_MOE_ACT_BF16 = os.environ.get("QWEN36_MOE_ACT_BF16") == "1"
+_MOE_ACT_DT = ttnn.bfloat16 if _MOE_ACT_BF16 else ttnn.bfloat8_b
+
+# K-tiles per block for the dense expert matmuls. Must divide Kt for both (gate_up Kt=64, down Kt=16)
+# -> one of 1,2,4,8,16. Larger means fewer K-block iterations, hence fewer per-block multicast
+# handshakes for the same bytes (the decode sparse path found 16 best for the same reason).
+#
+# 8 pairs with the BFP8 in0 above and ONLY with it: measured L1 at tc=256, the down projection
+# (per_core_M=8, per_core_N=64), against a 1.5 MB budget --
+#   bf16 in0, block 1 -> 1.16 MB (fits, the old default)   bf16 in0, block 4 -> 1.59 MB (TT_THROW)
+#   BFP8 in0, block 8 -> fits                              BFP8 in0, block 1/2/4 -> 1.81-2.08 MB (TT_THROW)
+# i.e. neither knob helps alone and the pair is not a smooth trade-off, so both defaults move together
+# and _FAST_DENSE_OK below guards the combination at runtime.
+# Reverting the dtype reverts this too (bf16 in0 with block 8 does not fit L1 at tc=256), unless the
+# caller overrides it explicitly.
+_DENSE_IN0BW = int(os.environ.get("QWEN36_DENSE_IN0BW", "1" if _MOE_ACT_BF16 else "8"))
+
+# Tri-state guard on the (BFP8 in0, in0_block_w=8) pair: None = not yet tried, True/False after the
+# first full-size chunk. L1 fit is NOT monotonic in the chunk size -- measured, bf16 in0 with block 8
+# fits at tc=128 but TT_THROWs at tc=200 and tc=256 -- so the pair is used ONLY at the one chunk size
+# it was validated at (tc == _DENSE_TMAX, which is every chunk of a prefill except a short tail) and
+# the first such chunk still proves it on the live device before it is trusted.
+_FAST_DENSE_OK = None
 
 
 class TtMoE(LightweightModule):
@@ -165,12 +220,23 @@ class TtMoE(LightweightModule):
                 return d
         return 1
 
-    def _dense_expert_pc(self, m, n):
+    def _dense_expert_pc(self, m, n, bw=None):
         """Batched-matmul program config for the dense expert matmuls [E,M,K]@[E,K,N]. The default
-        ttnn heuristic serializes the E=256 batch onto few cores (~15 ms); spreading each expert's
-        full [M,N] output across the whole compute grid is ~7x faster (PCC-identical). m,n are the
-        (padded-to-tile) output element dims. out_subblock_h*out_subblock_w must fit DST: 8 tiles for
-        bf16 dest-acc (LoFi/the model path), 4 for fp32 dest-acc (the ttnn default); prefer wide N."""
+                ttnn heuristic serializes the E=256 batch onto few cores (~15 ms); spreading each expert's
+                full [M,N] output across the whole compute grid is ~7x faster (PCC-identical). m,n are the
+                (padded-to-tile) output element dims. out_subblock_h*out_subblock_w must fit DST: 8 tiles for
+                bf16 dest-acc (LoFi/the model path), 4 for fp32 dest-acc (the ttnn default); prefer wide N.
+
+        in0_block_w is the
+                K-tiles per block; it must divide Kt for BOTH expert matmuls (gate_up Kt=64, down Kt=16).
+
+                NOTE this config type hard-requires ``per_core_N == Nt`` (matmul_device_operation.cpp:1615),
+                so the per-core output block can only be shrunk via per_core_M, i.e. via the token chunk. That
+                is why the [E,tc,2*inter] swiglu tensor cannot be block-float: a BLOCK-FLOAT matmul output
+                makes the op allocate a bf16 intermediate CB *in addition to* the packed output CB (~2.5x the
+                L1 for the same block; measured 1.81 MB against a 1.5 MB budget), and the only way to pay for
+                that would be halving tc — which doubles the number of chunks and therefore doubles the
+                453 MB/layer expert-weight read, costing more than the narrower activation saves."""
         m_tiles = (m + 31) // 32
         n_tiles = (n + 31) // 32
         ck = self.compute_kernel_config
@@ -180,7 +246,7 @@ class TtMoE(LightweightModule):
         sh = self._largest_divisor_leq(m_tiles, max(1, dst_cap // sw))
         return ttnn.MatmulMultiCoreReuseProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(*self._grid),
-            in0_block_w=1,
+            in0_block_w=_DENSE_IN0BW if bw is None else bw,
             out_subblock_h=sh,
             out_subblock_w=sw,
             per_core_M=m_tiles,
@@ -291,6 +357,94 @@ class TtMoE(LightweightModule):
         w = ttnn.reshape(sparsity, [self.num_experts, 1])
         return ttnn.sum(ttnn.multiply(down, w), dim=0)  # [hidden] -> [1, hidden] via caller
 
+    def _rowsel(self, K):
+        """Static [K*top_k, K, 1] one-hot: slot i belongs to token row i // top_k. Host-built once per
+        K and cached — a device constant, so it is trace-safe."""
+        if not hasattr(self, "_rowsel_cache"):
+            self._rowsel_cache = {}
+        rs = self._rowsel_cache.get(K)
+        if rs is None:
+            t = torch.zeros(K * self.top_k, K, 1)
+            for i in range(K * self.top_k):
+                t[i, i // self.top_k, 0] = 1.0
+            rs = to_tt(t, self.mesh_device, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT)
+            self._rowsel_cache[K] = rs
+        return rs
+
+    def _verify_indices(self, topi, na):
+        """[K, top_k] topk ids -> [1,1,1,K*top_k] UINT16 ROW_MAJOR, the `indices` operand's contract.
+
+        Not `moe_gather.topk_to_indices`: that reshapes FIRST, and `ttnn.reshape` rejects UINT16 (it
+        only accepts BF16/FP32/UINT32/INT32). At K==1 its reshape is a no-op view so it happens to
+        work; at K>1 it is a real op and fatals. Cast up, reshape, cast back. Row-major flattening
+        makes slot i == (token row i // top_k, k-index i % top_k), which is what _rowsel assumes."""
+        idx = topi if topi.dtype == ttnn.uint32 else ttnn.typecast(topi, ttnn.uint32)
+        idx = ttnn.reshape(idx, [1, 1, 1, na])
+        return ttnn.to_layout(ttnn.typecast(idx, ttnn.uint16), ttnn.ROW_MAJOR_LAYOUT)
+
+    def _verify_sparsity(self):
+        """`sparsity` is a REQUIRED sparse_matmul operand that indexed/gather mode never reads (the
+        gather loop is driven by `indices`). Cache one constant instead of deriving a per-call tensor."""
+        if getattr(self, "_verify_sparsity_t", None) is None:
+            self._verify_sparsity_t = to_tt(
+                torch.ones(1, 1, 1, self.num_experts) / self.num_experts,
+                self.mesh_device,
+                dtype=ttnn.bfloat16,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+        return self._verify_sparsity_t
+
+    def forward_verify(self, x, K=None):
+        """Speculative VERIFY of K tokens of ONE sequence. x: [1,1,K,hidden] -> [1,1,K,hidden].
+
+        This is `forward_sparse_decode`'s indexed/gather path generalised from one token to K, and it
+        is where most of MTP's MoE amortization comes from: the router, shared expert, topk, scatter
+        and combine all run ONCE for the whole K-row tile (they are 0.216 of the 0.326 ms MoE op and
+        flat in K, because `_sparse_pc` gives per_core_M=1 for any m<=32 — token ROWS are free), while
+        only the expert-slot count grows (num_active = K*top_k). Measured cost
+        0.0277 + 0.0102*num_active ms/layer, i.e. MoE(K) = 0.245 + 0.0818K vs K*0.326 for K decode
+        steps. See MTP.md.
+
+        `nnz` is deliberately NOT used: the active-expert union is data-dependent and a static nnz that
+        disagrees with it DEADLOCKS the device (host-uncheckable). Indexed mode is exact and static."""
+        T = x.shape[2]
+        K = T if K is None else K
+        assert K == T, (K, T)
+        hidden = x.shape[3]
+        E, H, I = self.num_experts, self.hidden, self.inter
+        na = K * self.top_k
+        x2 = ttnn.reshape(x, [K, hidden])
+        shared, topv, topi, probs = self._shared_and_router(x2)  # all flat in K
+
+        with sp.region("moe.experts"):
+            sparsity = self._verify_sparsity()
+            indices = self._verify_indices(topi, na)  # [1,1,1,K*top_k] uint16 RM
+            x4 = ttnn.reshape(x2, [1, 1, K, H])
+            gu = ttnn.sparse_matmul(
+                x4,
+                self.gate_up_sp,
+                sparsity=sparsity,
+                indices=indices,
+                program_config=self._sparse_pc(K, 2 * I),
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )  # [1, na, K, 2I]
+            gate, up = self._split_last(gu, I)
+            h = ttnn.reshape(ttnn.multiply(ttnn.silu(gate), up), [1, na, K, I])
+            down = ttnn.sparse_matmul(
+                h,
+                self.down_sp,
+                sparsity=sparsity,
+                indices=indices,
+                is_input_a_sparse=True,
+                program_config=self._sparse_pc(K, H),
+                memory_config=ttnn.L1_MEMORY_CONFIG,
+            )  # [1, na, K, H]
+        with sp.region("moe.combine"):
+            # slot i carries token row i//top_k with weight topv[row, i%top_k]; ROWSEL zeroes the rest
+            wt = ttnn.multiply(ttnn.reshape(topv, [na, 1, 1]), self._rowsel(K))  # [na, K, 1]
+            routed = ttnn.sum(ttnn.multiply(ttnn.reshape(down, [na, K, H]), wt), dim=0)  # [K, hidden]
+            return ttnn.reshape(ttnn.add(routed, shared), [1, 1, K, hidden])
+
     def _experts_for_tile(self, xt, sparsity, wt):
         """One 32-row tile of the sparse expert path. xt: [32, hidden]. sparsity: [1,1,1,E] (the
         tile's union mask, ROW_MAJOR bf16). wt: [E, 32, 1] per-(expert,token) routing weights.
@@ -356,9 +510,14 @@ class TtMoE(LightweightModule):
             topv = ttnn.divide(topv, ttnn.sum(topv, dim=-1, keepdim=True))  # renormalize
         return shared, topv, topi, probs
 
-    def forward(self, x):
-        """x: [1, 1, T, hidden] -> [1, 1, T, hidden]. sparse_matmul decode (T==1); dense prefill by
-        default (T>1); optional sparse per-tile prefill if QWEN36_SPARSE_PREFILL=1 and T%32==0."""
+    def forward(self, x, traced=False):
+        """x: [1, 1, T, hidden] -> [1, 1, T, hidden]. sparse_matmul decode (T==1); dense prefill
+        (T>1, see _dense_experts and the module docstring for why dense); optional sparse per-tile
+        prefill if QWEN36_SPARSE_PREFILL=1 and T%32==0.
+
+        ``traced`` is accepted for callers running this under ``ttnn.begin_trace_capture``; every
+        current path is trace-safe, so it is a no-op, but it documents the requirement for any future
+        prefill variant that needs a host readback (both measured-and-rejected sparse variants did)."""
         T = x.shape[2]
         hidden = x.shape[3]
         x2 = ttnn.reshape(x, [T, hidden])
@@ -366,15 +525,20 @@ class TtMoE(LightweightModule):
         # device (would break trace capture if profiling were enabled during decode). The prefill-only
         # sub-timers below (T>1 dense branch) are safe.
         shared, topv, topi, probs = self._shared_and_router(x2)
-        # zeros via a compute op (probs*0), not ttnn.zeros_like: a fill is illegal inside a captured
-        # trace, whereas an eltwise multiply is a normal traced kernel (PCC-identical, also fine eager).
-        with sp.region("moe.scatter"):
-            routing = ttnn.scatter(ttnn.multiply(probs, 0.0), 1, topi, topv)  # [T, E]
+
+        def scatter_routing():
+            # zeros via a compute op (probs*0), not ttnn.zeros_like: a fill is illegal inside a
+            # captured trace, whereas an eltwise multiply is a normal traced kernel (PCC-identical,
+            # also fine eager). Built lazily — the gathered prefill path below never reads it.
+            with sp.region("moe.scatter"):
+                return ttnn.scatter(ttnn.multiply(probs, 0.0), 1, topi, topv)  # [T, E]
 
         if T == 1:
             # --- sparse_matmul decode: compute only selected experts, NO host sync (traceable) ---
             with sp.region("moe.experts"):
-                sparsity = ttnn.to_layout(ttnn.reshape(routing, [1, 1, 1, self.num_experts]), ttnn.ROW_MAJOR_LAYOUT)
+                sparsity = ttnn.to_layout(
+                    ttnn.reshape(scatter_routing(), [1, 1, 1, self.num_experts]), ttnn.ROW_MAJOR_LAYOUT
+                )
                 if self._decode_gather:
                     # gather path: pass the active expert ids -> kernels iterate top_k, not all E
                     indices = moe_gather.topk_to_indices(topi, self.top_k)
@@ -387,14 +551,44 @@ class TtMoE(LightweightModule):
         if T % 32 == 0 and os.environ.get("QWEN36_SPARSE_PREFILL"):
             # --- opt-in sparse per-tile prefill: each 32-token tile computes only experts it touches.
             # Off by default: PCC-identical to dense but slower at this expert size (dispatch-bound). ---
-            routed = self.forward_sparse_prefill(x2, routing)  # [T, hidden]
+            routed = self.forward_sparse_prefill(x2, scatter_routing())  # [T, hidden]
             return ttnn.reshape(ttnn.add(routed, shared), [1, 1, T, hidden])
 
         # --- dense prefill (DEFAULT): all experts via batched matmul on the sparse-layout weights ---
-        # Chunk over T (<= _DENSE_TMAX): the tuned program config gives each core an expert's full
-        # [tc, N] output, which sits in L1 (per_core_M = tc/32). The down-proj (N=hidden) overflows L1
-        # past tc~320, so cap tc at 256 (per_core_M<=8, proven to fit) and concat — same fast config
-        # per chunk, L1-bounded for any T. One chunk (no concat) when T <= _DENSE_TMAX.
+        global _FAST_DENSE_OK
+        routing = scatter_routing()
+        dt, bw = (ttnn.bfloat16, 1) if _FAST_DENSE_OK is False else (_MOE_ACT_DT, _DENSE_IN0BW)
+        if _FAST_DENSE_OK is None and (dt, bw) != (ttnn.bfloat16, 1) and T >= _DENSE_TMAX:
+            try:  # first call with the fast config proves it, so a bad shape can never crash a run
+                routed = self._dense_experts(x2, routing, T, hidden, dt, bw)
+                _FAST_DENSE_OK = True
+            except RuntimeError as e:  # L1 CB overflow for this chunk shape -> use the safe config
+                logger.warning(
+                    f"qwen36 MoE: fast dense config unavailable ({str(e)[:120]}); "
+                    "falling back to BFLOAT16 / in0_block_w=1 for this process"
+                )
+                _FAST_DENSE_OK = False
+                routed = self._dense_experts(x2, routing, T, hidden, ttnn.bfloat16, 1)
+        else:
+            routed = self._dense_experts(x2, routing, T, hidden, dt, bw)
+        with sp.region("moe.combine"):
+            return ttnn.reshape(ttnn.add(routed, shared), [1, 1, T, hidden])
+
+    def _dense_experts(self, x2, routing, T, hidden, dt, bw):
+        """The dense expert stages: every expert against every token, masked by the routing weight.
+        x2 [T, hidden], routing [T, E] -> routed [T, hidden].
+
+        Chunk over T (<= _DENSE_TMAX): the tuned program config gives each core an expert's full
+        [tc, N] output, which sits in L1 (per_core_M = tc/32). The down-proj (N=hidden) overflows L1
+        past tc~320, so cap tc at 256 (per_core_M<=8, proven to fit) and concat — same fast config
+        per chunk, L1-bounded for any T. One chunk (no concat) when T <= _DENSE_TMAX. NOTE each chunk
+        re-reads all 453 MB of this layer's expert weights, so a SMALLER chunk is strictly worse.
+
+        This is DRAM-bandwidth-bound, not FLOP-bound: at tc=256 it moves ~2.5 GB per call at ~299 GB/s
+        = ~69% of this card's 432 GB/s peak, and only ~0.45 GB of that is weights. It computes
+        num_experts/top_k = 32x the needed FLOPs, but see forward() for why the two obvious ways to
+        cut that both measure SLOWER here. Narrowing the two matmul in0 tensors to `dt` is what is
+        actually left, and it is worth ~1.43x."""
         E, H, I = self.num_experts, self.hidden, self.inter
         gate_up_w = ttnn.reshape(self.gate_up_sp, [E, H, 2 * I])
         down_w = ttnn.reshape(self.down_sp, [E, I, H])
@@ -402,17 +596,21 @@ class TtMoE(LightweightModule):
         for t0 in range(0, T, _DENSE_TMAX):
             t1 = min(t0 + _DENSE_TMAX, T)
             tc = t1 - t0
+            # The fast (BFP8, block 8) pair is validated at the full chunk size only; a short tail
+            # chunk is a different L1 shape, and fit is not monotonic in tc, so it uses the safe pair.
+            cdt, cbw = (dt, bw) if tc == _DENSE_TMAX else (ttnn.bfloat16, 1)
             with prof.phase(self.mesh_device, "moe.repeat"), sp.region("moe.repeat"):
-                xe = ttnn.repeat(
-                    ttnn.reshape(ttnn.slice(x2, [t0, 0], [t1, hidden]), [1, tc, hidden]), ttnn.Shape([E, 1, 1])
-                )  # [E, tc, hidden]
+                xs = ttnn.slice(x2, [t0, 0], [t1, hidden])
+                if xs.dtype != cdt:  # cast the [tc, hidden] slice, i.e. BEFORE the E-fold broadcast
+                    xs = ttnn.typecast(xs, cdt)
+                xe = ttnn.repeat(ttnn.reshape(xs, [1, tc, hidden]), ttnn.Shape([E, 1, 1]))  # [E, tc, hidden]
             with prof.phase(self.mesh_device, "moe.gate_up_mm"), sp.region("moe.gate_up_mm"):
                 hgu = ttnn.matmul(
                     xe,
                     gate_up_w,
-                    program_config=self._dense_expert_pc(tc, 2 * I),
+                    program_config=self._dense_expert_pc(tc, 2 * I, cbw),
                     compute_kernel_config=self.compute_kernel_config,
-                )  # [E, tc, 2*inter]
+                )  # [E, tc, 2*inter], BFLOAT16 — see the _MOE_ACT_DT note (slice + block-float)
             with prof.phase(self.mesh_device, "moe.swiglu"), sp.region("moe.swiglu"):
                 gate = ttnn.slice(hgu, [0, 0, 0], [E, tc, I])
                 up = ttnn.slice(hgu, [0, 0, I], [E, tc, 2 * I])
@@ -421,16 +619,19 @@ class TtMoE(LightweightModule):
                 # bias), so sum_e w_e·down(h_e) == sum_e down(w_e·h_e); scaling the [E,tc,I] input is
                 # ~4x less data than scaling the [E,tc,H] output and lets the expert-reduce be a sum.
                 wc = ttnn.reshape(ttnn.transpose(ttnn.slice(routing, [t0, 0], [t1, E]), 0, 1), [E, tc, 1])
-                h = ttnn.multiply(h, wc)
+                h = ttnn.multiply(h, wc, dtype=cdt)  # down's in0: fold + narrow in one pass
             with prof.phase(self.mesh_device, "moe.down_mm"), sp.region("moe.down_mm"):
                 ye = ttnn.matmul(
                     h,
                     down_w,
-                    program_config=self._dense_expert_pc(tc, H),
+                    program_config=self._dense_expert_pc(tc, H, cbw),
                     compute_kernel_config=self.compute_kernel_config,
-                )  # [E, tc, hidden]
+                )  # [E, tc, hidden] — `dtype` is INHERITED from in0, so this is `cdt` too
             with prof.phase(self.mesh_device, "moe.reduce"), sp.region("moe.reduce"):
-                outs.append(ttnn.sum(ye, dim=0))  # [tc, hidden]
-        routed = outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # [T, hidden]
-        with sp.region("moe.combine"):
-            return ttnn.reshape(ttnn.add(routed, shared), [1, 1, T, hidden])
+                # Land every chunk in BFLOAT16: `ye` (and so this sum) inherits in0's dtype, which
+                # differs between a full chunk and a short tail, and ttnn.concat rejects mixed dtypes.
+                # Only [tc, hidden] crosses this boundary, so the upcast is ~1 MB, and the residual /
+                # norm chain downstream never sees a block-float tensor.
+                y = ttnn.sum(ye, dim=0)  # [tc, hidden]
+                outs.append(y if y.dtype == ttnn.bfloat16 else ttnn.typecast(y, ttnn.bfloat16))
+        return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # [T, hidden]

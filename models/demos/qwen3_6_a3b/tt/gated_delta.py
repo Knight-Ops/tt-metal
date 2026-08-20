@@ -32,7 +32,12 @@ from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt import signpost as sp
 from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
-from models.demos.qwen3_6_a3b.tt.ttl_delta import chunk_state_tt, decode_step_batch_tt, decode_step_tt
+from models.demos.qwen3_6_a3b.tt.ttl_delta import (
+    chunk_state_tt,
+    decode_step_batch_tt,
+    decode_step_chain_tt,
+    decode_step_tt,
+)
 
 # Fused chunked prefill: replace the sequential recurrent scan (O(T) dispatches) with the chunked
 # delta-rule — ttnn per-chunk prep batched over heads + the fused tt-lang _chunk_state kernel (one
@@ -53,9 +58,11 @@ _CHUNK = 64  # chunk_size, matches reference torch_chunk_gated_delta_rule defaul
 # ``ttnn.transformer.chunk_gated_delta_rule`` (new in v0.77.0) instead of the in-tree chunk prep +
 # ttl/ttnn chunk-state loop. Measured on a single P150 at real GDN dims (32 v-heads, Dk=Dv=128):
 # 4.4x (T=64) to 11.8x (T=512) on the recurrence in isolation, core/state PCC ~0.999998.
-# QWEN36_GDN_FUSED_OP=1 enables. Eager path only for now — the traced path keeps its pre-allocated
-# buffer pool (the op allocates its own outputs), so `pool is not None` always falls through.
-_GDN_FUSED_OP = os.environ.get("QWEN36_GDN_FUSED_OP", "0") == "1"
+# DEFAULT ON (QWEN36_GDN_FUSED_OP=0 reverts): measured 40-layer eager prefill 672.3 -> 450.3 ms at
+# T=256, 1277.3 -> 837.3 ms at T=512, 2489.4 -> 1607.4 ms at T=1024 (1.49-1.55x). Eager path only — the traced path keeps its
+# pre-allocated buffer pool (the op allocates its own outputs), so `pool is not None` falls through;
+# that costs nothing, since tracing the prefill measures only ~1.02x once this op is on.
+_GDN_FUSED_OP = os.environ.get("QWEN36_GDN_FUSED_OP", "1") != "0"
 # The fused op runs at chunk 32, NOT _CHUNK(64): 128 exceeds the L1 CB budget, and at 64 the WY
 # matrix becomes a 2x2 tile-block whose bottom-right 32x32 sub-block can be ill-conditioned enough
 # that the fp32 block inverse loses precision. At 32 each WY matrix is one tile solved by the
@@ -97,6 +104,17 @@ _CONV_ADDCHAIN = os.environ.get("QWEN36_CONV_ADDCHAIN", "1") != "0"
 # w_ba/w_out) + the conv stay in ttnn. DEFAULT on; QWEN36_GDN_FUSED=0 reverts to the recurrent scan.
 # The kernel compiles once per (n_v_heads, n_k_heads, head-dim) shape (~1 min, disk-cached).
 _GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") != "0"
+# Fold the K-step speculative-verify recurrence ONTO the core (one ttl launch for the whole chain)
+# instead of driving it from Python. Not a kernel-time win — it deletes 6 of the 7 ttnn ops per step
+# per layer, and the verify trace is dispatch-bound. QWEN36_GDN_VERIFY_CHAIN=0 reverts to the
+# per-step-launch path (both are PCC-gated in tests/test_gated_delta_verify.py). See EXPERIMENTS.md.
+_GDN_VERIFY_CHAIN = os.environ.get("QWEN36_GDN_VERIFY_CHAIN", "1") != "0"
+# Keep speculative-verify intermediates in L1 for K up to this (rows are tiny; 8 is far inside budget).
+_VERIFY_L1_MAX_K = int(os.environ.get("QWEN36_VERIFY_L1_MAX_K", "8"))
+# MEASURED DEAD END (EXPERIMENTS.md #7): a low-op-count "stacked window" form of the causal conv
+# (4 slices + concat + multiply + sum = 8 ops) is 38% SLOWER than the 11-op loop form below
+# (0.6552 vs 0.4752 ms/layer), because `concat` and a `sum` reduction are in the expensive
+# data-movement class while small broadcast-multiplies are not. Do not "optimise" this by op count.
 TILE = 32
 
 # Batched (B>1 multi-user) fused decode kernel: one ttl launch (decode_step_batch_tt) does the whole
@@ -274,8 +292,14 @@ class TtGatedDeltaNet(LightweightModule):
                 self.w_out, K, N, _DRAM_BANKS
             )
 
-    def _conv_silu(self, mixed, conv_state=None):
-        """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns (out[T,conv_dim], new_conv_state[K-1,conv_dim])."""
+    def _conv_silu(self, mixed, conv_state=None, need_state=True):
+        """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns
+        (out[T,conv_dim], new_conv_state[K-1,conv_dim]); new_conv_state is None when need_state=False.
+
+        `need_state=False` is for the speculative-verify path, which DISCARDS it — `commit_verify`
+        recomputes the conv tail from the accepted prefix instead. Skipping it is free money: that one
+        slice measured **0.0868 ms/layer** (a [conv_k-1, conv_dim] sub-tile row slice, and conv_dim=8192
+        means it gathers 3 of 32 rows across all 256 tile-columns)."""
         T = mixed.shape[0]
         if conv_state is None:
             pad = ttnn.zeros(
@@ -299,7 +323,7 @@ class TtGatedDeltaNet(LightweightModule):
                 xj = ttnn.slice(xpad, [j, 0], [j + T, self.conv_dim])
                 term = ttnn.multiply(xj, self.conv_taps[j])
                 acc = term if acc is None else ttnn.add(acc, term)
-        new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim])
+        new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim]) if need_state else None
         # Same T==1 gate as the concat above: at prefill T this is [T, conv_dim] (28 MB at T=1711),
         # and because ttnn defaults memory_config to the INPUT's config, an L1 result here silently
         # propagates to the q/k/v slices and everything downstream of them — pinning ~700 KB/core and
@@ -785,8 +809,12 @@ class TtGatedDeltaNet(LightweightModule):
             "valid": valid,
         }
 
-    def forward(self, x, cache=None, pool=None, init_state=None, valid_len=None, decode=False):
+    def forward(self, x, cache=None, pool=None, init_state=None, valid_len=None, decode=False, verify=False):
         """x: [1,1,T,hidden]. If cache (dict with conv_state/recurrent_state) given, continues from it.
+
+        verify=True marks a speculative VERIFY of T=K tokens of ONE sequence (see _forward_verify_seq):
+        like prefill it is a sequence, but the recurrence runs as K chained single-step ttl launches and
+        the persistent state is left UNTOUCHED so the caller can roll back to the accepted prefix.
 
         decode=True marks BATCHED multi-user decode: the leading dim T is B independent users, each one
         token (NOT a sequence). B=1 keeps the fused ttl kernel; B>1 runs a single batched recurrent step
@@ -810,7 +838,12 @@ class TtGatedDeltaNet(LightweightModule):
         # Decode (T==1) keeps the tiny intermediates L1-resident (QWEN36_GDN_L1): measured to cut the
         # gated-delta step, since the decode path is many tiny dispatch-bound ops, not DRAM-bandwidth.
         # Prefill (T>1) stays on the default (interleaved DRAM) to avoid L1 overflow at large T.
-        mc = _MC if T == 1 else None
+        # L1-resident intermediates for T==1 decode AND for a small-K speculative verify. Verify is
+        # the same regime the T==1 win came from — many tiny dispatch-bound ops — and its tensors are
+        # only K rows wide, so they fit L1 easily. Measured: GDN verify was 1.0189 ms/layer against a
+        # 0.3204 ms decode step, i.e. WORSE than 3 separate decodes, largely because it ran everything
+        # from DRAM. Bounded by _VERIFY_L1_MAX_K so a large K cannot overflow L1.
+        mc = _MC if (T == 1 or (verify and T <= _VERIFY_L1_MAX_K)) else None
         V = self.num_v_heads
 
         # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). One fused input matmul (default)
@@ -828,15 +861,19 @@ class TtGatedDeltaNet(LightweightModule):
                 ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
 
         with sp.region("delta.conv"):
-            if _CONV_ADDCHAIN and (T == 1 or decode) and cache is not None and "conv_rows" in cache:
+            conv_in = mixed  # pre-conv projection rows; verify rollback recomputes conv_state from these
+            if _CONV_ADDCHAIN and (T == 1 or decode) and not verify and cache is not None and "conv_rows" in cache:
                 # decode fast path (B=1 or batched B>1): per-user add-chain over separate history rows
                 # ([B, conv_dim] for batched; each row is one user's independent conv history, synced from
                 # conv_state at start_decode). State maintained in-place in conv_rows, no copy-back.
                 mixed = self._conv_addchain_decode(mixed, cache["conv_rows"])
             else:
                 conv_state = cache.get("conv_state") if cache else None
-                mixed, new_conv_state = self._conv_silu(mixed, conv_state)
-                if cache is not None:
+                # verify discards new_conv_state (commit_verify rebuilds the tail from conv_in)
+                mixed, new_conv_state = self._conv_silu(mixed, conv_state, need_state=not verify)
+                if verify:
+                    pass  # leave conv_state alone; commit_verify() applies the accepted prefix
+                elif cache is not None:
                     if conv_state is not None:
                         ttnn.copy(new_conv_state, conv_state)  # in-place: keep persistent buffer (traceable)
                     else:
@@ -850,6 +887,8 @@ class TtGatedDeltaNet(LightweightModule):
         # Fused single-step decode: one ttl launch for the whole step (prep + recurrence + gated-norm).
         # q/k [1,key_dim], v/z [1,value_dim] feed the kernel directly (heads along columns); raw a/b are
         # expanded to per-head uniform tiles; state stays head-major in the persistent cache.
+        if verify and cache is not None:
+            return self._forward_verify_seq(q, k, v, z, ba, cache, hidden, T, conv_in)
         if _GDN_FUSED and T == 1 and cache is not None:
             return self._forward_decode_fused(q, k, v, z, ba, cache, hidden)  # B=1 fast path
         if _GDN_BATCH_FUSED and decode and T > 1 and cache is not None:
@@ -904,6 +943,242 @@ class TtGatedDeltaNet(LightweightModule):
         if ragged:  # restore the padded width (pad rows are unused downstream; head reads the real last)
             y = ttnn.pad(y, [(0, 0), (0, 0), (0, T_full - T), (0, 0)], value=0.0)
         return y
+
+    def _verify_scratch(self, K):
+        """Persistent per-K scratch, allocated once and reused so the addresses are stable (required
+        under trace capture): K state buffers [V*Dk,Dv], K output tile-rows, and the [K, conv_dim] copy
+        of the conv input that `commit_verify` reads.
+
+        Everything here is keyed BY K. The conv buffer in particular must be — a round with gamma>0
+        alternates between the K=1 seed step and K-row verifies, and a single shared attribute would
+        hand a [K, conv_dim] buffer to a [1, conv_dim] copy (measured: TT_FATAL shape mismatch
+        [1,8192] vs [3,8192])."""
+        if not hasattr(self, "_verify_scratch_cache"):
+            self._verify_scratch_cache = {}
+        sc = self._verify_scratch_cache.get(K)
+        if sc is None:
+            V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
+            z_ = lambda shp: ttnn.zeros(shp, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            # out buffers are a FULL tile-row each (the kernel writes tile-row 0 of `out`)
+            sc = ([z_([V * Dk, Dv]) for _ in range(K)], [z_([TILE, self.value_dim]) for _ in range(K)])
+            # persistent copy of the conv INPUT rows: commit_verify recomputes the rolled-back
+            # conv_state from these, and it runs in its own captured trace — a trace cannot reference a
+            # transient produced inside a DIFFERENT trace, so this has to be a stable buffer.
+            sc = sc + (z_([K, self.conv_dim]),)
+            self._verify_scratch_cache[K] = sc
+        return sc
+
+    def _verify_chain_scratch(self, K):
+        """Persistent output/state buffers for the CHAINED verify kernel: out [K*TILE, value_dim] and
+        Snew [K*nv*Dk, Dv]. `Snew` must be persistent, not a transient: `commit_verify` slices step
+        j-1 out of it and runs in its OWN captured trace, which cannot reference a buffer produced
+        inside the verify trace."""
+        if not hasattr(self, "_verify_chain_cache"):
+            self._verify_chain_cache = {}
+        sc = self._verify_chain_cache.get(K)
+        if sc is None:
+            V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
+            z_ = lambda shp: ttnn.zeros(shp, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            sc = (z_([K * TILE, self.value_dim]), z_([K * V * Dk, Dv]))
+            self._verify_chain_cache[K] = sc
+        return sc
+
+    def _verify_const(self, K):
+        """negA / dt_bias replicated to the chained kernel's [K*nv*TILE, TILE] layout (cached: they are
+        per-head constants, identical for every step)."""
+        if not hasattr(self, "_verify_const_cache"):
+            self._verify_const_cache = {}
+        c = self._verify_const_cache.get(K)
+        if c is None:
+            rep = lambda t: ttnn.reshape(
+                ttnn.repeat(ttnn.reshape(t, [1, t.shape[0], t.shape[1]]), ttnn.Shape([K, 1, 1])),
+                [K * t.shape[0], t.shape[1]],
+            )
+            c = (rep(self._fused_negA), rep(self._fused_dtb))
+            self._verify_const_cache[K] = c
+        return c
+
+    def _forward_verify_seq(self, q, k, v, z, ba, cache, hidden, K, conv_in):
+        """Speculative VERIFY of K tokens of ONE sequence: K CHAINED single-step ttl launches.
+
+        This is where the GDN amortization comes from, and it is not the recurrence: the fused ttl
+        kernel is only 0.061 of the 0.319 ms GDN layer, while `w_in_proj`, the conv and `w_out` — the
+        other 81% — are flat in K (per_core_M=1 for any m<=32). So running the projections ONCE over
+        the K rows and looping only the kernel gives ~2.5x amortization with no new kernel. A chained
+        ON-CORE kernel would save a further ~2% of a round; see MTP.md.
+
+        The persistent `recurrent_state` and `conv_state` are NOT modified — every step writes into
+        scratch — so the caller can accept any prefix and then call `commit_verify(cache, j)`."""
+        V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
+        states, outs, conv_buf = self._verify_scratch(K)
+
+        # ttl indexes in TILE units, not rows: `ct = 1` is one 32-row tile, and the kernel's outer
+        # product k^T @ delta contracts over ALL 32 rows of it. So each step's operand must be a tile
+        # whose row 0 is the token and whose other 31 rows are ZERO. A plain `ttnn.slice(q,[t,0],...)`
+        # of a [K, feat] tensor does NOT satisfy that (the pad carries the neighbouring token rows) —
+        # it silently produced a wrong result while every input value compared bit-identical, and only
+        # K==1 happened to work because an M=1 matmul zeroes its own tile pad. `_to_tilerows` (the same
+        # helper the batched kernel uses) lays each token on its own zero-padded tile-row.
+        #
+        # q|k and v|z are PAIRED into one relayout each rather than four separate ones: the pads are
+        # 3 ops apiece and the verify trace is dispatch-bound, so this halves that overhead while
+        # staying provably identical (all four operands are still zero-padded, just in two tensors).
+        if _GDN_VERIFY_CHAIN:
+            # the chained kernel takes each operand as its OWN [K*TILE, feat] tensor (it computes the
+            # per-head column slab itself), so no pairing here; pads measured ~free (EXPERIMENTS #4).
+            qT = self._to_tilerows(q, self.key_dim, K)
+            kT = self._to_tilerows(k, self.key_dim, K)
+            vT = self._to_tilerows(v, self.value_dim, K)
+            zT = self._to_tilerows(z, self.value_dim, K)
+        else:
+            qkT = self._to_tilerows(ttnn.concat([q, k], dim=1), 2 * self.key_dim, K)
+            vzT = self._to_tilerows(ttnn.concat([v, z], dim=1), 2 * self.value_dim, K)
+
+        if _GDN_VERIFY_CHAIN:
+            # ---- ONE ttl launch for the whole K-step chain (see ttl_delta._get_decode_op_chain) ----
+            # araw/braw must be laid out per-(t,h) as [K*nv*TILE, TILE]: `ba` is [K, 2V] with row t =
+            # [b(V) | a(V)], so b and a interleave per step and cannot simply be split in half. Build
+            # the two halves separately and concat, which keeps this to a handful of ops for all K.
+            with sp.region("delta.recurrence"):
+                bslice = ttnn.slice(ba, [0, 0], [K, V])  # [K, V] all steps' b
+                aslice = ttnn.slice(ba, [0, V], [K, 2 * V])  # [K, V] all steps' a
+                braw = ttnn.reshape(
+                    ttnn.repeat(ttnn.reshape(bslice, [K * V, 1, 1]), ttnn.Shape([1, TILE, TILE])),
+                    [K * V * TILE, TILE],
+                )
+                araw = ttnn.reshape(
+                    ttnn.repeat(ttnn.reshape(aslice, [K * V, 1, 1]), ttnn.Shape([1, TILE, TILE])),
+                    [K * V * TILE, TILE],
+                )
+                nA, dtbc = self._verify_const(K)
+                out_buf, snew_buf = self._verify_chain_scratch(K)
+                decode_step_chain_tt(
+                    qT,
+                    kT,
+                    vT,
+                    zT,
+                    araw,
+                    braw,
+                    nA,
+                    dtbc,
+                    ttnn.reshape(cache["recurrent_state"], [V * Dk, Dv]),
+                    self._fused_nweight,
+                    out_buf,
+                    snew_buf,
+                    V,
+                    self.num_k_heads,
+                    self.qk_scale,
+                    self.eps,
+                    K,
+                )
+            # `snew_buf` is the persistent per-step state STACK; commit_verify slices step j-1 out of
+            # it inside its own trace (so it must not be sliced into transients here).
+            pending_states = snew_buf
+        else:
+            with sp.region("delta.recurrence"):
+                # raw a|b -> per-(t,head) uniform [V*TILE,TILE] tiles, exactly as _forward_decode_fused
+                # does for one token, but sliced per step.
+                #
+                # `keep` is load-bearing: ttnn enqueues asynchronously, so a per-step operand whose last
+                # Python reference dies at the end of the loop iteration has its device buffer FREED
+                # immediately and can be handed to a later step's allocation before the earlier ttl launch
+                # has run. That corrupts the EARLIER steps (the last one is never clobbered) and is
+                # non-deterministic — measured as row-0 PCC wandering 0.31..0.58 while row K-1 stayed
+                # ~0.99. Holding every per-step operand alive until after the launches fixes it.
+                keep = []
+                # Expand the raw a|b gating scalars to per-(t,head) uniform tiles ONCE for all K steps.
+                # Doing it inside the loop costs 7 ops per step per layer (slice, transpose, reshape,
+                # repeat, reshape, 2 slices) = 21 ops/layer at K=3, and the verify trace is DISPATCH-bound
+                # (measured 64.1 ms vs a 38.4 ms cost model, with only ~1.3 ms of host glue), so op count
+                # is the thing that matters here. Hoisted this is 3 ops + 2 slices/step.
+                # Layout: ba is [K, 2V] and row t is [b(V) | a(V)], so flattening row-major puts (t, j) at
+                # index t*2V + j -> tile-row (t*2V + j). Hence b for step t occupies tile-rows
+                # [t*2V, t*2V+V) and a occupies [t*2V+V, (t+1)*2V).
+                ba_all = ttnn.repeat(ttnn.reshape(ba, [K * 2 * V, 1, 1]), ttnn.Shape([1, TILE, TILE]))
+                ba_all = ttnn.reshape(ba_all, [K * 2 * V * TILE, TILE])
+                keep.append(ba_all)
+                for t in range(K):
+                    b0 = t * 2 * V * TILE
+                    braw_tile = ttnn.slice(ba_all, [b0, 0], [b0 + V * TILE, TILE])
+                    araw_tile = ttnn.slice(ba_all, [b0 + V * TILE, 0], [b0 + 2 * V * TILE, TILE])
+                    # step 0 reads the PERSISTENT state (read-only); later steps chain through scratch
+                    S_src = ttnn.reshape(cache["recurrent_state"], [V * Dk, Dv]) if t == 0 else states[t - 1]
+                    # Match _forward_decode_fused's operand residency exactly: the single-step ttl kernel
+                    # is only ever exercised with L1 operands (T==1 sets mc=_MC), and feeding it the
+                    # DRAM rows a T=K projection produces gives a WRONG result (row-0 PCC 0.58 vs 1.0)
+                    # even though the values are bit-identical. Slice, then place in L1.
+                    r0, r1 = t * TILE, (t + 1) * TILE  # tile-aligned: the zero pad is preserved
+                    kd, vd = self.key_dim, self.value_dim
+                    q_t = ttnn.slice(qkT, [r0, 0], [r1, kd])
+                    k_t = ttnn.slice(qkT, [r0, kd], [r1, 2 * kd])
+                    v_t = ttnn.slice(vzT, [r0, 0], [r1, vd])
+                    z_t = ttnn.slice(vzT, [r0, vd], [r1, 2 * vd])
+                    keep += [braw_tile, araw_tile, S_src, q_t, k_t, v_t, z_t]
+                    decode_step_tt(
+                        q_t,
+                        k_t,
+                        v_t,
+                        z_t,
+                        araw_tile,
+                        braw_tile,
+                        self._fused_negA,
+                        self._fused_dtb,
+                        S_src,
+                        self._fused_nweight,
+                        outs[t],
+                        states[t],
+                        V,
+                        self.num_k_heads,
+                        self.qk_scale,
+                        self.eps,
+                    )
+            pending_states = states  # list of persistent per-step buffers
+        # stash what commit_verify needs. conv_in is the PRE-conv projection (the conv's own input);
+        # copy it into the persistent buffer so a separately-captured commit trace can read it.
+        ttnn.copy(conv_in, conv_buf)
+        self._verify_pending = (pending_states, conv_buf)
+        with sp.region("delta.w_out"):
+            if _GDN_VERIFY_CHAIN:
+                core = self._from_tilerows(out_buf, self.value_dim, K)  # [K, value_dim]
+            else:
+                rows = [ttnn.slice(o, [0, 0], [1, self.value_dim]) for o in outs]
+                core = rows[0] if K == 1 else ttnn.concat(rows, dim=0)
+            if self._wout_dram is not None and K <= TILE:
+                # The DRAM-sharded w_out is usable here after all, not "M=1-only": `build_dram_shard`
+                # already sizes the activation/output shards at a FULL 32-row tile with per_core_M=1,
+                # so any K <= 32 fits the same config — the decode path merely happens to call it with
+                # one row. Worth ~0.06 ms/layer (interleaved measured 0.0952).
+                osh = ttnn.linear(
+                    ttnn.to_memory_config(core, self._wout_amc),
+                    self._wout_dram,
+                    program_config=self._wout_pc,
+                    memory_config=self._wout_omc,
+                )
+                y = ttnn.to_memory_config(osh, _MC if _GDN_L1 else ttnn.DRAM_MEMORY_CONFIG)
+            else:
+                y = ttnn.linear(core, self.w_out)
+            return ttnn.reshape(y, [1, 1, K, hidden])
+
+    def commit_verify(self, cache, j):
+        """Advance the persistent state by the j ACCEPTED tokens of the last verify (j in 0..K).
+
+        recurrent_state <- the j-th chained scratch state. conv_state <- the last (conv_k-1) rows of
+        [old conv_state | conv_in[:j]] — recomputed rather than snapshotted, because `_conv_silu`
+        only ever produced the tail after ALL K tokens."""
+        if j <= 0 or getattr(self, "_verify_pending", None) is None:
+            return
+        V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
+        pending, conv_in = self._verify_pending
+        if isinstance(pending, list):  # per-step-launch path: one persistent buffer per step
+            st = pending[j - 1]
+        else:  # chained path: one persistent [K*nv*Dk, Dv] stack, slice step j-1 out of it HERE (this
+            # runs inside the commit trace, so the slice must be built from a persistent buffer)
+            st = ttnn.slice(pending, [(j - 1) * V * Dk, 0], [j * V * Dk, Dv])
+        ttnn.copy(ttnn.reshape(st, [1, V, Dk, Dv]), cache["recurrent_state"])
+        cs = cache.get("conv_state")
+        if cs is not None:
+            kept = ttnn.concat([cs, ttnn.slice(conv_in, [0, 0], [j, self.conv_dim])], dim=0)
+            ttnn.copy(ttnn.slice(kept, [j, 0], [j + self.conv_k - 1, self.conv_dim]), cs)
 
     def _forward_decode_batch(self, q, k, v, z, ba, cache, hidden, B):
         """Batched multi-user decode: B independent users, each one token. ONE recurrent step over B

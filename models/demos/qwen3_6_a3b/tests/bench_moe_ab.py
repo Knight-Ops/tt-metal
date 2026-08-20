@@ -498,7 +498,9 @@ def run(mesh_device, iters=100, warmup=3):
             res[("dense_xo", T)] = ms if ms is not None else r
         else:
             res[("dense_xo", T)] = "n/a(T=1)"
-        ms, r = _try_time(mesh_device, lambda: moe.forward(x), iters, warmup)
+        # traced=True: this leg deliberately times the DENSE block, and the gathered path's host
+        # readback is illegal under the trace capture that _try_time performs.
+        ms, r = _try_time(mesh_device, lambda: moe.forward(x, traced=True), iters, warmup)
         res[("dense_full", T)] = ms if ms is not None else r
 
         # --- candidate moe_compute (never at T=1) ---

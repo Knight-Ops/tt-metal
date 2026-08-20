@@ -94,7 +94,10 @@ class TtDecoderLayer(LightweightModule):
             h = self.mixer.forward_prefill(h, cos, sin, cache)
         x = ttnn.add(x, h)
         h = self.post_norm.forward(x)
-        return ttnn.add(x, self.moe.forward(h))
+        # traced=True declares the trace-capture context to the MoE. Every current prefill path is
+        # trace-safe, so it is a no-op today; both sparse prefill variants that were measured and
+        # rejected needed a host routing readback, which a captured trace cannot do (see tt/moe.py).
+        return ttnn.add(x, self.moe.forward(h, traced=True))
 
     def forward_prefill_incremental(self, x, cos, sin, cache, page_table, P, valid_len=None, q_chunk=None):
         """Incremental prefill of new tokens continuing from the cache (offset P). Gated-delta starts
@@ -115,6 +118,28 @@ class TtDecoderLayer(LightweightModule):
         x = ttnn.add(x, h)
         h = self.post_norm.forward(x)
         return ttnn.add(x, self.moe.forward(h))
+
+    def forward_verify(self, x, cos, sin, cache, positions):
+        """Speculative VERIFY of K tokens of ONE sequence. x: [1,1,K,hidden]; positions: a DEVICE int32
+        [K] tensor of absolute positions (contiguous). Unlike forward_decode's B rows (independent
+        users) these are K consecutive timesteps, so every sub-block runs its sequence-aware verify
+        path. Device-resident positions keep the whole thing trace-capturable.
+
+        The mixers leave their persistent state UNTOUCHED — call `commit_verify(cache, j)` on the linear
+        layers once the accepted prefix length j is known. Attention needs no rollback: rejected KV rows
+        sit past the committed position and are overwritten by the next round."""
+        h = self.input_norm.forward(x)
+        if self.is_linear:
+            h = self.mixer.forward(h, cache=cache, verify=True)
+        else:
+            h = self.mixer.forward_verify(h, cos, sin, cache, positions)
+        x = ttnn.add(x, h)
+        return ttnn.add(x, self.moe.forward_verify(self.post_norm.forward(x)))
+
+    def commit_verify(self, cache, j):
+        """Advance this layer's persistent state by the j accepted tokens (linear layers only)."""
+        if self.is_linear:
+            self.mixer.commit_verify(cache, j)
 
     def forward_decode(self, x, cos, sin, cache, current_pos):
         with sp.region("layer.input_norm"):

@@ -19,6 +19,11 @@ from pathlib import Path
 from safetensors import safe_open
 
 PREFIX = "model.language_model"
+# The checkpoint also ships a multi-token-prediction head under a top-level ``mtp.`` prefix: one
+# decoder layer that is dimensionally identical to a main full-attention layer, plus an fc that
+# halves a [2*hidden] concat, two pre-fc norms and a final norm. It shares ``embed_tokens`` and
+# ``lm_head`` with the backbone (``mtp_use_dedicated_embeddings: false``). Unused by the backbone.
+MTP_PREFIX = "mtp"
 
 
 class CheckpointLoader:
@@ -51,7 +56,9 @@ class CheckpointLoader:
         return f"{PREFIX}.layers.{i}"
 
     def attention_weights(self, i: int) -> dict:
-        p = f"{self.layer_prefix(i)}.self_attn"
+        return self._attention_weights(f"{self.layer_prefix(i)}.self_attn")
+
+    def _attention_weights(self, p: str) -> dict:
         return {
             "q_proj": self._fn(f"{p}.q_proj.weight"),
             "k_proj": self._fn(f"{p}.k_proj.weight"),
@@ -76,7 +83,9 @@ class CheckpointLoader:
         }
 
     def moe_weights(self, i: int) -> dict:
-        p = f"{self.layer_prefix(i)}.mlp"
+        return self._moe_weights(f"{self.layer_prefix(i)}.mlp")
+
+    def _moe_weights(self, p: str) -> dict:
         return {
             "gate": self._fn(f"{p}.gate.weight"),
             "gate_up_proj": self._fn(f"{p}.experts.gate_up_proj"),
@@ -88,8 +97,10 @@ class CheckpointLoader:
         }
 
     def norm_weights(self, i: int) -> dict:
+        return self._norm_weights(self.layer_prefix(i))
+
+    def _norm_weights(self, p: str) -> dict:
         # Tiny (dim floats) and never cached -> read eagerly, return tensors.
-        p = self.layer_prefix(i)
         return {
             "input_layernorm": self.get(f"{p}.input_layernorm.weight"),
             "post_attention_layernorm": self.get(f"{p}.post_attention_layernorm.weight"),
@@ -103,3 +114,29 @@ class CheckpointLoader:
 
     def lm_head(self):
         return self._fn("lm_head.weight")
+
+    # --- multi-token-prediction (MTP) head ---
+    def has_mtp(self) -> bool:
+        """Whether this checkpoint ships the ``mtp.*`` head (probes one required tensor)."""
+        return self.has(f"{MTP_PREFIX}.fc.weight")
+
+    def mtp_layer_prefix(self, i: int = 0) -> str:
+        return f"{MTP_PREFIX}.layers.{i}"
+
+    def mtp_attention_weights(self, i: int = 0) -> dict:
+        return self._attention_weights(f"{self.mtp_layer_prefix(i)}.self_attn")
+
+    def mtp_moe_weights(self, i: int = 0) -> dict:
+        return self._moe_weights(f"{self.mtp_layer_prefix(i)}.mlp")
+
+    def mtp_norm_weights(self, i: int = 0) -> dict:
+        return self._norm_weights(self.mtp_layer_prefix(i))
+
+    def mtp_head_weights(self) -> dict:
+        """The non-layer MTP tensors. ``fc`` is big enough to cache (a thunk); the norms are tiny."""
+        return {
+            "fc": self._fn(f"{MTP_PREFIX}.fc.weight"),
+            "pre_fc_norm_embedding": self.get(f"{MTP_PREFIX}.pre_fc_norm_embedding.weight"),
+            "pre_fc_norm_hidden": self.get(f"{MTP_PREFIX}.pre_fc_norm_hidden.weight"),
+            "norm": self.get(f"{MTP_PREFIX}.norm.weight"),
+        }
