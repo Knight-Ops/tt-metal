@@ -27,11 +27,19 @@ models/qwen3_6_a3b/                    <- vendored: OUR model, carrying our fixe
 
 Two rules make this work:
 
-- **Vendor our model, host-resolve the platform.** `models.common.*` and
-  `models.tt_transformers.*` (the `Generator` base class) stay host-resolved — upstream tt-metal
-  code we do not modify, so depending on the host for them is as safe as depending on it for
-  `ttnn`. Vendoring the `Generator` import alone would pull in 32 extra modules / ~890 KB to
-  inherit one base class.
+- **Vendor our model, host-resolve the platform.** Exactly two modules are host-resolved —
+  `models.common.lightweightmodule` and `models.tt_transformers.tt.generator` (the `Generator`
+  base class) — because they genuinely ship with tt-metal, so depending on the host for them is as
+  safe as depending on it for `ttnn`. Vendoring the `Generator` import alone would pull in 32 extra
+  modules / ~890 KB to inherit one base class.
+
+  This is an **allowlist**, and `stage_vllm_bundle.py` fails the stage on anything else. The
+  previous rule ("all of `models.common` is upstream") published a bundle that could not import:
+  `tt/moe.py` did `from models.common import moe_gather`, and `moe_gather.py` was *our* file that
+  happened to live in `models/common/` on the build machine — not in tt-metal, never staged. It now
+  lives in the model package, so the import closure vendors it and no host copy can shadow it.
+  `packaging/validate_bundle.py` proves self-containment by importing a staged bundle with the
+  model directory out of reach; run it before every push.
 - **`models/qwen3_6_a3b/`, not `models/demos/qwen3_6_a3b/`.** `models/` has no `__init__.py`
   anywhere, so it is a PEP 420 namespace package that Python *merges* across `sys.path` — which
   is how the host's `models.common` and our `models.qwen3_6_a3b` coexist. The vendored path must
