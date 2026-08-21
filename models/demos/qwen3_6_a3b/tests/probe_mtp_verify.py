@@ -175,7 +175,7 @@ def run_a1(mesh):
 
     def idx(n):
         """[1,1,1,n] UINT16 ROW_MAJOR expert ids -- the dtype/layout sparse_matmul validates. Built
-        via typecast like models/common/moe_gather.py:topk_to_indices (from_torch cannot emit uint16
+        via typecast like tt/moe_gather.py:topk_to_indices (from_torch cannot emit uint16
         from an int32 host tensor). Ids are non-monotonic and duplicates are legal: gather slots are
         independent."""
         ids = (torch.arange(n) * 7 + 3) % E

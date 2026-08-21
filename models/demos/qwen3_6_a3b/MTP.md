@@ -354,3 +354,39 @@ Why deeper cannot work here, and what would change it:
 - The real alternative is breadth, not depth (tree/multi-candidate drafting), and that is structurally
   blocked on this model: each tree branch needs its own GDN recurrent-state chain, and the recurrence
   cannot branch. Same structural reason MTP was hard here to begin with.
+
+---
+
+# Phase C — speculative SAMPLING + serving integration (2026-08-20)
+
+Phase B left two gaps: acceptance was exact-match only (so MTP could not serve the server's default
+sampled requests), and nothing outside `bench_mtp.py` ever called it. Both are closed. Full measured
+detail, including four wrong predictions and a device-level trace trap, is in **EXPERIMENTS.md**; the
+summary:
+
+| what | result |
+|---|---|
+| **speculative sampling** (`tt/mtp_sampling.py`) | exact rejection sampling with a point-mass (argmax) draft, so accept-prob is just `p(x̂)` and the residual is `p` minus `x̂`. Distribution-exactness χ²-gated host-side (`tests/test_mtp_sampling_rule.py`, 18 cases). |
+| greedy speculative decode, 40L, gamma=2 | **52.1 ms/round -> 43.5 tok/s = 1.25x** (verify 52.5 -> 44.0 ms, full-accept commit 6.18 -> ~1 ms) |
+| sampled, exact, default thinking-mode config | **1.11-1.19x and distribution-EXACT** (was 1.00x; the round cost, not the acceptance rule, was the binding constraint). Round 55.0 ms |
+| sampled, `QWEN36_MTP_ACCEPT=relaxed` | **1.22x** (150-round paired sweep), NOT distribution-preserving: mean TV 0.088 |
+| sampled, `QWEN36_MTP_ACCEPT=lenient` | a tunable dial between the two: **1.18x** at mean TV 0.052 (lenience 0.5), and it never force-emits a token the target rated <10% |
+| sampling the DRAFT on device instead of argmax | **not worth it** (+0.02 acceptance host-measured for an extra per-step topk) |
+| serving | `QWEN36_MTP=greedy_only` (recommended) / `1`, wired into `demo/server.py` + `demo/demo.py`, with a live break-even guard that disengages when speculation is losing |
+
+## Why the host acceptance model over-predicted sampled acceptance
+
+The A5-style host probe (extended here with the sampling rules and a presence-penalty dimension) said
+exact sampled acceptance would cost only ~0.03: at T=0.6/top_p=0.95 the truncated target is nearly a
+point mass (mean |support| **1.4**, H **0.15**, E[p_max] **0.936**). Device measured a **0.20** drop
+(0.85 -> 0.65 conditional). Two causes, both measured:
+
+1. the **presence penalty** flattens exactly the tokens the model just used (device: 2.50 -> 2.30
+   tok/round going from presence 0 -> 1.5);
+2. **off-policy bias** — the probe scores the captured GREEDY trajectory, while sampled decode visits
+   flatter states where a one-token-ahead draft head is less accurate. This is structural: no amount of
+   extra host sampling fixes it, only an on-policy capture would.
+
+**So the probe is the right tool for exploring the (T, top_k, top_p, presence) space cheaply and the
+wrong tool for predicting on-policy throughput.** Predict cost from cost measurements; never predict
+acceptance off-policy.

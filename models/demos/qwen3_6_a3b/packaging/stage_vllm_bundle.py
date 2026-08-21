@@ -13,11 +13,21 @@ We therefore vendor **our model package** into the bundle and host-resolve **the
 
   * vendored: everything under ``models/demos/qwen3_6_a3b/`` that the adapter's import closure
     reaches, laid down as ``models/autoports/qwen3_6_a3b/`` with the adapter moved inside it.
-  * host-resolved: ``models.common.*`` (lightweightmodule, moe_gather) and
-    ``models.tt_transformers.*`` (the ``Generator`` base class). These are upstream tt-metal
-    code we do not modify, so depending on the host for them is exactly as safe as depending on
-    it for ``ttnn`` -- and vendoring the ``Generator`` import alone would drag in 32 extra
-    modules / ~890 KB, three quarters of the bundle, to inherit one base class.
+  * host-resolved: ``models.common.lightweightmodule`` and ``models.tt_transformers.*`` (the
+    ``Generator`` base class). These are upstream tt-metal code we do not modify, so depending on
+    the host for them is exactly as safe as depending on it for ``ttnn`` -- and vendoring the
+    ``Generator`` import alone would drag in 32 extra modules / ~890 KB, three quarters of the
+    bundle, to inherit one base class.
+
+Host-resolution is now an ALLOWLIST (``HOST_RESOLVED``) and staging FAILS on anything else, because
+the previous "all of ``models.common`` is upstream" rule shipped a broken bundle: ``moe_gather.py``
+was OUR file living in ``models/common/``, so it existed on the build machine and nowhere else, and
+``tt/moe.py``'s unconditional ``from models.common import moe_gather`` made every pulled bundle fail
+at import. Two things hid it: the module was in a directory that reads as upstream, and
+:func:`external_imports` recorded ``from models.common import moe_gather`` as just ``models.common``
+-- a package, not a file -- so the audit called it an attribute import and passed. It now expands
+imported NAMES to modules, and the file itself has moved into this package where the closure picks it
+up automatically and no host copy can shadow it.
 
 Why ``models/qwen3_6_a3b`` and not ``models/demos/qwen3_6_a3b``
 --------------------------------------------------------------
@@ -61,6 +71,19 @@ BUNDLE_SUBDIR = SRC_DIR / "packaging" / "vllm_bundle"
 ENTRY_MODULES = [f"{SRC_PKG}.tt.model", f"{SRC_PKG}.tt.model_config", f"{SRC_PKG}.tt.load_checkpoints"]
 # Namespace-package levels that must NOT get an __init__.py.
 NAMESPACE_DIRS = {Path("models")}
+# The ONLY `models.*` modules the bundle may resolve from the serve host. Anything else must be
+# vendored (i.e. must live under SRC_PKG so the closure picks it up). Keep this list tiny and only
+# for code that genuinely ships with tt-metal.
+# MODULES only -- deliberately no bare-package entries. `from models.common import moe_gather`
+# reports the PACKAGE (`models.common`), and if the name cannot be resolved to a file in this repo
+# there is no way to tell a submodule from an attribute -- which is the exact shape of the bug that
+# shipped. Listing only leaf modules means any `from <pkg> import name` surfaces `<pkg>`, fails the
+# check, and forces an explicit decision. `from models.common.lightweightmodule import X` reports the
+# module itself and passes.
+HOST_RESOLVED = {
+    "models.common.lightweightmodule",
+    "models.tt_transformers.tt.generator",
+}
 # `vllm_metadata.json` is not staged: with a v4 --manifest, tt-kernel renders it on pull from the
 # authoritative manifest and overwrites anything shipped, so shipping the checked-in copy only
 # publishes a stale env that contradicts the manifest.
@@ -115,21 +138,33 @@ def compute_closure(repo: Path, entries: list[str], within: str = SRC_PKG) -> li
 
 
 def external_imports(repo: Path, files: list[str]) -> set[str]:
-    """`models.*` imports in the staged set that fall OUTSIDE SRC_PKG (i.e. host-resolved)."""
+    """`models.*` imports in the staged set that fall OUTSIDE SRC_PKG (i.e. host-resolved).
+
+    Expands ``from pkg import name`` to ``pkg.name`` when that resolves to a module FILE. Without
+    that, ``from models.common import moe_gather`` was recorded as ``models.common`` -- a package
+    that obviously exists on the host -- and the audit passed while the bundle was missing the
+    module it actually needed."""
     out: set[str] = set()
     for rel in files:
         for node in ast.walk(ast.parse((repo / rel).read_text())):
-            mod = None
-            if isinstance(node, ast.ImportFrom) and node.module:
-                mod = node.module
-            elif isinstance(node, ast.Import):
-                for a in node.names:
-                    if a.name.startswith("models.") and not a.name.startswith(SRC_PKG):
-                        out.add(a.name)
-                continue
-            if mod and mod.startswith("models.") and not mod.startswith(SRC_PKG):
-                out.add(mod)
+            if isinstance(node, ast.Import):
+                out.update(
+                    a.name for a in node.names if a.name.startswith("models.") and not a.name.startswith(SRC_PKG)
+                )
+            elif isinstance(node, ast.ImportFrom) and node.module and node.module.startswith("models."):
+                if node.module.startswith(SRC_PKG):
+                    continue
+                out.add(node.module)
+                for a in node.names:  # `from pkg import mod` may name a SUBMODULE, not an attribute
+                    if _module_to_path(repo, f"{node.module}.{a.name}"):
+                        out.add(f"{node.module}.{a.name}")
     return out
+
+
+def check_host_resolved(external: set[str]) -> list[str]:
+    """External imports that are NOT on the HOST_RESOLVED allowlist -- i.e. things that will not
+    exist on a serve host and must be vendored instead. Returns the offenders."""
+    return sorted(m for m in external if m not in HOST_RESOLVED)
 
 
 def rewrite(text: str) -> str:
@@ -216,8 +251,31 @@ def main() -> int:
         for x in leaked[:10]:
             print(f"    {x}", file=sys.stderr)
         return 1
-    ext = external_imports(repo, closure)
+    # Audit the ADAPTER too, not just the closure: it is staged separately (step 1) and its imports
+    # were never checked. Then fail on anything the serve host will not provide -- shipping a bundle
+    # whose import graph reaches a build-machine-only module is the one failure mode that looks like
+    # "plug and play" right up until someone pulls it.
+    ext = external_imports(repo, closure + [str(BUNDLE_SUBDIR / ADAPTER)])
     print(f"  host-resolved      : {', '.join(sorted(ext)) or '(none)'}")
+    bad = check_host_resolved(ext)
+    if bad:
+        print(
+            f"  ERROR: {len(bad)} import(s) resolve to neither this bundle nor tt-metal:",
+            file=sys.stderr,
+        )
+        for m in bad:
+            where = _module_to_path(repo, m)
+            print(
+                f"    {m}" + (f"  (exists here as {where} -- move it under {SRC_PKG})" if where else ""),
+                file=sys.stderr,
+            )
+        print(
+            "  Either move the module under "
+            f"{SRC_PKG} so the closure vendors it, or add it to HOST_RESOLVED if it genuinely "
+            "ships with tt-metal.",
+            file=sys.stderr,
+        )
+        return 1
     return 0
 
 

@@ -45,13 +45,15 @@ def main():
     ap.add_argument("--top-p", type=float, default=1.0, help="top-p (nucleus) for sampling")
     ap.add_argument("--presence-penalty", type=float, default=0.0, help="subtract from logits of seen tokens")
     ap.add_argument("--seed", type=int, default=0, help="RNG seed for sampling (deterministic per seed)")
+    ap.add_argument("--mtp", action="store_true", help="speculative decode with the MTP draft head")
+    ap.add_argument("--mtp-gamma", type=int, default=2, help="draft depth (measured optimum: 2)")
     args_cli = ap.parse_args()
 
     ckpt = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
     n_layers = int(os.environ.get("QWEN36_LAYERS", "40"))
 
     # Trace capture (greedy or sampling) needs a nonzero trace region; eager-only can use 0.
-    trace_region = 200 * 1024 * 1024 if args_cli.trace else 0
+    trace_region = 200 * 1024 * 1024 if (args_cli.trace or args_cli.mtp) else 0
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), trace_region_size=trace_region)
     try:
         max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "512"))
@@ -89,7 +91,46 @@ def main():
         generated = []
         dec_times = []
         next_id = int(logits[0, -1].argmax())  # prefill's first token (greedy)
-        if args_cli.trace and args_cli.gen:
+        if args_cli.mtp and args_cli.gen:
+            # Speculative decode: each round drafts `gamma` tokens with the MTP head, verifies all
+            # gamma+1 in ONE backbone pass, and emits the accepted prefix plus one guaranteed token.
+            # Greedy accepts on argmax match; with --temperature>0 it runs speculative SAMPLING, which
+            # is distribution-exact (tt/mtp_sampling.py), so output quality is unchanged either way.
+            model.build_mtp_head(gamma=args_cli.mtp_gamma)
+            model.start_decode(next_id)
+            model.setup_mtp_decode()
+            model._mtp_hidden = None
+            generated.append(next_id)
+            t0 = time.time()
+            warm = model.setup_mtp_traces()  # 2 warm eager rounds (their tokens are real) + capture
+            print(f"[demo] MTP traces captured in {time.time() - t0:.1f}s (gamma={model.mtp_gamma})")
+            generated.extend(warm)
+            rounds = 0
+            t0 = time.time()
+            while len(generated) < args_cli.gen:
+                generated.extend(model.spec_decode_step())
+                rounds += 1
+            dt = time.time() - t0
+            generated = generated[: args_cli.gen]
+            tpr, acc, pacc = model.mtp_acceptance()
+            ms_round = dt / max(rounds, 1) * 1e3
+            print(
+                f"[demo] MTP: {rounds} rounds, {ms_round:.1f} ms/round, {tpr:.2f} tokens/round, "
+                f"accepted/drafted {acc:.2f}" + (f", mean p(draft) {pacc:.3f}" if pacc is not None else "")
+            )
+            print(
+                f"[demo] decode (MTP traced): {ms_round / tpr:.1f} ms/token -> {1000 * tpr / ms_round:.2f} tok/s/user"
+            )
+            # Speculation only pays above ~2.2 tokens/round at gamma=2 (a round costs ~2.2x a plain
+            # decode step), and acceptance is strongly prompt-dependent: measured 2.04-2.70. This demo
+            # reports the raw number with no guard; demo/server.py measures the plain rate at warmup
+            # and disengages automatically when speculation is behind.
+            if tpr < 2.2:
+                print(
+                    f"[demo] NOTE: {tpr:.2f} tokens/round is below the ~2.2 break-even for gamma=2 — on "
+                    f"this prompt plain decode is likely FASTER (run without --mtp to compare)"
+                )
+        elif args_cli.trace and args_cli.gen:
             # token + positions live on device; decode runs embed->...->argmax->next-token in one
             # traced graph. one eager step compiles the kernels, then record-only capture + replay.
             generated.append(next_id)

@@ -239,11 +239,17 @@ def gdnbreak(mesh, n_layers, max_seq, K, iters):
     stages = [
         ("in_proj (M=K)", lambda: ttnn.linear(x2, m.w_in_proj)),
         ("conv_silu (T=K)", lambda: m._conv_silu(mixed, cache.get("conv_state"))),
-        # inside the conv: which of its parts is the 0.475 ms?
+        # inside the conv. The verify conv is now the STACKED form (one matmul selects every tap shift,
+        # one multiply applies all taps, one matmul sums them) — see gated_delta._conv_stack_const. The
+        # old slice-loop pieces are kept below for comparison because that is where the 0.475 -> 0.235
+        # ms/layer came from, but they are NOT what runs any more.
         ("  conv: xpad concat", lambda: ttnn.concat([cache["conv_state"], mixed], dim=0)),
-        ("  conv: 4 slice+mul+add", lambda: _conv_taps_only(m, xpad_c, K)),
+        ("  conv: stacked matmul S", lambda: ttnn.matmul(m._conv_stack_const(K)[0], xpad_c)),
+        ("  conv: stacked mul TAPS", lambda: ttnn.multiply(_stack_Z(m, xpad_c, K), m._conv_stack_const(K)[2])),
+        ("  conv: stacked matmul A", lambda: ttnn.matmul(m._conv_stack_const(K)[1], _stack_Y(m, xpad_c, K))),
         ("  conv: silu", lambda: ttnn.silu(mixed)),
-        ("  conv: new_state slice", lambda: ttnn.slice(xpad_c, [K, 0], [K + m.conv_k - 1, m.conv_dim])),
+        ("  [old] conv: 4 slice+mul+add", lambda: _conv_taps_only(m, xpad_c, K)),
+        ("  [old] conv: new_state slice", lambda: ttnn.slice(xpad_c, [K, 0], [K + m.conv_k - 1, m.conv_dim])),
         (
             "4x _to_tilerows",
             lambda: [
@@ -275,7 +281,17 @@ def gdnbreak(mesh, n_layers, max_seq, K, iters):
             continue
         tot += ms
         print(f"    {name:>20}{ms:>9.4f} ms", flush=True)
-    print(f"    {'STAGE SUM':>20}{tot:>9.4f} ms   (block measures ~1.01 ms/layer)")
+    print(f"    {'STAGE SUM':>20}{tot:>9.4f} ms   (isolated stages OVER-count: they do not pipeline)")
+
+
+def _stack_Z(m, xpad, T):
+    """Z = S @ xpad — the stacked conv's shift-selection product (see gated_delta._conv_stack_const)."""
+    return ttnn.matmul(m._conv_stack_const(T)[0], xpad)
+
+
+def _stack_Y(m, xpad, T):
+    """Y = Z * TAPS — the stacked conv's tap product, ready for the summing matmul."""
+    return ttnn.multiply(_stack_Z(m, xpad, T), m._conv_stack_const(T)[2])
 
 
 def _conv_taps_only(m, xpad, T):

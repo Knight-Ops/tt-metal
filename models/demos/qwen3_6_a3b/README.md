@@ -115,6 +115,8 @@ sampling reference (on-device design, supported params, and the perf breakdown).
 
 ```bash
 # launch (opens the 1x1 mesh directly, like demo.py); trace path on by default
+# add QWEN36_MTP=1 for speculative decode (needs the checkpoint's mtp.* head) — exact for
+# greedy AND sampled requests, see SAMPLING.md "Speculative decode + sampling"
 QWEN36_LAYERS=40 ./python_env/bin/python models/demos/qwen3_6_a3b/demo/server.py
 
 # smoke endpoints
@@ -188,6 +190,14 @@ tt-inference-server workflows.
 | `QWEN36_LMHEAD_BF4` | 1 | `0` keeps lm_head in BFP8 |
 | `QWEN36_EXPERT_DTYPE` | `bf4` | routed-expert precision (`bf4`/`bf8`); used by the accuracy sweep in `evaluation/` |
 | `QWEN36_EXPERT_DOWN_BF8` | 0 | `1` pins the sensitive routed-expert `down_proj` to bf8 (gate_up stays bf4) — mixed-precision recipe, ~+5GB, still fits a 32GB P150 |
+| `QWEN36_MTP` | 0 | speculative decode with the checkpoint's MTP draft head. `greedy_only` = only `temperature==0` requests (**recommended: 1.22×, exact**); `1` = also sampled requests (exact but ~1.02× — see EXPERIMENTS.md). Needs `mtp.*` weights + decode tracing |
+| `QWEN36_MTP_GAMMA` | 2 | draft depth (measured optimum; ≥4 is measured *worse*, see MTP.md) |
+| `QWEN36_MTP_ACCEPT` | `exact` | acceptance rule for sampled requests: `exact` (distribution-preserving, 1.14×), `relaxed` (typical acceptance, 1.25×, mean TV 0.090), `lenient` (tunable via `QWEN36_MTP_LENIENCE`, 1.21× at mean TV 0.054), `greedy` (parity testing only — biases sampled output toward the argmax) |
+| `QWEN36_TRACE_REGION` | 200 (400 with MTP) | trace region, MiB |
+| `QWEN36_SPARSE_IN0BW_GU` | 32 | MoE `gate_up` sparse-matmul `in0_block_w` (its Kt=64 is not constrained by `down`'s Kt=16) |
+| `QWEN36_GDN_VERIFY_CONV_STACK` | 1 | stacked-matmul verify conv (verify 52.5→44.0 ms, PCC 0.9997→0.99998); `0` reverts to the slice loop |
+| `QWEN36_GDN_COMMIT_COPY` | 1 | full-accept conv commit as one copy (round −2.6 ms) |
+| `QWEN36_GDN_COMMIT_SELECT` | 0 | general commit as selection matmuls: −5.1 ms but breaks sampled acceptance at 40L — see EXPERIMENTS.md |
 
 ## Correctness
 
@@ -210,6 +220,15 @@ Full 40-layer decode on a single P150 (text-only, BFP4 experts), measured progre
 | + self-contained on-device trace (argmax/rope/pos + O(1) KV) | 7.77 |
 | + fused gate+up MoE sparse_matmul | 9.11 |
 | **+ decode-opt levers** (8-of-256 MoE gather, fused Gated-DeltaNet decode kernel, conv add-chain, DRAM-sharded projections, MoE `in0_block_w`) | **~30** |
+| + per-matmul MoE `in0_block_w` (`gate_up`=32) | 34.9 |
+| **+ speculative decode (MTP, gamma=2, greedy)** | **43.5** |
+
+Speculative decode is measured at **43.5 tok/s/user greedy** (1.25× over 34.9, gamma=2, round 52.1 ms). Acceptance is prompt-dependent and break-even is ~1.9
+tokens/round, so the server measures both rates live and disengages if speculation is losing. For
+*sampled* requests it is **distribution-exact at 1.11–1.19×**;
+`QWEN36_MTP_ACCEPT=relaxed` gets 1.22× by giving up exactness and `=lenient` 1.18× at half the
+divergence, but exact needs no tradeoff. See EXPERIMENTS.md ("Speculative SAMPLING", "The verify pass
+was 16% slower than it needed to be") for the full measured picture.
 
 ≈58× faster decode than the naive baseline, and the full model generates coherently:
 `"The capital of France is"` → `" Paris, a city renowned for its iconic landmarks such as the"`.

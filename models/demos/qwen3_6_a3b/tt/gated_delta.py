@@ -292,6 +292,80 @@ class TtGatedDeltaNet(LightweightModule):
                 self.w_out, K, N, _DRAM_BANKS
             )
 
+    # Roll the conv window forward on commit by row SELECTION instead of a concat plus two row slices
+    # (see _commit_conv_const). Two variants, because only one of them is safe:
+    #
+    #   _COMMIT_COPY (default ON): the FULL-ACCEPT commit (j == K == conv_k-1) needs no arithmetic at
+    #     all — every new conv_state row is a conv_in row, in order — so it collapses to one copy. No
+    #     matmul, no transient, and it is the commit greedy decode hits most often.
+    #
+    #   _COMMIT_SELECT (default OFF): the general j case as two selection matmuls plus an add. It is
+    #     bit-identical (0/1 selection) and it WORKS — measured commit trace 6.18 -> 1.08 ms, round
+    #     54.7 -> 49.4, greedy 1.19x -> 1.31x — but it silently destroys SAMPLED acceptance at 40
+    #     layers: a1 0.727 -> 0.211, tokens/round 2.18 -> 1.00, reproducible, while
+    #       * conv_state and recurrent_state are BIT-IDENTICAL to the old path at 4 layers over 8
+    #         rounds, eager AND traced, with identical emitted tokens;
+    #       * `test_gated_delta_verify` reports conv_state PCC 1.0 at every accept count;
+    #       * 40-layer GREEDY decode is unaffected (2.267 tok/round, eager-vs-traced parity 136/136).
+    #     Correct-at-4-layers / broken-at-40 in one path only is the signature of the allocation-
+    #     pressure failures this file already records (the multi-bucket prefill wedge, and the
+    #     trace-capture corruption in setup_mtp_decode). Removing a transient by writing the sum
+    #     straight into conv_state with `add(output_tensor=)` did NOT fix it, so it is not simply
+    #     transient count. Left in, default OFF, with the 5.1 ms it would buy documented rather than
+    #     quietly shipped.
+    _COMMIT_COPY = os.environ.get("QWEN36_GDN_COMMIT_COPY", "1") != "0"
+    _COMMIT_SELECT = os.environ.get("QWEN36_GDN_COMMIT_SELECT", "0") != "0"
+
+    # Fold the speculative-verify conv into 4 dense ops instead of 11 dispatch-bound ones. Only for
+    # SMALL T (verify): the stacked form has conv_k*T rows, which is free while that stays inside one
+    # 32-row tile and quadratic-ish beyond it, so prefill's T=512+ must keep the loop.
+    _CONV_STACK = os.environ.get("QWEN36_GDN_VERIFY_CONV_STACK", "1") != "0"
+    _CONV_STACK_MAX_T = 8
+
+    def _conv_stack_const(self, T):
+        """Constants for the stacked verify conv, cached per T.
+
+        `out[t] = sum_j tap[j] * xpad[t+j]` is a contraction over conv_k shifts. Stack every shift into
+        one tensor of conv_k*T rows and it becomes:
+
+            Z   = S @ xpad     [conv_k*T, D]   ONE matmul instead of conv_k row slices
+            Y   = Z * TAPS     [conv_k*T, D]   ONE multiply instead of conv_k multiplies
+            out = A @ Y        [T, D]          ONE matmul instead of conv_k-1 adds
+
+        with S[j*T+t, t+j] = 1 and A[t, j*T+t] = 1 (pure 0/1 selection/summation matrices). The reason
+        this is a win rather than a wash: in TILE layout a conv_k*T-row tensor occupies the SAME single
+        32-row tile as the T-row tensors it replaces, so widening costs nothing while the op count
+        drops. MEASURED at K=3, conv_dim=8192, in isolation: 1146 us -> 383 us (3.0x). A row slice
+        there is 108 us against 44 us for the equivalent selection matmul."""
+        if not hasattr(self, "_conv_stack_cache"):
+            self._conv_stack_cache = {}
+        c = self._conv_stack_cache.get(T)
+        if c is None:
+            CK, D, R = self.conv_k, self.conv_dim, T + self.conv_k - 1
+            Sm = torch.zeros(CK * T, R)
+            Am = torch.zeros(T, CK * T)
+            for j in range(CK):
+                for t in range(T):
+                    Sm[j * T + t, t + j] = 1.0
+                    Am[t, j * T + t] = 1.0
+            # TAPS[j*T+t] = tap[j], built on device from the per-tap rows so it works on both the
+            # fresh-weight and weight-cache paths. Built once per T, so its cost is irrelevant.
+            taps = ttnn.concat([ttnn.repeat(self.conv_taps[j], ttnn.Shape([T, 1])) for j in range(CK)], dim=0)
+            # S split by SOURCE so the [conv_state | mixed] concat can be skipped entirely: the concat
+            # measured 0.1242 ms/layer, 53% of the whole stacked conv, while the two half-width
+            # selection matmuls plus one add come to ~0.059. (An isolated microbench had called this a
+            # wash at 171 vs 168 us; in-model the selection matmuls cost 17 us, not 44, so the balance
+            # flips — measure the replacement where it will run.)
+            c = (
+                to_tt(Sm, self.mesh_device, dtype=ttnn.bfloat16),
+                to_tt(Am, self.mesh_device, dtype=ttnn.bfloat16),
+                taps,
+                to_tt(Sm[:, : self.conv_k - 1].contiguous(), self.mesh_device, dtype=ttnn.bfloat16),
+                to_tt(Sm[:, self.conv_k - 1 :].contiguous(), self.mesh_device, dtype=ttnn.bfloat16),
+            )
+            self._conv_stack_cache[T] = c
+        return c
+
     def _conv_silu(self, mixed, conv_state=None, need_state=True):
         """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns
         (out[T,conv_dim], new_conv_state[K-1,conv_dim]); new_conv_state is None when need_state=False.
@@ -307,9 +381,15 @@ class TtGatedDeltaNet(LightweightModule):
             )
         else:
             pad = conv_state
-        # L1 only for the tiny T==1 decode concat; prefill (large T) stays in DRAM (an L1 [T+K-1,
-        # conv_dim] concat is ~33 MB at T=2048 and overflows L1 — the _MC residency is a decode-only win).
-        xpad = ttnn.concat([pad, mixed], dim=0, memory_config=(_MC if T == 1 else None))  # [T+K-1, conv_dim]
+        stacked = self._CONV_STACK and 1 < T <= self._CONV_STACK_MAX_T
+        # The stacked verify path reads the two sources directly, so it only needs `xpad` when the
+        # caller also wants the rolled-forward state (verify does not — commit_verify recomputes it).
+        if stacked and not need_state:
+            xpad = None
+        else:
+            # L1 only for the tiny T==1 decode concat; prefill (large T) stays in DRAM (an L1 [T+K-1,
+            # conv_dim] concat is ~33 MB at T=2048 and overflows L1 — an L1-residency decode-only win).
+            xpad = ttnn.concat([pad, mixed], dim=0, memory_config=(_MC if T == 1 else None))
         if T == 1:
             # decode: xpad is exactly [K, conv_dim] and out[0] = sum_j xpad[j]*tap[j]. One elementwise
             # multiply against the stacked taps + one row-sum, vs K slices + K multiplies + (K-1) adds
@@ -317,6 +397,20 @@ class TtGatedDeltaNet(LightweightModule):
             acc = ttnn.sum(
                 ttnn.multiply(xpad, self.conv_taps_stacked, memory_config=_MC), dim=0, keepdim=True, memory_config=_MC
             )  # [1, conv_dim]
+        elif stacked:
+            # verify: one stacked contraction (see _conv_stack_const). HiFi4 so the conv_k-term tap sum
+            # accumulates in fp32 — strictly better than the bf16 add chain it replaces, though it is a
+            # different rounding ORDER, which the recurrence is sensitive to (hence the PCC gate in
+            # tests/test_gated_delta_verify.py and the env kill-switch).
+            S, A, TAPS, S_pad, S_new = self._conv_stack_const(T)
+            if xpad is None:  # skip the concat: select from each source and add (see _conv_stack_const)
+                Z = ttnn.add(
+                    ttnn.matmul(S_pad, pad, compute_kernel_config=_HIFI4),
+                    ttnn.matmul(S_new, mixed, compute_kernel_config=_HIFI4),
+                )
+            else:
+                Z = ttnn.matmul(S, xpad, compute_kernel_config=_HIFI4)
+            acc = ttnn.matmul(A, ttnn.multiply(Z, TAPS), compute_kernel_config=_HIFI4)
         else:
             acc = None
             for j in range(self.conv_k):
@@ -324,6 +418,7 @@ class TtGatedDeltaNet(LightweightModule):
                 term = ttnn.multiply(xj, self.conv_taps[j])
                 acc = term if acc is None else ttnn.add(acc, term)
         new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim]) if need_state else None
+        assert not (need_state and xpad is None)
         # Same T==1 gate as the concat above: at prefill T this is [T, conv_dim] (28 MB at T=1711),
         # and because ttnn defaults memory_config to the INPUT's config, an L1 result here silently
         # propagates to the q/k/v slices and everything downstream of them — pinning ~700 KB/core and
@@ -1159,6 +1254,40 @@ class TtGatedDeltaNet(LightweightModule):
                 y = ttnn.linear(core, self.w_out)
             return ttnn.reshape(y, [1, 1, K, hidden])
 
+    def _commit_conv_const(self, j, K):
+        """Selection matrices for rolling the conv window forward by j accepted tokens, cached per (j,K).
+
+        `new_state[i] = row (j+i) of [conv_state(conv_k-1 rows) ; conv_in(K rows)]`, so it is a pure row
+        selection from the two sources — the same exact-by-construction trick the verify conv uses:
+
+            new_state = Scs @ conv_state + Sci @ conv_in
+
+        replacing a concat plus two sub-tile row slices (~118 + 2x108 us) with two tiny matmuls and an
+        add. Returns (Scs, Sci); either is None when that source contributes no row, which is the common
+        case — at K == conv_k-1 the full-accept commit reads conv_in alone."""
+        if not hasattr(self, "_commit_conv_cache"):
+            self._commit_conv_cache = {}
+        key = (j, K)
+        c = self._commit_conv_cache.get(key)
+        if c is None:
+            P, CK = self.conv_k - 1, self.conv_k
+            cs_m, ci_m = torch.zeros(P, P), torch.zeros(P, K)
+            for i in range(P):
+                r = j + i
+                if r < P:
+                    cs_m[i, r] = 1.0
+                else:
+                    ci_m[i, r - P] = 1.0
+            mk = lambda m: to_tt(m, self.mesh_device, dtype=ttnn.bfloat16)
+            c = (
+                mk(cs_m) if bool(cs_m.any()) else None,
+                mk(ci_m) if bool(ci_m.any()) else None,
+                # identity fast path: every new row comes from conv_in, in order, starting at row 0
+                bool(not cs_m.any()) and P == K and bool((ci_m == torch.eye(P)).all()),
+            )
+            self._commit_conv_cache[key] = c
+        return c
+
     def commit_verify(self, cache, j):
         """Advance the persistent state by the j ACCEPTED tokens of the last verify (j in 0..K).
 
@@ -1177,8 +1306,23 @@ class TtGatedDeltaNet(LightweightModule):
         ttnn.copy(ttnn.reshape(st, [1, V, Dk, Dv]), cache["recurrent_state"])
         cs = cache.get("conv_state")
         if cs is not None:
-            kept = ttnn.concat([cs, ttnn.slice(conv_in, [0, 0], [j, self.conv_dim])], dim=0)
-            ttnn.copy(ttnn.slice(kept, [j, 0], [j + self.conv_k - 1, self.conv_dim]), cs)
+            Scs, Sci, ident = self._commit_conv_const(j, conv_in.shape[0])
+            if ident and self._COMMIT_COPY:
+                # full accept: new conv_state IS conv_in (see _commit_conv_const). One copy.
+                ttnn.copy(conv_in, cs)
+            elif not self._COMMIT_SELECT:
+                kept = ttnn.concat([cs, ttnn.slice(conv_in, [0, 0], [j, self.conv_dim])], dim=0)
+                ttnn.copy(ttnn.slice(kept, [j, 0], [j + self.conv_k - 1, self.conv_dim]), cs)
+            elif Scs is None or Sci is None:  # one source contributes every row: a single matmul
+                ttnn.copy(ttnn.matmul(Scs or Sci, cs if Sci is None else conv_in, compute_kernel_config=_HIFI4), cs)
+            else:
+                # `add` accepts output_tensor= (matmul does not), so the sum lands straight in
+                # conv_state: two ops, and one fewer transient inside the commit trace.
+                ttnn.add(
+                    ttnn.matmul(Scs, cs, compute_kernel_config=_HIFI4),
+                    ttnn.matmul(Sci, conv_in, compute_kernel_config=_HIFI4),
+                    output_tensor=cs,
+                )
 
     def _forward_decode_batch(self, q, k, v, z, ba, cache, hidden, B):
         """Batched multi-user decode: B independent users, each one token. ONE recurrent step over B

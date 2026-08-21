@@ -234,3 +234,185 @@ def test_verify_does_not_drift(mesh_device):
     # first by more than a small margin (measured: fluctuates 0.981-0.999, no trend).
     print(f"[spec] verify+commit x{n}: no crash, {len(pccs)} steps executed")
     assert len(pccs) == n
+
+
+# ── speculative SAMPLING ─────────────────────────────────────────────────────────────────────
+def _spec_stream(model, prompt, n_gen, gamma):
+    """Fresh prefill, then drive speculative rounds until n_gen tokens have been produced."""
+    model.build_mtp_head(gamma=gamma)
+    logits = model.forward(prompt)  # re-prefill resets the linear state
+    model.start_decode(int(logits[0, -1].argmax()))
+    model.setup_mtp_decode()
+    model._mtp_hidden = None
+    out = [int(from_tt_first(model))]
+    while len(out) < n_gen:
+        out.extend(model.spec_decode_step())
+    return out[:n_gen]
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("gamma", [1, 2])
+def test_spec_sampling_at_zero_temperature_equals_greedy_spec(mesh_device, gamma):
+    """The decisive end-to-end gate for speculative SAMPLING.
+
+    As temperature -> 0 the truncated target collapses to a point mass on the argmax (top-p then keeps
+    exactly one token), so exact rejection sampling MUST degenerate: accept iff the draft is the
+    argmax, and on rejection emit the argmax from the residual. The sampled path therefore has to be
+    TOKEN-IDENTICAL to the already-gated greedy speculative path -- not merely close. Any bug in the
+    host rule, in the device candidate tail, or in the accept-count -> commit_verify contract breaks
+    this, and unlike a PCC gate it is not tie-sensitive: both paths consume the same verify logits.
+    """
+    model, args = _model(mesh_device)
+    prompt = _prompt(args)
+
+    model.enable_sampling(0.0, 0, 1.0, 0, 0.0)  # greedy tail (sampling disabled)
+    greedy = _spec_stream(model, prompt, N_GEN, gamma)
+
+    model.enable_sampling(1e-4, 20, 0.95, seed=1234, presence_penalty=0.0)
+    sampled = _spec_stream(model, prompt, N_GEN, gamma)
+    st = model.mtp_stats
+    _, _, pacc = model.mtp_acceptance()
+    print(
+        f"[spec] gamma={gamma} T->0: tokens/round {st['tokens'] / max(st['rounds'], 1):.2f}  "
+        f"mean p(draft) {pacc:.4f}  accepted {st['accepted']}/{st['drafted']}  "
+        f"bonus {st.get('bonus', 0)}  rejections {st.get('fallbacks', 0)}"
+    )
+    div = next((i for i, (a, b) in enumerate(zip(greedy, sampled)) if a != b), N_GEN)
+    assert div == N_GEN, (
+        f"sampled spec diverged from greedy spec at token {div} despite T->0:\n"
+        f"  greedy  {greedy[max(0, div - 2):div + 3]}\n  sampled {sampled[max(0, div - 2):div + 3]}"
+    )
+    # At T->0 the accept probability is exactly 1 for a draft that IS the argmax and 0 otherwise, so
+    # the summed accept probability must equal the accepted count. Layer-count independent: at reduced
+    # QWEN36_LAYERS acceptance is legitimately 0 (the head was trained against the 40-layer backbone,
+    # see MTP.md), and this still holds — 0 == 0.
+    assert pacc is not None, "sampled mode must record accept probabilities"
+    drift = abs(st.get("accept_prob_sum", 0.0) - st["accepted"])
+    assert drift <= 0.01 * max(st.get("accept_tests", 1), 1), (
+        f"at T->0 each accept probability must be 0 or 1: sum {st.get('accept_prob_sum', 0.0):.4f} "
+        f"vs accepted {st['accepted']} over {st.get('accept_tests', 0)} tests"
+    )
+
+
+@torch.no_grad()
+def test_spec_sampling_is_seed_reproducible(mesh_device):
+    """Same seed -> identical stream (the host RNG is the only randomness); different seed -> different
+    stream. Reproducibility is what makes the sampled path debuggable at all, and it is the property
+    the eager-vs-traced parity check in bench_mtp.py relies on."""
+    model, args = _model(mesh_device)
+    prompt = _prompt(args)
+    model.enable_sampling(1.0, 20, 0.95, seed=7, presence_penalty=0.0)
+    a = _spec_stream(model, prompt, N_GEN, 2)
+    model.enable_sampling(1.0, 20, 0.95, seed=7, presence_penalty=0.0)
+    b = _spec_stream(model, prompt, N_GEN, 2)
+    model.enable_sampling(1.0, 20, 0.95, seed=99, presence_penalty=0.0)
+    c = _spec_stream(model, prompt, N_GEN, 2)
+    print(
+        f"[spec] seed 7 vs 7: {'identical' if a == b else 'DIFFER'};  7 vs 99 first diff at "
+        f"{next((i for i, (x, y) in enumerate(zip(a, c)) if x != y), None)}"
+    )
+    assert a == b, f"same seed produced different streams:\n  {a}\n  {b}"
+    assert a != c, "different seeds produced the identical stream — the seed is not reaching the sampler"
+
+
+@torch.no_grad()
+def test_spec_sampling_emits_only_in_support(mesh_device):
+    """Every emitted token must lie in the verify row's truncated top-k support. This is the property
+    that would break if the candidate indices were scrambled or the residual renormalisation were
+    wrong, and it holds at any temperature (unlike token-identity, which only holds at T->0)."""
+    from models.demos.qwen3_6_a3b.tt.mtp_sampling import SpecSampler
+
+    model, args = _model(mesh_device)
+    prompt = _prompt(args)
+    model.enable_sampling(1.0, 20, 0.95, seed=3, presence_penalty=0.0)
+    model.build_mtp_head(gamma=2)
+    logits = model.forward(prompt)
+    model.start_decode(int(logits[0, -1].argmax()))
+    model.setup_mtp_decode()
+    model._mtp_hidden = None
+    model.spec_decode_step()  # seed round (K=1)
+    sm = SpecSampler(temperature=1.0, top_k=20, top_p=0.95)
+    checked = 0
+    for _ in range(6):
+        emitted = model.spec_decode_step()
+        cands = model._mtp_last_cands  # the exact rows this round's decisions were made from
+        gen = set()
+        for r, tok in enumerate(emitted):
+            _, ids = sm.probs(cands[r][0], cands[r][1], penalised=gen)
+            assert tok in set(ids.tolist()), f"row {r} emitted {tok} outside its top-k support"
+            gen.add(tok)
+            checked += 1
+    print(f"[spec] checked {checked} emitted tokens, all inside their row's truncated support")
+    assert checked >= 6
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("gamma", [1, 2, 3])
+def test_spec_sampling_oracle_draft_accepts_everything(mesh_device, gamma):
+    """Exercise the ACCEPT branch, which the T->0 test above cannot reach at reduced layer counts.
+
+    At `QWEN36_LAYERS < 40` the real MTP head accepts nothing (it was trained against the 40-layer
+    backbone -- MTP.md), so every round takes the rejection path and the accept path would ship
+    untested. Substituting an ORACLE drafter -- one that proposes exactly the greedy continuation --
+    forces acceptance to 100% and pins down the parts that only matter when drafts are accepted: the
+    full-accept commit count (n == gamma+1, the largest rollback), the bonus token that a fully
+    accepted round emits, and the T->0 identity of accept probabilities.
+    """
+    model, args = _model(mesh_device)
+    prompt = _prompt(args)
+    T = int(prompt.shape[1])
+    # The oracle must propose the VERIFY path's own greedy continuation, not the plain-decode
+    # baseline's: the two differ by ~1e-3 in bf16 logits and diverge at the first near-tie (see the
+    # module docstring), after which a baseline-fed oracle starts getting rejected. That continuation
+    # is drafter-INDEPENDENT: verify row i's argmax depends only on [cur, d_1..d_i], and for every
+    # accepted i the draft equals an earlier row's argmax, so the EMITTED stream is the same whatever
+    # the drafter proposes — only the tokens-per-round changes. So one greedy pass with the real
+    # drafter defines the oracle exactly.
+    model.enable_sampling(0.0, 0, 1.0, 0, 0.0)
+    chain = _spec_stream(model, prompt, N_GEN + gamma + 3, gamma)
+    tok_at = lambda pos: chain[pos - T]  # chain[0] is the prefill token, which sits at absolute pos T
+
+    def run(temperature):
+        if temperature:
+            model.enable_sampling(temperature, 20, 0.95, seed=5, presence_penalty=0.0)
+        else:
+            model.enable_sampling(0.0, 0, 1.0, 0, 0.0)
+        model.build_mtp_head(gamma=gamma)
+        logits = model.forward(prompt)
+        model.start_decode(int(logits[0, -1].argmax()))
+        model.setup_mtp_decode()
+        model._mtp_hidden = None
+        model.mtp_draft = lambda hidden, first_token, g: [tok_at(model.pos + 1 + j) for j in range(g)]
+        out, sizes = [int(from_tt_first(model))], []
+        while len(out) < N_GEN:
+            e = model.spec_decode_step()
+            out.extend(e)
+            sizes.append(len(e))
+        return out[:N_GEN], sizes, dict(model.mtp_stats)
+
+    g_out, g_sizes, g_st = run(0.0)
+    s_out, s_sizes, s_st = run(1e-4)
+    print(
+        f"[spec] oracle gamma={gamma}: greedy sizes {g_sizes} sampled sizes {s_sizes}  "
+        f"accepted {s_st['accepted']}/{s_st['drafted']}  bonus {s_st['bonus']}"
+    )
+    # The oracle's chain is recorded under the ORIGINAL round boundaries; once it drives full
+    # acceptance the boundaries change, so verify groups different tokens per K-row pass and a single
+    # near-tie can flip an argmax and derail the chain from then on (the accepted non-bit-parity
+    # regime — a conv change that IMPROVED PCC 0.9997 -> 0.99998 was enough to move such a tie). So
+    # require that full acceptance happens and is exercised, not that it lasts forever.
+    assert max(g_sizes) == gamma + 1, f"greedy oracle never reached a full-accept round: {g_sizes}"
+    assert g_sizes[1] == gamma + 1, f"the first oracle-driven round should fully accept: {g_sizes}"
+    assert s_st["bonus"] > 0, f"the full-accept bonus path was never exercised: {s_st}"
+    # T->0 must behave IDENTICALLY to greedy — same round structure and same tokens. This is the real
+    # subject of the test: the accept branch, the n == gamma+1 commit, and the bonus token.
+    assert g_sizes == s_sizes, f"round structure differs at T->0:\n  greedy {g_sizes}\n  sampled {s_sizes}"
+    # At T->0 an ACCEPTED draft must have target probability 1 -- but only accepted ones: a REJECTED
+    # draft can legitimately carry p=0.5, because bf16 logits over a 248k vocab produce exact ties and
+    # softmax at T->0 spreads a point mass uniformly across them rather than picking one.
+    assert s_st["acc_p_n"] and abs(s_st["acc_p_sum"] - s_st["acc_p_n"]) <= 0.01 * s_st["acc_p_n"], s_st
+    div = next((i for i, (a, b) in enumerate(zip(g_out, s_out)) if a != b), N_GEN)
+    assert div == N_GEN, (
+        f"oracle-drafted sampled spec diverged from greedy at token {div}:\n"
+        f"  greedy  {g_out[max(0, div - 2):div + 3]}\n  sampled {s_out[max(0, div - 2):div + 3]}"
+    )

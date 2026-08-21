@@ -436,6 +436,12 @@ class TtModel(LightweightModule):
 
         ttnn.sampling's ``temp`` is 1/T and ``k`` must be in (0, 32]; we clamp accordingly.
         """
+        # Speculative decode samples on the HOST (from verify's per-row candidates), so it needs the
+        # same seed and a fresh generated-token set per request. Reset both here — enable_sampling is
+        # the per-request entry point — for the greedy tail too, so a mode switch cannot leak state.
+        self._samp_seed = int(seed)
+        self._mtp_rng = torch.Generator().manual_seed(int(seed))
+        self._mtp_gen = set()
         if temperature == 0:
             self.sampling = None  # greedy
             return
@@ -450,6 +456,7 @@ class TtModel(LightweightModule):
         # Static (param-independent) buffers, built once.
         if getattr(self, "_samp_nc", None) != nc:
             self._samp_nc = nc
+            self._samp_offsets_f = None  # rebuilt lazily from the new offsets (see _samp_offsets_f32)
             # per-chunk global-index offset (chunk i -> +i*CW), broadcast across the K kept indices
             off = (torch.arange(nc, dtype=torch.int32).view(1, 1, nc, 1).expand(1, 1, nc, K).contiguous()) * CW
             self._samp_offsets = _t(off, ttnn.int32, ttnn.TILE_LAYOUT)
@@ -463,6 +470,9 @@ class TtModel(LightweightModule):
 
         k = top_k if 0 < top_k <= K else K  # k in (0, 32]; <=0 ("all") or >32 -> 32
         p = min(max(top_p, 0.0), 1.0)
+        # Host-side copy of the truncation params: speculative decode applies them on the host (over
+        # verify's candidates) rather than in `ttnn.sampling`, so it needs the python values.
+        self._samp_params = (float(temperature), int(k), float(p), float(self._presence_penalty))
         self.t_k = _t(torch.full((B,), k, dtype=torch.int32), ttnn.uint32)
         self.t_p = _t(torch.full((B,), p), ttnn.bfloat16)
         self.t_temp = _t(torch.full((B,), 1.0 / temperature), ttnn.bfloat16)  # ttnn.sampling scales by 1/T
@@ -768,9 +778,22 @@ class TtModel(LightweightModule):
         Trace capture forbids HOST writes, not device allocation — so everything the host has to
         refresh between rounds (the K candidate tokens, their positions, the seed hidden) must live in
         a buffer written via `ttnn.copy` OUTSIDE the trace, and everything the round produces must land
-        in a buffer the host can read after `execute_trace`."""
+        in a buffer the host can read after `execute_trace`.
+
+        IDEMPOTENT for a given K, and that is load-bearing: the captured traces bake in these exact
+        buffer ADDRESSES, so re-allocating them (e.g. once per served request) would both leak device
+        memory and silently invalidate every MTP trace. A repeat call with the same K therefore only
+        resets the per-request state and keeps the traces; a call with a DIFFERENT K (a gamma sweep)
+        releases the traces first, because they are shaped for the old K."""
         K = self.mtp_gamma + 1
         dim = self.args.dim
+        if getattr(self, "_m_tok", None) is not None:
+            if self._m_tok.shape[0] == K:
+                self._mtp_cur = None
+                self._mtp_gen = set()
+                self._mtp_rng = torch.Generator().manual_seed(int(getattr(self, "_samp_seed", 0)))
+                return K
+            self.release_mtp_traces()  # K changed: the old traces are the wrong shape
         z = lambda shp, dt: ttnn.zeros(shp, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device)
         self._m_tok = z([K], ttnn.uint32)  # slot 0 = pending token, 1..gamma = drafts
         self._m_pos_i32 = z([K], ttnn.int32)  # absolute positions (attention / kv writes)
@@ -789,10 +812,86 @@ class TtModel(LightweightModule):
                 [1, 1, 1, dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
             )
         self.mtp_verify_trace = None
+        # Which tail the captured verify graph records: "greedy" (argmax only) or "sampling" (argmax +
+        # per-row candidates). Fixed for as long as the trace lives, and there is exactly ONE verify
+        # trace, because MEASURED: keeping a second verify trace resident while capturing another
+        # CORRUPTS the second trace's output buffers -- the sampling tail's candidate rows came back as
+        # ~1e9 garbage, which then fed an out-of-vocab id into ttnn.embedding and HUNG the device.
+        # (Same family as the "multi-bucket prefill trace wedge" in forward_prefill_traced, and the
+        # reason capture_decode_trace always releases the prior trace before capturing.)
+        # The A/B that established it: greedy-capture-then-sampling-capture FAILS; the same sequence
+        # with release_mtp_traces() in between, or with no greedy capture at all, PASSES.
+        self.mtp_verify_tail = None
         self.mtp_draft_trace = None
         self.mtp_commit_traces = None
         self._mtp_cur = None  # re-seed the python-tracked pending token from t_tok on the next round
+        # Speculative-SAMPLING state (unused on the greedy path). `_mtp_gen` is the sequence's
+        # generated-token set for the presence penalty; the RNG is host-side and seeded so a given
+        # `seed` reproduces a run exactly, as the on-device sampler's `t_seed` does for plain decode.
+        self._mtp_gen = set()
+        self._mtp_rng = torch.Generator().manual_seed(int(getattr(self, "_samp_seed", 0)))
         return K
+
+    def release_mtp_traces(self):
+        """Release every captured MTP trace (verify per tail, draft, commit 1..K) and forget them.
+
+        The MTP traces are captured ONCE and reused across requests — unlike the plain decode trace,
+        which `capture_decode_trace` re-captures per request — because their graphs read only the
+        persistent `_m_*` buffers and the shared caches. So the only times they must go are a gamma
+        change (wrong shape) and shutdown. Not releasing on a gamma change is the same
+        trace-accumulation leak that OOMed the server."""
+        if getattr(self, "mtp_verify_trace", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.mtp_verify_trace)
+        self.mtp_verify_trace = None
+        self.mtp_verify_tail = None
+        if getattr(self, "mtp_draft_trace", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.mtp_draft_trace)
+        self.mtp_draft_trace = None
+        for tid in (getattr(self, "mtp_commit_traces", None) or {}).values():
+            ttnn.release_trace(self.mesh_device, tid)
+        self.mtp_commit_traces = None
+
+    def _mtp_tail(self):
+        """The tail the NEXT capture should record. Follows `enable_sampling`; once captured it is
+        pinned in `self.mtp_verify_tail` (see setup_mtp_decode for why there is only ever one)."""
+        return "sampling" if self.sampling is not None else "greedy"
+
+    def mtp_tail_ready(self):
+        """Can the captured verify trace serve the CURRENT sampling mode?
+
+        A sampling round needs the candidate rows, so a greedy-tail trace cannot serve it (it would
+        replay fine and then read a buffer the graph never wrote). A greedy round is happy with either
+        tail: the sampling tail writes `_m_argmax` too, it just also pays the candidate topk. Returns
+        False when the round must fall back to the (correct, slower) eager verify."""
+        # getattr: the eager-only entry points (spec_decode_step straight after build_mtp_head, as the
+        # correctness tests do) never call setup_mtp_decode, so these attributes may not exist.
+        if getattr(self, "mtp_verify_trace", None) is None:
+            return False
+        return getattr(self, "mtp_verify_tail", None) == "sampling" or self.sampling is None
+
+    def _mtp_cand_buffers(self, K):
+        """Persistent candidate buffer the verify graph writes and the host reads after `execute_trace`.
+
+        ONE float32 `[1, 1, 2K, nc*SAMP_K]` tensor: rows 0..K-1 hold each verify row's candidate
+        logits, rows K..2K-1 hold their global vocab indices. Indices are < 2^24 so float32 represents
+        them EXACTLY (vocab 248320, max offset+local 262143), and keeping a single dtype is deliberate:
+        an int32 index tensor written from inside the CAPTURED graph came back holding float32 bit
+        patterns, even though the identical int32 typecast/add/concat/copy chain is correct when run
+        eagerly (verified model-free). One dtype also halves the readback to a single D2H.
+
+        Allocated on the WARM run — `ttnn.zeros` is a host write, which trace capture forbids — and
+        cached, exactly like gated_delta's `_verify_scratch`."""
+        assert self.sampling is not None, "call enable_sampling() before capturing a sampling verify"
+        w = self._samp_nc * self.SAMP_K
+        key = (K, w)
+        if getattr(self, "_mtp_cand_cache", None) is None:
+            self._mtp_cand_cache = {}
+        buf = self._mtp_cand_cache.get(key)
+        if buf is None:
+            buf = ttnn.zeros([1, 1, 2 * K, w], dtype=ttnn.float32, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            self._mtp_cand_cache[key] = buf
+        self._m_cand = buf
+        return buf
 
     def _h2d(self, values, dtype, dst):
         """Write a small python/torch vector into an EXISTING device buffer.
@@ -812,9 +911,30 @@ class TtModel(LightweightModule):
 
     def sync_mtp_state(self):
         """Push the python-tracked pending token/position back into the device decode state, so a caller
-        can hand off from speculative rounds to plain `decode_step_*` without a stale `t_tok`."""
+        can hand off from speculative rounds to plain `decode_step_*` without a stale `t_tok`.
+
+        ALSO re-seeds the decode conv add-chain. The two paths keep the gated-delta conv history in
+        DIFFERENT places: verify reads `cache["conv_state"]` as its left-pad and `commit_verify` rolls
+        that forward, while plain decode reads/shifts the `conv_rows` row buffers (`_CONV_ADDCHAIN`,
+        default on). Without this, a spec -> plain-decode handoff silently runs on the conv window as
+        it stood when `start_decode` last ran, i.e. it drops every token the spec rounds emitted."""
         if getattr(self, "_mtp_cur", None) is not None:
             self.set_decode_state([self._mtp_cur], [self.pos])
+        if _CONV_ADDCHAIN:
+            for layer, cache in zip(self.layers, self.caches):
+                if layer.is_linear:
+                    layer.mixer.sync_conv_rows(cache)
+
+    def refresh_conv_state(self):
+        """The inverse of `sync_conv_rows`: fold the decode add-chain's `conv_rows` back into
+        `conv_state`, which is what the VERIFY conv reads as its left-pad. Needed when entering
+        speculative rounds after plain decode steps have advanced `conv_rows` (after a prefill the two
+        already agree, so this is a no-op there). One concat + copy per linear layer, once."""
+        if not _CONV_ADDCHAIN:
+            return
+        for layer, cache in zip(self.layers, self.caches):
+            if layer.is_linear and isinstance(cache, dict) and "conv_rows" in cache and "conv_state" in cache:
+                ttnn.copy(ttnn.concat(cache["conv_rows"], dim=0), cache["conv_state"])
 
     def _mtp_verify_graph(self):
         """The traceable verify body: reads the persistent token/position buffers, writes the
@@ -831,6 +951,60 @@ class TtModel(LightweightModule):
         logits = ttnn.linear(ttnn.reshape(x, [K, self.args.dim]), self.lm_head_w)  # [K, vocab]
         am = ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1)
         ttnn.copy(ttnn.reshape(am, [K]), self._m_argmax)
+        # The tail is decided by what this capture is FOR, not by the live sampling flag: a greedy
+        # request replaying a sampling-tail trace must execute the very same graph.
+        if (self.mtp_verify_tail or self._mtp_tail()) == "sampling":
+            self._verify_candidate_tail(logits, K)
+
+    def _verify_candidate_tail(self, logits, K):
+        """Speculative SAMPLING needs the target DISTRIBUTION per verify row, not just its argmax.
+
+        Emits each row's top-(nc*SAMP_K) (value, global index) pair -- the same candidate set the plain
+        decode tail feeds to `ttnn.sampling` -- into two persistent buffers the host reads after the
+        replay. The host then applies presence/temperature/top-k/top-p and runs the acceptance rule
+        (`tt/mtp_sampling.py`), which is why the truncation parameters are NOT baked into the trace: a
+        request can change temperature/top_k/top_p with no re-capture.
+
+        Two things are deliberate:
+          * the PER-ROW loop (slice -> pad -> reshape -> topk), not a single `[1,1,K*nc,CW]` reshape:
+            that cross-row reshape in TILE layout is what scrambled candidates in the batched decode
+            path, and it is the exact hazard `_select_token_batch` documents;
+          * float32 END TO END, values and indices alike. The logits are bf16 out of the matmul so
+            this adds no accuracy, but an int32 index tensor produced inside the CAPTURED graph came
+            back holding float32 bit patterns (the same typecast/add/concat/copy chain is correct
+            eagerly), and float32 holds every index exactly -- see `_mtp_cand_buffers`.
+        """
+        V, CW, Kk, nc = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self._samp_nc
+        cand = self._mtp_cand_buffers(K)
+        off = self._samp_offsets_f32()
+        lg = ttnn.reshape(logits, [1, 1, K, V])
+        vrows, irows = [], []
+        with sp.region("mtp.verify.topk"):
+            for i in range(K):
+                row = ttnn.reshape(ttnn.slice(lg, [0, 0, i, 0], [1, 1, i + 1, V]), [1, 1, 1, V])
+                row = ttnn.pad(row, [(0, 0), (0, 0), (0, 0), (0, nc * CW - V)], value=self.SAMP_NEG)
+                chunks = ttnn.reshape(row, [1, 1, nc, CW])  # power-of-2 width per row -> multicore topk
+                vals, idxs = ttnn.topk(chunks, k=Kk, dim=-1, sorted=False, indices_tensor=self._samp_local_idx)
+                gidx = ttnn.add(ttnn.typecast(idxs, ttnn.float32), off)  # local -> global vocab index
+                vrows.append(ttnn.typecast(ttnn.reshape(vals, [1, 1, 1, nc * Kk]), ttnn.float32))
+                irows.append(ttnn.reshape(gidx, [1, 1, 1, nc * Kk]))
+        # one [1,1,2K,W] block: K value rows then K index rows -> a single copy and a single readback
+        ttnn.copy(ttnn.concat(vrows + irows, dim=2), cand)
+
+    def _samp_offsets_f32(self):
+        """`_samp_offsets` as float32, built once. Keeps the [1,1,nc,SAMP_K] shape of `ttnn.topk`'s
+        index output -- the add is elementwise per (chunk, rank), so flattening it first is a
+        broadcasting error, not a reshape."""
+        if getattr(self, "_samp_offsets_f", None) is None:
+            self._samp_offsets_f = ttnn.typecast(self._samp_offsets, ttnn.float32)
+        return self._samp_offsets_f
+
+    def read_verify_candidates(self, K=None):
+        """Host copy of the last verify's per-row candidates: (values [K, nc*SAMP_K] float32,
+        indices [K, nc*SAMP_K] int64). Additive -- `verify_step_traced`'s return value is unchanged."""
+        K = self._m_tok.shape[0] if K is None else K
+        t = from_tt(self._m_cand, self.mesh_device).reshape(2 * K, -1).float()
+        return t[:K], t[K:].round().to(torch.int64)
 
     def _mtp_draft_graph(self):
         """Traceable gamma-step draft chain, fully on device.
@@ -898,9 +1072,11 @@ class TtModel(LightweightModule):
             the same positions. Capturing with the buffers still zeroed writes token 0 at position 0
             and silently corrupts the prompt's first KV row, which then perturbs every verify row.
         """
-        if self.mtp_verify_trace is not None:
+        tail = self._mtp_tail()
+        if self.mtp_verify_trace is not None:  # never keep two resident (see setup_mtp_decode)
             ttnn.release_trace(self.mesh_device, self.mtp_verify_trace)
             self.mtp_verify_trace = None
+        self.mtp_verify_tail = tail  # the graph below records THIS tail
         self._mtp_write_round(tokens, positions)
         self._mtp_verify_graph()  # warm: compile + build constants, and prime the KV rows
         ttnn.synchronize_device(self.mesh_device)
@@ -911,6 +1087,7 @@ class TtModel(LightweightModule):
         for src, dst in zip(snap, self._trace_snapshot_tensors()):
             ttnn.copy(src, dst)  # undo the warm/capture runs' effect on the accumulators
         self.mtp_verify_trace = tid
+        self.mtp_verify_tail = tail
         return tid
 
     def verify_step_traced(self, tokens, positions):
@@ -992,6 +1169,75 @@ class TtModel(LightweightModule):
             self.mtp_commit_traces[n] = tid
         return self.mtp_commit_traces
 
+    def setup_mtp_traces(self):
+        """Run the warm eager rounds a capture needs, then capture verify + draft + commit.
+
+        Returns the token ids the warm rounds emitted — they are REAL generated output, so the caller
+        must keep them (this is why capture cannot simply be hidden inside the first replay).
+
+        Releases every MTP trace FIRST, so the whole set is captured from a clean slate. MEASURED: a
+        verify trace captured while the previous round's draft + commit traces are still resident comes
+        back CORRUPT (its candidate rows read as ~1e9 garbage, which then hangs the device by feeding
+        an out-of-vocab id to ttnn.embedding); the identical sequence with everything released first is
+        correct. Capturing draft and commit AFTER verify is fine -- it is capturing the big verify trace
+        under pinned company that breaks. Same failure family as forward_prefill_traced's multi-bucket
+        wedge, where the pinned per-trace intermediate footprint is what corrupts the larger trace.
+
+        TWO warm rounds, not one: round 1 is the K=1 seed step (no draft, and a 1-row verify), and
+        round 2 is the first true K-row verify, which is what creates the K-shaped verify scratch the
+        commit traces slice their per-step state out of. Capture is then primed with real POSITIONS
+        (>= self.pos): the warm and capture runs write the attention KV cache, which is deliberately
+        outside `_trace_snapshot_tensors()`, and rows at positions >= pos are rewritten by the very
+        next verify before anything reads them. Priming with the zeroed buffers instead would write
+        position 0 and corrupt the prompt's first KV row, which nothing ever repairs."""
+        self.release_mtp_traces()  # clean slate: nothing may be resident while verify is captured
+        emitted = list(self.spec_decode_step())
+        emitted += list(self.spec_decode_step())
+        K = self.mtp_gamma + 1
+        toks = [self._mtp_cur] * K
+        positions = [self.pos + i for i in range(K)]
+        self.capture_mtp_verify_trace(toks, positions)
+        if self.mtp_gamma > 0:
+            self._mtp_write_round(toks, positions)  # the traced draft chain slices these positions
+            self.capture_mtp_draft_trace()
+        self.capture_mtp_commit_traces()
+        return emitted
+
+    def set_mtp_sampler(self, sampler):
+        """Override the acceptance rule in process (the env is the normal route). Used by bench_mtp to
+        sweep rules without rebuilding the model: the captured verify trace is rule-INDEPENDENT — it
+        only emits candidates — so only this host-side object changes."""
+        self._mtp_sampler_cache = (getattr(self, "_samp_params", None), sampler)
+        return sampler
+
+    def mtp_divergence(self):
+        """How far this run's emitted stream strayed from the target distribution.
+
+        Returns (mean TV per emitted token, mean p of ACCEPTED drafts, fraction of accepted drafts the
+        target rated < 0.1), or None on the greedy path. The exact rule must report TV == 0."""
+        st = getattr(self, "mtp_stats", None) or {}
+        if not st.get("accept_tests"):
+            return None
+        n_tok = max(st.get("tokens", 0), 1)
+        n_acc = max(st.get("acc_p_n", 0), 1)
+        return (
+            st.get("tv_sum", 0.0) / n_tok,
+            st.get("acc_p_sum", 0.0) / n_acc,
+            st.get("acc_p_low", 0) / n_acc,
+        )
+
+    def mtp_acceptance(self):
+        """(tokens_per_round, accepted/drafted, mean accept probability) since the stats were reset.
+        Mean accept probability is None on the greedy path (no probabilities are computed there)."""
+        st = getattr(self, "mtp_stats", None) or {}
+        rounds = max(st.get("rounds", 0), 1)
+        tests = st.get("accept_tests", 0)
+        return (
+            st.get("tokens", 0) / rounds,
+            st.get("accepted", 0) / max(st.get("drafted", 0), 1),
+            (st.get("accept_prob_sum", 0.0) / tests) if tests else None,
+        )
+
     def mtp_draft(self, hidden, first_token, gamma):
         """Chain `gamma` draft steps from the backbone hidden `hidden` ([1,1,1,dim]) and the pending
         token `first_token`. Each step feeds back the head's PRE-`mtp.norm` output (what A5 measured).
@@ -1012,9 +1258,45 @@ class TtModel(LightweightModule):
             h = pre
         return drafts
 
+    def _mtp_sampler(self):
+        """The acceptance rule + truncation config for this request (see tt/mtp_sampling.py). Cached
+        per parameter tuple so a long generation does not rebuild it every round."""
+        from models.demos.qwen3_6_a3b.tt.mtp_sampling import sampler_from_env
+
+        params = getattr(self, "_samp_params", None)
+        assert params is not None, "enable_sampling() must run before sampled speculative decode"
+        cache = getattr(self, "_mtp_sampler_cache", None)
+        if cache is None or cache[0] != params:
+            self._mtp_sampler_cache = (params, sampler_from_env(*params))
+        return self._mtp_sampler_cache[1]
+
+    def _mtp_uniform(self):
+        return float(torch.rand((), generator=self._mtp_rng))
+
+    def _mtp_candidates(self, K, logits=None):
+        """Per-row (values, indices) candidates for the acceptance rule.
+
+        Traced verify (`logits is None`) reads the persistent candidate buffers the graph wrote; the
+        eager path derives the SAME candidate width from the full-vocab logits with `torch.topk`, so
+        both paths hand the rule identical inputs and the eager path stays a valid reference."""
+        if logits is None:
+            v, i = self.read_verify_candidates(K)
+        else:
+            lg = from_tt(logits, self.mesh_device).reshape(K, -1).float()
+            w = min(self._samp_nc * self.SAMP_K, lg.shape[-1])
+            v, idx = torch.topk(lg, w, dim=-1)
+            i = idx.to(torch.int64)
+        return [(v[r], i[r]) for r in range(K)]
+
     def spec_decode_step(self):
         """One speculative round. Returns the list of newly emitted token ids (1..gamma+1 of them).
-        `self.t_tok` is left holding the last emitted token so the next round continues seamlessly."""
+        `self.t_tok` is left holding the last emitted token so the next round continues seamlessly.
+
+        GREEDY (`self.sampling is None`) accepts a draft iff it equals the verify row's argmax.
+        SAMPLING runs speculative sampling instead: the draft is accepted with probability p(draft)
+        under the row's truncated target distribution and a rejection emits from the residual, which
+        makes the emitted stream EXACTLY target-distributed (proof + host tests in tt/mtp_sampling.py).
+        Both rules produce the same accept-count contract, so `commit_verify` is untouched."""
         gamma = self.mtp_gamma
         # The pending token is tracked in PYTHON. Reading it back off `t_tok` every round costs a
         # blocking D2H sync, and nothing in the verify path consumes t_tok/t_curpos (verify reads the
@@ -1026,7 +1308,14 @@ class TtModel(LightweightModule):
             # first round: no backbone hidden yet for the pending token, so take one plain decode step.
             # Always eager — the captured trace is shaped for K = gamma+1 rows, not 1.
             logits, hid = self.verify_forward([cur], [self.pos])
-            a0 = int(from_tt(logits, self.mesh_device).reshape(1, -1)[0].argmax())
+            if self.sampling is None:
+                a0 = int(from_tt(logits, self.mesh_device).reshape(1, -1)[0].argmax())
+            else:  # sample it, exactly as a plain sampled decode step would
+                sm = self._mtp_sampler()
+                cv, ci = self._mtp_candidates(1, logits=logits)[0]
+                pr, ids = sm.probs(cv, ci, penalised=self._mtp_gen)
+                a0 = sm.sample(pr, ids, self._mtp_uniform())
+                self._mtp_gen.add(a0)
             self.commit_verify(1)
             self._mtp_hidden = hid
             self._mtp_cur = a0
@@ -1042,7 +1331,11 @@ class TtModel(LightweightModule):
             drafts = self.mtp_draft(self._mtp_hidden, cur, gamma)
         toks = [cur] + drafts
         positions = [self.pos + i for i in range(len(toks))]
-        if getattr(self, "mtp_verify_trace", None) is not None:
+        # Gate on the TAIL, not just "a trace exists": a sampling round replaying a greedy-tail trace
+        # would read a candidate buffer the graph never wrote. Falling back to eager verify is slow but
+        # always correct.
+        logits = None
+        if self.mtp_tail_ready():
             # traced verify: bit-exact vs the eager path (test_mtp_trace) and ~90% of the round's ops
             a = self.verify_step_traced(toks, positions)
             hid = self._m_vhidden
@@ -1050,13 +1343,25 @@ class TtModel(LightweightModule):
             logits, hid = self.verify_forward(toks, positions)
             a = from_tt(logits, self.mesh_device).reshape(len(toks), -1).argmax(dim=-1).tolist()
 
-        n = 1
-        for i in range(gamma):
-            if drafts[i] == a[i]:
-                n += 1
-            else:
-                break
-        emitted = a[:n]
+        info = None
+        if self.sampling is None:  # greedy: accept while the draft matches the row's argmax
+            n = 1
+            for i in range(gamma):
+                if drafts[i] == a[i]:
+                    n += 1
+                else:
+                    break
+            emitted = a[:n]
+        else:  # speculative SAMPLING (exact by default; see tt/mtp_sampling.py)
+            sm = self._mtp_sampler()
+            cands = self._mtp_candidates(len(toks), logits=logits)
+            # kept for inspection: the per-row target candidates this round's decisions were made
+            # from. Cheap (K x 256 host floats) and the only way a test can check "the emitted token
+            # was in the row's support" on the EAGER path, where no candidate buffer is written.
+            self._mtp_last_cands, self._mtp_last_drafts = cands, list(drafts)
+            emitted, info = sm.resolve_round(cands, drafts, self._mtp_uniform, generated=self._mtp_gen)
+            n = len(emitted)
+            self._mtp_gen.update(emitted)
         self.commit_verify(n)
         # seed the next round from the accepted prefix's last hidden and last emitted token
         self._mtp_hidden = ttnn.slice(hid, [0, 0, n - 1, 0], [1, 1, n, self.args.dim])
@@ -1066,6 +1371,19 @@ class TtModel(LightweightModule):
         st["tokens"] += n
         st["accepted"] += n - 1
         st["drafted"] += gamma
+        if info is not None:  # sampled-mode observability: how peaked the target actually was
+            st["accept_prob_sum"] = st.get("accept_prob_sum", 0.0) + sum(info["accept_probs"])
+            st["accept_tests"] = st.get("accept_tests", 0) + len(info["accept_probs"])
+            st["bonus"] = st.get("bonus", 0) + int(info["bonus"])
+            st["fallbacks"] = st.get("fallbacks", 0) + int(not info["bonus"])
+            # Divergence bookkeeping: the exact per-position TV between what the rule emitted and the
+            # target (0 for the exact rule by construction), plus how often a rule force-emitted a
+            # draft the target rated UNLIKELY — the concrete thing a non-exact rule trades away.
+            st["tv_sum"] = st.get("tv_sum", 0.0) + sum(info["tvs"])
+            acc_p = info["accept_probs"][: info["accepted"]]  # loop breaks at the first rejection
+            st["acc_p_sum"] = st.get("acc_p_sum", 0.0) + sum(acc_p)
+            st["acc_p_n"] = st.get("acc_p_n", 0) + len(acc_p)
+            st["acc_p_low"] = st.get("acc_p_low", 0) + sum(1 for x in acc_p if x < 0.1)
         return emitted
 
     def set_decode_tokens(self, token_ids):

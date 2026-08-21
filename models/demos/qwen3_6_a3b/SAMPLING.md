@@ -125,3 +125,89 @@ QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/tests/bench_decode.py \
 - `min_p` and `repetition_penalty` are not implemented (no-ops at their recommended defaults).
 - The **first** token (from prefill) is always greedy argmax; only decode tokens are sampled.
 - The presence penalty applies to generated (decode) tokens; the prompt is not included.
+
+## Speculative decode + sampling (MTP)
+
+Speculative decode (`MTP.md`, `EXPERIMENTS.md`) originally only supported **greedy** acceptance — a
+draft was accepted iff it equalled the verify row's argmax — so it could not serve the server's
+default config, which samples. It now runs **speculative sampling**, which accepts drafts while
+keeping the emitted stream **exactly** the distribution the model would have sampled from.
+
+### The rule (and why it is cheap here)
+
+The draft head picks each token by `argmax`, so the draft distribution q is a point mass at x̂.
+Speculative sampling's `min(1, p(x̂)/q(x̂))` therefore collapses to **`p(x̂)`**, and the rejection
+residual `norm((p−q)₊)` collapses to *p with x̂ removed and renormalised*:
+
+    P[emit x̂]    = p(x̂)
+    P[emit y≠x̂] = (1 − p(x̂)) · p(y)/(1 − p(x̂)) = p(y)      → exactly p
+
+So the draft graph needs **no change at all** — only the target distribution p per verify row.
+
+### Where p comes from
+
+`TtModel._verify_candidate_tail` runs the same chunked top-k the plain decode tail runs, but per verify
+row, and writes each row's 256 (value, global index) candidates into a persistent buffer. The host then
+applies presence penalty → temperature → top-k → top-p (`tt/mtp_sampling.py::SpecSampler.probs`) and
+runs the acceptance rule. Three consequences:
+
+- **temperature/top_k/top_p are NOT baked into the trace** — a request can change them with no
+  re-capture. Only greedy-vs-sampling changes the recorded graph, and that choice is made **once per
+  process**, not per request: exactly one MTP verify trace may be resident (see below), so
+  `QWEN36_MTP=1` captures the sampling tail and lets greedy requests replay it too (it writes the
+  argmax buffer as well; they just also pay the candidate topk, ~1.7 ms/round at gamma=2), while
+  `QWEN36_MTP=greedy_only` captures the greedy tail and routes sampled requests to plain decode.
+- **Truncating over candidates is exact, not approximate.** Any member of the global top-32 is in its
+  own chunk's top-32, so for `top_k ≤ 32` the truncated support is the true one. Applying the presence
+  penalty to candidates is exact for the same reason (proof in the `tt/mtp_sampling.py` docstring,
+  checked directly against a full-vocab reference in `tests/test_mtp_sampling_rule.py`).
+- The presence penalty is in fact **more** faithful than the device mask: the penalised set can include
+  tokens accepted earlier *in the same round*, which a per-step device mask cannot express.
+
+### Acceptance rules
+
+`QWEN36_MTP_ACCEPT` selects the rule:
+
+| value | behaviour | exact? |
+|---|---|---|
+| `exact` (default) | rejection sampling, accept with probability `p(x̂)` | **yes** |
+| `relaxed` | Medusa-style typical acceptance: accept when `p(x̂) ≥ min(eps, delta·e^−H(p))` (`QWEN36_MTP_RELAX_EPS`=0.09, `QWEN36_MTP_RELAX_DELTA`=0.3). Deterministic, so it pays the maximal divergence its decision allows | no — measured mean TV 0.094 |
+| `lenient` | exact rejection sampling against a *tempered* target: accept with probability `min(1, p(x̂)/QWEN36_MTP_LENIENCE)`. Lenience 1.0 IS `exact`; smaller values buy acceptance at a divergence of exactly `min(1,p/L) − p` per position | tunably — measured mean TV 0.030 (L=0.7) to 0.069 (L=0.3) |
+| `greedy` | accept iff `x̂` is the argmax (the pre-sampling rule) | n/a |
+
+### Why sampled acceptance barely costs anything
+
+Measured host-side against the real `mtp.*` head over 384 positions
+(`probe_mtp_acceptance.py score`), at the server's default `T=0.6 top_k=20 top_p=0.95`:
+
+| rule | host-model depth-1 acceptance |
+|---|--:|
+| greedy (exact match) | 0.896 |
+| exact, argmax draft (shipped) | 0.858 |
+| exact, *sampled* draft | 0.880 |
+| relaxed | 0.934 |
+
+That host model says exact should cost almost nothing, because at `T=0.6` with `top_p=0.95` the
+truncated target is extremely peaked: mean **|support| = 1.4 tokens, H(p) = 0.15 nats,
+E[p_max] = 0.936**. **On device it costs a lot more** — 2.70 → 2.30 tokens/round — because the host
+model scores an off-policy greedy trajectory while real sampled decode visits flatter states. See
+EXPERIMENTS.md for the measured numbers and the resulting shipping defaults; the short version is
+**exact sampled MTP is 1.14× and distribution-preserving**, `lenient` 1.21× and `relaxed` 1.25×. Exact was 1.00× until a verify-conv fix cut the round 66.1 -> 57.5 ms — the round cost, not the acceptance rule, was what made sampled speculation look hopeless.
+
+One design question the host model does settle: **sampling the draft on device is not worth it**
+(+0.02 acceptance for an extra per-step topk in the draft trace), so the draft stays `argmax`.
+
+### One resident trace — a hazard worth knowing about
+Capturing the verify trace while any other MTP trace is still resident produces a **silently corrupt
+trace**: the candidate rows read back as ~1e9 garbage, the acceptance rule then "samples" an
+out-of-vocab id, and handing that to `ttnn.embedding` **hangs the device** — so the symptom appears
+in the server, far from the cause. `TtModel.setup_mtp_traces` therefore releases every MTP trace
+before capturing the set, and `tests/test_mtp_trace.py::test_mtp_candidates_valid_after_a_greedy_capture`
+pins it. This is the same failure family as `forward_prefill_traced`'s multi-bucket wedge and the
+reason `capture_decode_trace` always releases the prior trace first.
+
+### Determinism
+The acceptance/residual randomness is a host `torch.Generator` seeded from the request's `seed`, so
+`seed` reproduces a run exactly (gated by `test_spec_sampling_is_seed_reproducible`). It is a different
+RNG stream from the on-device `ttnn.sampling` path, so a given seed does not produce the same text with
+and without MTP — each is reproducible on its own.

@@ -5,9 +5,9 @@ import pytest
 import torch
 
 import ttnn
-from models.common import moe_gather
 from models.common.utility_functions import comp_pcc
 from models.demos.qwen3_6_a3b.reference.qwen3_5_moe import Qwen35MoeConfig, Qwen35MoeSparseMoeBlock
+from models.demos.qwen3_6_a3b.tt import moe_gather
 from models.demos.qwen3_6_a3b.tt.common import from_tt, to_tt
 from models.demos.qwen3_6_a3b.tt.moe import TtMoE
 

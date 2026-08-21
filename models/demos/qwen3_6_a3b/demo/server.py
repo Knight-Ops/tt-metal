@@ -516,6 +516,22 @@ class Qwen36Engine:
 
         args = ModelArgs(mesh_device, ckpt_dir=ckpt, max_seq_len=max_seq)
         loader = CheckpointLoader(ckpt)
+        # Speculative decode (MTP). QWEN36_MTP: "0" off (default) | "1" on for every request |
+        # "greedy_only" on only for temperature==0. It needs the checkpoint's `mtp.*` head (+845M
+        # params and its own KV cache), a nonzero trace region, and decode tracing, so it is opt-in.
+        self.mtp_mode = os.environ.get("QWEN36_MTP", "0").lower()
+        self.mtp_gamma = int(os.environ.get("QWEN36_MTP_GAMMA", "2"))
+        self.plain_ms_per_token = None  # measured at warmup; the break-even reference for MTP
+        # Re-check every N rounds whether speculation is beating plain decode, and disengage if not.
+        # 0 disables the guard (always speculate).
+        self.mtp_check_rounds = int(os.environ.get("QWEN36_MTP_CHECK_ROUNDS", "24"))
+        self._RATE_WARM = 4  # steps/rounds skipped before timing anything (see _decode_plain)
+        self.use_mtp = self.mtp_mode in ("1", "greedy_only", "true", "on") and use_trace and loader.has_mtp()
+        if self.mtp_mode not in ("0", "false", "off") and not self.use_mtp:
+            logger.warning(
+                f"QWEN36_MTP={self.mtp_mode!r} requested but unavailable "
+                f"(has_mtp={loader.has_mtp()}, trace={use_trace}); serving without speculative decode."
+            )
         logger.info(f"Building {n_layers}-layer model ({args.model_name})...")
         t0 = time.time()
         self.model = TtModel(mesh_device, args, loader, num_layers=n_layers)
@@ -530,8 +546,58 @@ class Qwen36Engine:
         prior) decode trace; persistent caches + that release keep device memory flat across
         requests (the OOM fix)."""
         warm_ids = self.tokenizer.encode("Hello", return_tensors="pt").squeeze(0)
-        self.generate(warm_ids, 4)  # greedy tail
-        self.generate(warm_ids, 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)  # sampling tail
+        mtp, self.use_mtp = self.use_mtp, False  # the two warm generates below must stay PLAIN: they
+        try:  # compile the plain tails and provide the break-even reference _decode_mtp compares to
+            # 24 tokens, not 4: long enough for _decode_plain to record an end-to-end ms/token
+            # (it needs >16 steps), which is the reference the MTP break-even guard uses.
+            self.generate(warm_ids, 64 if mtp else 4)  # greedy tail
+            greedy_ms, greedy_e2e = self._calibrate_plain() if mtp else None, self.plain_ms_per_token
+            self.generate(warm_ids, 64 if mtp else 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)
+            sampling_ms, sampling_e2e = self._calibrate_plain() if mtp else None, self.plain_ms_per_token
+        finally:
+            self.use_mtp = mtp
+        if self.use_mtp:
+            # The reference is the tail MTP will actually be compared against: greedy_only serves
+            # temperature==0 requests, mode 1 serves sampled ones too (and the sampling tail is the
+            # slower of the two, so using it is the conservative choice there).
+            sampled_mode = self.mtp_mode in ("1", "true", "on")
+            self.plain_ms_per_token = (sampling_e2e if sampled_mode else greedy_e2e) or (
+                sampling_ms if sampled_mode else greedy_ms
+            )
+            if self.plain_ms_per_token:
+                logger.info(
+                    f"[mtp] plain decode reference {self.plain_ms_per_token:.2f} ms/token end-to-end "
+                    f"(device-only: greedy {greedy_ms:.2f}, sampling {sampling_ms:.2f})"
+                )
+            # ONE MTP warm generation, whose sampling mode picks the verify tail this process will use
+            # for its whole lifetime. Exactly one verify trace may be resident (a second one corrupts
+            # it — see TtModel.setup_mtp_decode), so the tail is a process-level choice, not a
+            # per-request one:
+            #   QWEN36_MTP=1          -> capture the SAMPLING tail; greedy requests replay it too
+            #                            (it writes the argmax buffer as well, they just also pay the
+            #                            candidate topk, ~1.7 ms/round at gamma=2).
+            #   QWEN36_MTP=greedy_only-> capture the GREEDY tail; sampled requests use plain decode.
+            n = max(self.mtp_gamma + 2, 6)  # enough rounds to get past the 2 warm/capture rounds
+            if self.mtp_mode in ("1", "true", "on"):
+                self.generate(warm_ids, n, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)
+            else:
+                self.generate(warm_ids, n)
+
+    def _calibrate_plain(self, steps: int = 24):
+        """ms/token for the plain traced decode step on this board.
+
+        Speculative decode only pays above a break-even acceptance (round_ms / plain_ms tokens per
+        round), and that ratio is board- and build-specific, so it is measured rather than assumed.
+        Runs during warmup, where mutating the decode state is harmless. Returns None if there is no
+        decode trace to replay (eager mode)."""
+        m = self.model
+        if getattr(m, "trace_id", None) is None:
+            return None
+        m.decode_step_traced()  # discard one: settles the queue after the preceding generate
+        t0 = time.time()
+        for _ in range(steps):
+            m.decode_step_traced()
+        return (time.time() - t0) / steps * 1e3
 
     def _resolve_eos_ids(self, ckpt: str) -> set:
         ids = set()
@@ -608,7 +674,9 @@ class Qwen36Engine:
         """Core generator: prefill then yield one token id per decode step.
 
         ``temperature == 0`` is greedy argmax (on device); ``> 0`` enables the on-device
-        temperature/top-k/top-p (+ presence_penalty) sampling tail. ``min_p`` and
+        temperature/top-k/top-p (+ presence_penalty) sampling tail. With ``QWEN36_MTP`` enabled the
+        decode steps are replaced by speculative rounds (``_decode_mtp``), which emit 1..gamma+1
+        tokens each and are distribution-exact for both greedy and sampled requests. ``min_p`` and
         ``repetition_penalty`` are accepted but not implemented (no-ops at their default
         0.0 / 1.0). Mirrors demo.py's loop. Stops on an EOS id, on ``max_new``, or when the
         KV / state cache would overflow ``max_seq``. Holds no lock itself — callers serialize.
@@ -643,15 +711,34 @@ class Qwen36Engine:
         next_id = int(logits[0, -1].argmax())  # first token is greedy argmax
         self.model.start_decode(next_id)
 
-        # Capture the decode trace on this request's first step, then replay it for the rest. The
-        # capture RELEASES the prior request's trace (see capture_decode_trace) so traces don't
-        # accumulate; combined with persistent caches, device memory stays flat (no OOM).
-        traced = False
+        if self._mtp_active(temperature):
+            yield from self._decode_mtp(next_id, budget)
+            return
+        yield from self._decode_plain(next_id, budget)
+
+    def _decode_plain(self, next_id: int, budget: int, traced: bool = False) -> Iterator[int]:
+        """One-token-per-step decode. Capture the decode trace on the first step, then replay it. The
+        capture RELEASES the prior request's trace (see capture_decode_trace) so traces don't
+        accumulate; combined with persistent caches, device memory stays flat (no OOM).
+
+        `traced=True` means a usable decode trace is already live — used when `_decode_mtp` disengages
+        mid-request and hands the rest of the generation over.
+
+        Also records `plain_ms_per_token` END TO END — i.e. including the caller's per-token work
+        (`_generate_text` re-decodes the whole token list each step). That is deliberately the number
+        `_decode_mtp` compares against: a speculative round pays the same host cost per token, so
+        comparing its round time against a DEVICE-only plain step would penalise it for overhead both
+        paths share. Measured here that overhead is small — 28.55 ms in decode_step vs 29.46 end-to-end,
+        so ~0.9 ms/token — but it has to be measured over enough SETTLED steps: a 16-step window
+        starting right after capture_decode_trace reads 43-46 ms/token, which is the capture's
+        snapshot/restore draining, not a real rate."""
+        t0, n, dev = None, 0, 0.0
         for step in range(budget):
             if next_id in self.eos_ids:
                 self._finish_reason = "stop"
                 return
             yield next_id
+            t_step = time.time()
             if self.use_trace and not traced:
                 next_id = self.model.decode_step_eager()  # warmup compiles kernels
                 self.model.capture_decode_trace()
@@ -660,6 +747,131 @@ class Qwen36Engine:
                 next_id = self.model.decode_step_traced()
             else:
                 next_id = self.model.decode_step_eager()
+            dev += time.time() - t_step
+            n += 1
+            # Exclude the first WARM steps, not just the first: step 1 compiles and captures, and
+            # capture_decode_trace's state snapshot/restore (~30 layers of clone+copy) is enqueued
+            # behind it, so the next few replays queue behind that work. Measured: timing from step 2
+            # over 15 steps gave 43 ms/token where the settled rate is ~29 -- enough to make the MTP
+            # break-even guard mis-fire.
+            if n == self._RATE_WARM:
+                t0, dev = time.time(), 0.0
+            elif t0 is not None and (n - self._RATE_WARM) >= 16 and (n - self._RATE_WARM) % 16 == 0:
+                timed = n - self._RATE_WARM
+                self.plain_ms_per_token = (time.time() - t0) / timed * 1e3
+                logger.debug(  # the INFO summary is warmup's "plain decode reference" line
+                    f"[plain] {timed} steps: {self.plain_ms_per_token:.2f} ms/token end-to-end "
+                    f"({dev / timed * 1e3:.2f} in decode_step, "
+                    f"{self.plain_ms_per_token - dev / timed * 1e3:.2f} host)"
+                )
+
+    def _mtp_active(self, temperature: float) -> bool:
+        """Is speculative decode used for THIS request?
+
+        ``QWEN36_MTP=1`` uses it for greedy AND sampled requests: sampled speculative decode is
+        distribution-EXACT (rejection sampling over the verify rows' own distributions,
+        tt/mtp_sampling.py), so a sampled request's output distribution is unchanged by speculation.
+        ``greedy_only`` restricts it to ``temperature == 0``, which is the conservative setting if the
+        sampled speedup ever fails to beat plain sampled decode on a given board."""
+        if not self.use_mtp:
+            return False
+        return self.mtp_mode in ("1", "true", "on") or temperature == 0
+
+    def _decode_mtp(self, first_id: int, budget: int) -> Iterator[int]:
+        """Speculative-decode drive loop: yields the prefill token then each round's emitted tokens.
+
+        A round emits 1..gamma+1 tokens at once, so EOS and the token budget have to be honoured
+        INSIDE the round: the tokens after an EOS have already been computed, but must not be emitted.
+        The same goes for the context bound — a round consumes up to gamma+1 positions, so it is only
+        started when that many fit.
+
+        Correctness note: draft quality only affects THROUGHPUT. A rejected draft is discarded and the
+        emitted token comes from the backbone's own distribution, so a stale MTP KV cache (this flow
+        does not prime the head over the prompt — ``TtMtpHead.forward_prefill`` exists for that and is
+        the acceptance-improving follow-up) can cost tokens/round but never correctness."""
+        m = self.model
+        m.build_mtp_head(gamma=self.mtp_gamma)
+        m.setup_mtp_decode()  # idempotent for a fixed gamma: keeps the traces captured at warmup
+        # Verify reads cache["conv_state"] as the gated-delta conv left-pad while plain decode
+        # reads/advances the conv_rows buffers (see model.py). After a prefill the two already agree,
+        # so this is a ~10 ms/request no-op here — kept as insurance so any future flow that
+        # interleaves plain decode steps with speculative rounds cannot silently drop conv history.
+        m.refresh_conv_state()
+        m._mtp_hidden = None
+        m.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
+        pending, n_out, rounds, t_dec, base = [first_id], 0, 0, None, (0, 0)
+        while True:
+            for tid in pending:
+                if tid in self.eos_ids:
+                    self._finish_reason = "stop"
+                    return
+                yield tid
+                n_out += 1
+                if n_out >= budget:
+                    return
+            if m.pos + m.mtp_gamma + 2 > self.max_seq:  # a round needs gamma+1 positions of headroom
+                return
+
+            if not m.mtp_tail_ready():
+                # First MTP request for this tail (warmup normally does this): two warm eager rounds
+                # then capture. The warm rounds' tokens are REAL output, so they join the stream.
+                t0 = time.time()
+                pending = m.setup_mtp_traces()
+                logger.info(
+                    f"[mtp] captured verify({m.mtp_verify_tail})/draft/commit traces in {time.time() - t0:.1f}s"
+                )
+            else:
+                pending = m.spec_decode_step()
+            rounds += 1
+            if rounds <= self._RATE_WARM:
+                # Exclude the first rounds from the rate. Round 1 is the eager K=1 seed step (no
+                # draft, and no captured trace is shaped for one row) and costs hundreds of ms, and
+                # when this request also captured, the snapshot/restore work lands in the rounds right
+                # after it. Both would otherwise be smeared over the window and make a winning
+                # configuration look like a loser.
+                t_dec, base = time.time(), (m.mtp_stats["rounds"], m.mtp_stats["tokens"])
+                continue
+            timed = m.mtp_stats["rounds"] - base[0]
+            if self.mtp_check_rounds and timed and timed % self.mtp_check_rounds == 0:
+                # Decode-only rate (the [gen] line folds in prefill and any capture). Acceptance is
+                # strongly PROMPT-dependent — measured 2.70 tok/round on one chat prompt and 2.17 on
+                # another — and a round costs ~2.3x a plain decode step, so below break-even
+                # speculation is a net LOSS. Rather than gamble on the prompt, compare the two
+                # measured rates and hand the rest of the request to plain decode when we are behind.
+                ms_round = (time.time() - t_dec) / timed * 1e3
+                tpr = (m.mtp_stats["tokens"] - base[1]) / timed
+                ms_tok = ms_round / max(tpr, 1e-9)
+                logger.info(
+                    f"[mtp] {timed} rounds, {ms_round:.1f} ms/round, {tpr:.2f} tok/round "
+                    f"-> {1000 / ms_tok:.1f} tok/s decode-only"
+                    + (f" (plain {1000 / self.plain_ms_per_token:.1f})" if self.plain_ms_per_token else "")
+                )
+                losing = self.plain_ms_per_token and ms_tok > self.plain_ms_per_token
+                # Only hand over if a plain decode trace is ALREADY live: capturing one here would
+                # capture while the MTP traces are resident, which is the condition that silently
+                # corrupts a capture (see TtModel.setup_mtp_decode). Warmup's plain generate leaves
+                # one, so this holds in practice; if it somehow does not, keep speculating.
+                if losing and self.use_trace:
+                    # STICKY: acceptance is a property of the workload more than of one prompt, and
+                    # re-engaging would cost an ~8 s MTP re-capture per request. QWEN36_MTP_CHECK_ROUNDS=0
+                    # disables the guard for an operator who wants speculation regardless.
+                    logger.warning(
+                        f"[mtp] disabling speculative decode: {ms_tok:.1f} ms/token vs plain "
+                        f"{self.plain_ms_per_token:.1f} (break-even {ms_round / self.plain_ms_per_token:.2f} "
+                        f"tok/round, got {tpr:.2f})"
+                    )
+                    self.use_mtp = False
+                    # sync_mtp_state pushes the python-tracked token/position back AND re-seeds the
+                    # decode conv add-chain from conv_state, which the speculative rounds have been
+                    # advancing instead (see TtModel.sync_mtp_state).
+                    m.sync_mtp_state()
+                    m.release_mtp_traces()  # capture the plain trace from a clean slate (see above)
+                    # _mtp_cur was already yielded, so take one step for the NEXT token, then capture
+                    # this request's own decode tail exactly as the plain path's first step does.
+                    nxt = self.model.decode_step_eager()
+                    self.model.capture_decode_trace()
+                    yield from self._decode_plain(nxt, budget - n_out, traced=True)
+                    return
 
     def _generate_text(self, ids: torch.Tensor, max_new: int, stop=None, **sampling) -> Iterator[str]:
         """Drive ``_generate_ids`` and yield the cumulative decoded text after each step.
@@ -681,7 +893,13 @@ class Qwen36Engine:
             self._n_generated = len(out_ids)
             if len(out_ids) % 128 == 0:
                 dt = time.time() - t_start
-                logger.info(f"[gen] {len(out_ids)} tok, {len(out_ids) / dt:.1f} tok/s (still generating)")
+                extra = ""
+                if self.use_mtp and (self.model.mtp_stats or {}).get("rounds"):
+                    tpr, acc, pacc = self.model.mtp_acceptance()
+                    extra = f", mtp {tpr:.2f} tok/round (accept {acc:.2f}" + (
+                        f", mean p {pacc:.3f})" if pacc is not None else ")"
+                    )
+                logger.info(f"[gen] {len(out_ids)} tok, {len(out_ids) / dt:.1f} tok/s{extra} (still generating)")
             text = self.tokenizer.decode(out_ids, skip_special_tokens=True)
             if stops:
                 cut = _earliest_stop(text, stops)
@@ -928,8 +1146,13 @@ def main():
     host = os.environ.get("QWEN36_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("QWEN36_SERVER_PORT", "8000"))
 
-    # Trace capture needs a nonzero trace region; eager-only can use 0.
-    trace_region = 200 * 1024 * 1024 if use_trace else 0
+    # Trace capture needs a nonzero trace region; eager-only can use 0. Speculative decode holds more
+    # traces concurrently than plain decode — one verify per tail kind (greedy + sampling), the draft
+    # chain, and one commit trace per accept count 1..gamma+1, on top of the decode trace — so it gets
+    # a larger default. QWEN36_TRACE_REGION (MiB) overrides; raise it if capture starts failing.
+    mtp_on = os.environ.get("QWEN36_MTP", "0").lower() not in ("0", "false", "off")
+    default_mb = 400 if mtp_on else 200
+    trace_region = int(os.environ.get("QWEN36_TRACE_REGION", default_mb)) * 1024 * 1024 if use_trace else 0
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), trace_region_size=trace_region)
     try:
         engine = Qwen36Engine(mesh, ckpt, n_layers, max_seq, use_trace)

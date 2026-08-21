@@ -52,7 +52,7 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.common import moe_gather
+from models.demos.qwen3_6_a3b.tt import moe_gather
 from models.demos.qwen3_6_a3b.tt.moe import _DENSE_TMAX, TtMoE
 
 # ---------------------------------------------------------------------------- Qwen3.6 MoE dims

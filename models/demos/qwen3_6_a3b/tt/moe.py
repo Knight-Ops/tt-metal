@@ -55,8 +55,8 @@ import torch
 from loguru import logger
 
 import ttnn
-from models.common import moe_gather
 from models.common.lightweightmodule import LightweightModule
+from models.demos.qwen3_6_a3b.tt import moe_gather
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt import signpost as sp
 from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
@@ -263,15 +263,23 @@ class TtMoE(LightweightModule):
         hi = ttnn.slice(t, [0] * (r - 1) + [half], list(sh))
         return lo, hi
 
+    # gate_up's own in0_block_w (Kt=64, so 16/32/64 all divide it). See _sparse_pc.
+    _GU_IN0BW = int(os.environ.get("QWEN36_SPARSE_IN0BW_GU", "32"))
+
     @classmethod
-    def _sparse_pc(cls, m, n):
+    def _sparse_pc(cls, m, n, in0bw=None):
         Nt = (n + 31) // 32
         cx, cy = cls._grid_for(Nt)
         # in0_block_w = K-tiles processed per K-block. Larger -> fewer K-block iterations -> fewer
         # per-block multicast-semaphore handshakes (the measured decode MoE bottleneck). Must divide
-        # Kt for both expert matmuls (gate_up Kt=64, down Kt=16 -> common divisors 1,2,4,8,16). Measured
-        # 16 > 8 at 40L: MoE 0.348 -> 0.321 ms/op (~-1.1 ms/token), PCC-identical (program config only).
-        in0bw = int(os.environ.get("QWEN36_SPARSE_IN0BW", "16"))
+        # Kt for THIS matmul. 16 was the shared cap when one config served both expert matmuls
+        # (gate_up Kt=64, down Kt=16 -> common divisors 1,2,4,8,16); measured 16 > 8 at 40L:
+        # MoE 0.348 -> 0.321 ms/op (~-1.1 ms/token), PCC-identical (program config only).
+        # But the two sparse_matmul calls take SEPARATE program configs, so gate_up (Kt=64) was never
+        # actually constrained by down's Kt=16 -> callers pass in0bw=_GU_IN0BW for gate_up. Probed
+        # (MTP.md A1b): gu/dn 32/16 runs the expert matmuls at 0.92x of 16/16 (0.3152 vs 0.3513 ms at
+        # M=32/na=32, 0.1082 vs 0.1170 at M=1); 64/16 was slightly worse than 32/16.
+        in0bw = int(os.environ.get("QWEN36_SPARSE_IN0BW", "16")) if in0bw is None else int(in0bw)
         return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
             compute_with_storage_grid_size=ttnn.CoreCoord(cx, cy),
             in0_block_w=in0bw,
@@ -315,7 +323,7 @@ class TtMoE(LightweightModule):
                 self.gate_up_sp,
                 sparsity=sparsity,
                 indices=indices,
-                program_config=self._sparse_pc(1, 2 * I),
+                program_config=self._sparse_pc(1, 2 * I, in0bw=self._GU_IN0BW),
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )  # [.., top_k, 1, 2I]
             gate, up = self._split_last(gu, I)
@@ -338,7 +346,7 @@ class TtMoE(LightweightModule):
             self.gate_up_sp,
             sparsity=sparsity,
             nnz=nnz,
-            program_config=self._sparse_pc(1, 2 * I),
+            program_config=self._sparse_pc(1, 2 * I, in0bw=self._GU_IN0BW),
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         gate, up = self._split_last(gu, I)
@@ -425,7 +433,7 @@ class TtMoE(LightweightModule):
                 self.gate_up_sp,
                 sparsity=sparsity,
                 indices=indices,
-                program_config=self._sparse_pc(K, 2 * I),
+                program_config=self._sparse_pc(K, 2 * I, in0bw=self._GU_IN0BW),
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )  # [1, na, K, 2I]
             gate, up = self._split_last(gu, I)
@@ -456,7 +464,7 @@ class TtMoE(LightweightModule):
             self.gate_up_sp,
             sparsity=sparsity,
             nnz=None,
-            program_config=self._sparse_pc(32, 2 * I),
+            program_config=self._sparse_pc(32, 2 * I, in0bw=self._GU_IN0BW),
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         gate, up = self._split_last(gu, I)

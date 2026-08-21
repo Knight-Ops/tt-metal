@@ -19,6 +19,7 @@ import ttnn
 from models.demos.qwen3_6_a3b.tt.load_checkpoints import CheckpointLoader
 from models.demos.qwen3_6_a3b.tt.model import TtModel
 from models.demos.qwen3_6_a3b.tt.model_config import ModelArgs
+from models.demos.qwen3_6_a3b.tt.mtp_sampling import SpecSampler
 
 CKPT = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
 
@@ -147,3 +148,129 @@ def test_mtp_full_traced_round_matches_eager(mesh_device):
         f"fully-traced rounds diverged at token {div}: "
         f"eager {eager[max(0,div-2):div+3]} vs traced {traced[max(0,div-2):div+3]}"
     )
+
+
+@torch.no_grad()
+@pytest.mark.parametrize("gamma", [1, 2])
+def test_mtp_verify_candidates_match_eager_topk(mesh_device, gamma):
+    """The SAMPLING verify tail must hand back exactly the target distribution's top candidates.
+
+    Speculative sampling is only distribution-exact if p really is the model's own truncated
+    distribution, so the device tail (per-row pad -> chunked topk -> global index offsets -> concat)
+    is checked against `torch.topk` of the EAGER full-vocab verify logits. The decisive assertion is
+    the VALUE/INDEX PAIRING: `logits[row, returned_index] == returned_value`. That is what catches
+    both failure modes this tail can have -- a wrong per-chunk index offset, and the TILE-layout
+    cross-row reshape that scrambled candidates in the batched decode path -- and unlike a set
+    comparison it is immune to the many exact ties bf16 logits have across a 248k vocab.
+
+    Note what the tail does NOT return: the global top-256. It returns each of the 8 vocab chunks'
+    own top-32, which is a different set whenever one chunk holds more than 32 of the global top-256.
+    That is exactly the shipping decode tail's design, and it is exact where it matters: any member of
+    the global top-32 is necessarily in its OWN chunk's top-32, so for `top_k <= SAMP_K` the truncated
+    distribution is the true one. Hence the value assertion below is on the top-SAMP_K prefix, and the
+    real check is that the truncated distribution the host rule derives from the device candidates
+    equals the one it derives from the full-vocab logits.
+    """
+    args = ModelArgs(mesh_device, ckpt_dir=CKPT, max_seq_len=int(os.environ.get("QWEN36_MAX_SEQ", "256")))
+    loader = CheckpointLoader(CKPT)
+    if not loader.has_mtp():
+        pytest.skip("checkpoint has no mtp.* head")
+    model = TtModel(mesh_device, args, loader, num_layers=int(os.environ.get("QWEN36_LAYERS", "4")))
+    torch.manual_seed(0)
+    prompt = torch.randint(0, args.vocab_size, (1, 16))
+
+    model.enable_sampling(0.6, 20, 0.95, seed=0)  # selects the candidate tail; also builds _samp_* tables
+    lg = model.forward(prompt)
+    model.start_decode(int(lg[0, -1].argmax()))
+    model.build_mtp_head(gamma=gamma)
+    K = model.setup_mtp_decode()
+    assert model._mtp_tail() == "sampling"
+
+    toks = [int(ttnn.to_torch(model.t_tok).reshape(-1)[0])] + [7 + i for i in range(gamma)]
+    positions = [model.pos + i for i in range(K)]
+
+    lgv, _ = model.verify_forward(toks, positions)  # eager reference (leaves state untouched)
+    ref = torch.as_tensor(ttnn.to_torch(lgv)).reshape(K, -1).float()
+
+    model.capture_mtp_verify_trace(toks, positions)
+    model.verify_step_traced(toks, positions)
+    v, i = model.read_verify_candidates(K)
+    W = v.shape[1]
+    assert W == model._samp_nc * model.SAMP_K, (W, model._samp_nc, model.SAMP_K)
+    rv, ri = ref.topk(W, dim=-1)
+
+    sm = SpecSampler(temperature=0.6, top_k=20, top_p=0.95)
+    for r in range(K):
+        assert int(i[r].min()) >= 0 and int(i[r].max()) < args.vocab_size, "candidate index out of vocab"
+        paired = ref[r, i[r]]
+        assert torch.allclose(
+            paired, v[r], atol=1e-6
+        ), f"row {r}: value/index pairing broken, max delta {float((paired - v[r]).abs().max()):.4f}"
+        got = torch.sort(v[r], descending=True).values[: model.SAMP_K]
+        assert torch.allclose(got, rv[r][: model.SAMP_K], atol=1e-6), (
+            f"row {r}: the global top-{model.SAMP_K} is not fully present in the candidates "
+            f"(max delta {float((got - rv[r][: model.SAMP_K]).abs().max()):.4f})"
+        )
+        p_dev, id_dev = sm.probs(v[r], i[r])
+        p_ref, id_ref = sm.probs(rv[r], ri[r])
+        print(f"[trace] gamma={gamma} row {r}: |support| {id_dev.numel()}  p_max {float(p_dev[0]):.4f}")
+        assert torch.allclose(p_dev, p_ref, atol=1e-6), f"row {r}: truncated distribution differs"
+        # Identical ids too, unless the kept prefix holds an exact logit tie (bf16 over a 248k vocab
+        # has many), in which case which index wins is arbitrary and does not change p.
+        if p_dev.numel() == 1 or bool((p_dev[:-1] > p_dev[1:]).all()):
+            assert id_dev.tolist() == id_ref.tolist(), f"row {r}: truncated support differs"
+
+
+@torch.no_grad()
+def test_mtp_candidates_valid_after_a_greedy_capture(mesh_device):
+    """REGRESSION: only ONE MTP trace set may be resident when the verify trace is captured.
+
+    Capturing the sampling verify trace while a previous round's traces were still resident produced a
+    silently CORRUPT trace: the candidate rows read back as ~1e9 garbage, the acceptance rule then
+    "sampled" an out-of-vocab id, and feeding that to ttnn.embedding HUNG the device — a failure that
+    looks like a hang in the server, miles from its cause. `setup_mtp_traces` now releases everything
+    first; this test pins that down by doing the exact sequence that used to fail (capture the greedy
+    tail, run rounds, then switch to sampling and capture again).
+
+    The assertion is deliberately crude — every candidate index must be a real vocab id — because that
+    is precisely what the corruption violated, and it is what protects the device from the hang.
+    """
+    args = ModelArgs(mesh_device, ckpt_dir=CKPT, max_seq_len=int(os.environ.get("QWEN36_MAX_SEQ", "256")))
+    loader = CheckpointLoader(CKPT)
+    if not loader.has_mtp():
+        pytest.skip("checkpoint has no mtp.* head")
+    model = TtModel(mesh_device, args, loader, num_layers=int(os.environ.get("QWEN36_LAYERS", "4")))
+    torch.manual_seed(0)
+    prompt = torch.randint(0, args.vocab_size, (1, 16))
+
+    def run(temperature):
+        model.enable_sampling(temperature, 20, 0.95, 0, 0.0)
+        model.build_mtp_head(gamma=2)
+        lg = model.forward(prompt)
+        model.start_decode(int(lg[0, -1].argmax()))
+        model.setup_mtp_decode()
+        model._mtp_hidden = None
+        model.setup_mtp_traces()
+        return model.spec_decode_step()
+
+    greedy = run(0.0)
+    assert model.mtp_verify_tail == "greedy"
+    assert all(0 <= t < args.vocab_size for t in greedy), greedy
+
+    sampled = run(1.0)  # the switch that used to corrupt the newly captured trace
+    assert model.mtp_verify_tail == "sampling"
+    v, i = model.read_verify_candidates()
+    print(
+        f"[trace] after greedy->sampling switch: emitted {sampled}  "
+        f"cand idx range [{int(i.min())}, {int(i.max())}]  values [{float(v.min()):.2f}, {float(v.max()):.2f}]"
+    )
+    assert int(i.min()) >= 0 and int(i.max()) < args.vocab_size, (
+        f"candidate indices outside the vocab ([{int(i.min())}, {int(i.max())}]) — the verify trace was "
+        f"captured while other traces were resident and is corrupt"
+    )
+    assert all(0 <= t < args.vocab_size for t in sampled), f"emitted an out-of-vocab id: {sampled}"
+    # a greedy round must still be servable by the sampling-tail trace (it writes _m_argmax too)
+    model.enable_sampling(0.0, 0, 1.0, 0, 0.0)
+    assert model.mtp_tail_ready(), "a greedy round must be able to replay the sampling-tail trace"
+    again = model.spec_decode_step()
+    assert all(0 <= t < args.vocab_size for t in again), again
