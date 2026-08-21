@@ -999,17 +999,41 @@ def _stream_chat(
 
     parser = _ChatStreamParser(tools, expect_thinking=expect_thinking)
     full = ""
+    role_sent = False
+
+    def with_role(delta):
+        """Emit the assistant-role chunk lazily, immediately before the first real delta.
+
+        It used to be yielded BEFORE generation started, which made any client that times
+        "time to first chunk" measure the HTTP round-trip instead of time-to-first-token —
+        llama-benchy read 24 ms on a 4096-token prefill and reported 324k tok/s prefill from it
+        (the honest figure was its own e2e_ttft, 5.85 s). The wire format is unchanged: the first
+        chunk a client sees still carries the role, it just arrives when the first token does."""
+        nonlocal role_sent
+        out = [] if role_sent else [chunk({"role": "assistant"})]
+        role_sent = True
+        return out + [chunk(delta)]
+
     with eng.lock:
-        # first chunk announces the assistant role
-        yield chunk({"role": "assistant"})
         for full in eng._generate_text(ids, max_new, stop=stop, **sampling):
             for kind, payload in parser.push(full):
-                yield chunk(to_delta(kind, payload))
+                yield from with_role(to_delta(kind, payload))
         for kind, payload in parser.finish():
-            yield chunk(to_delta(kind, payload))
+            yield from with_role(to_delta(kind, payload))
         finish = "tool_calls" if parser.any_tool else eng._finish_reason
+    if not role_sent:  # empty generation: still hand the client a well-formed stream
+        yield chunk({"role": "assistant"})
     _log_chat_response(full, finish, None)  # raw stream text; tool calls were streamed as deltas
-    yield chunk({}, finish)
+    # `usage` on the terminal chunk (OpenAI puts it on a trailing choices-[] chunk under
+    # stream_options.include_usage; attaching it here avoids an empty-choices chunk that naive
+    # clients mis-handle). Without it, benchmark tools fall back to re-tokenizing the text locally.
+    yield _sse(
+        {
+            **base,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+            "usage": _usage(int(ids.shape[-1]), eng._n_generated),
+        }
+    )
     yield "data: [DONE]\n\n"
 
 
@@ -1023,7 +1047,14 @@ def _stream_completion(
         for piece in eng.stream_text(ids, max_new, stop=stop, **sampling):
             yield _sse({**base, "choices": [{"index": 0, "text": piece, "finish_reason": None}]})
         finish = eng._finish_reason
-    yield _sse({**base, "choices": [{"index": 0, "text": "", "finish_reason": finish}]})
+    # usage here too, for the same reason as the chat stream (see _stream_chat)
+    yield _sse(
+        {
+            **base,
+            "choices": [{"index": 0, "text": "", "finish_reason": finish}],
+            "usage": _usage(int(ids.shape[-1]), eng._n_generated),
+        }
+    )
     yield "data: [DONE]\n\n"
 
 
