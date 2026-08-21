@@ -1,14 +1,3 @@
-<!-- Source of truth for the model card published at the ROOT of
-     https://huggingface.co/Adartras/qwen3.6-a3b-blackhole (README.md).
-
-     Not staged into the bundle: `tt-kernel push` writes vllm_bundle/ + tt_kernel_manifest.json and
-     never touches the card, so edit here and upload separately:
-         hf upload Adartras/qwen3.6-a3b-blackhole \
-             models/demos/qwen3_6_a3b/packaging/HF_MODEL_CARD.md README.md --repo-type model
-
-     Keep the frontmatter to `tags:` ONLY. `tt-kernel push` calls hub.tag_repo(), which reloads the
-     card and replaces card.data with ModelCardData(tags=...) -- it merges tags but DROPS any other
-     frontmatter key (license, base_model, pipeline_tag). The body is preserved. -->
 ---
 tags:
 - tenstorrent
@@ -21,6 +10,19 @@ tags:
 - moe
 - speculative-decoding
 ---
+<!-- NOTE: the frontmatter above must stay the very FIRST bytes of this file -- the hub
+     ignores it otherwise. Keep editor notes below this line. -->
+<!-- Source of truth for the model card published at the ROOT of
+     https://huggingface.co/Adartras/qwen3.6-a3b-blackhole (README.md).
+
+     Not staged into the bundle: `tt-kernel push` writes vllm_bundle/ + tt_kernel_manifest.json and
+     never touches the card, so edit here and upload separately:
+         hf upload Adartras/qwen3.6-a3b-blackhole \
+             models/demos/qwen3_6_a3b/packaging/HF_MODEL_CARD.md README.md --repo-type model
+
+     Keep the frontmatter to `tags:` ONLY. `tt-kernel push` calls hub.tag_repo(), which reloads the
+     card and replaces card.data with ModelCardData(tags=...) -- it merges tags but DROPS any other
+     frontmatter key (license, base_model, pipeline_tag). The body is preserved. -->
 
 # Qwen3.6-35B-A3B on Tenstorrent Blackhole (p150)
 
