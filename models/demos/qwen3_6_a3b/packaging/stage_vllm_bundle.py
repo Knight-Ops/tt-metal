@@ -69,6 +69,19 @@ BUNDLE_SUBDIR = SRC_DIR / "packaging" / "vllm_bundle"
 # Entry modules of the adapter's closure. `models.tt_transformers.tt.generator` is deliberately
 # absent: it is host-resolved (see the module docstring).
 ENTRY_MODULES = [f"{SRC_PKG}.tt.model", f"{SRC_PKG}.tt.model_config", f"{SRC_PKG}.tt.load_checkpoints"]
+# Also vendored: the standalone OpenAI-compatible server and the CLI demo. Nothing in the vLLM path
+# imports these -- they ship so the artifact is self-sufficient for the one thing vLLM cannot do on
+# this backend, speculative decode (MTP is unreachable through the plugin: it asserts no
+# speculative_config, its runner is one-token-per-step, and vLLM has no hook to advance the
+# gated-delta recurrent state by an accepted count). Their extra third-party deps
+# (fastapi / uvicorn / transformers) are needed ONLY if you run them, so they cost the vLLM path
+# nothing but disk.
+SERVER_MODULES = [
+    f"{SRC_PKG}.demo.server",
+    f"{SRC_PKG}.demo.demo",
+    f"{SRC_PKG}.demo.runner",
+    f"{SRC_PKG}.demo.generate_weight_cache",
+]
 # Namespace-package levels that must NOT get an __init__.py.
 NAMESPACE_DIRS = {Path("models")}
 # The ONLY `models.*` modules the bundle may resolve from the serve host. Anything else must be
@@ -201,7 +214,7 @@ def main() -> int:
         staged_docs += src.name != ADAPTER
 
     # 2. the model package, remapped SRC_DIR -> DST_DIR
-    closure = compute_closure(repo, ENTRY_MODULES)
+    closure = compute_closure(repo, ENTRY_MODULES + SERVER_MODULES)
     for rel in closure:
         dst = out / DST_DIR / Path(rel).relative_to(SRC_DIR)
         dst.parent.mkdir(parents=True, exist_ok=True)
@@ -234,7 +247,8 @@ def main() -> int:
     py = sorted(out.rglob("*.py"))
     print(f"staged {out}")
     print(f"  bundle docs        : {staged_docs}")
-    print(f"  vendored modules   : {len(closure)} (+ adapter)")
+    n_server = sum(1 for rel in closure if "/demo/" in rel)
+    print(f"  vendored modules   : {len(closure)} (+ adapter)  [{n_server} standalone-server]")
     print(f"  data files         : {n_data}")
     print(f"  __init__.py created: {n_init}")
     print(f"  total python       : {sum(f.stat().st_size for f in py) / 1024:.0f} KB in {len(py)} files")

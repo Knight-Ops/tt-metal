@@ -114,8 +114,9 @@ calibrates the plain decode rate at warmup and automatically disengages if specu
 
 ## Speculative decoding is standalone-server only
 
-`tt/mtp.py` and `tt/mtp_sampling.py` **are** in this bundle, but nothing in the vLLM path calls them,
-and setting `QWEN36_MTP` under vLLM does nothing. Three reasons, in increasing order of difficulty:
+The MTP code and the server that drives it are both **in this bundle**, but nothing in the vLLM path
+calls them, and setting `QWEN36_MTP` under vLLM does nothing. Three reasons, in increasing order of
+difficulty:
 
 1. `vllm-tt-plugin/platform.py` hard-asserts `not vllm_config.speculative_config`
    ("Speculative decoding is not yet supported for TT backend").
@@ -130,21 +131,47 @@ vLLM upstream does have the framework (`v1/spec_decode/`, `method: "mtp"`, a hos
 and even a `qwen3_5_mtp.py` head), so this is wiring rather than invention — but the wiring belongs in
 the plugin, not in this bundle.
 
-### Running the MTP server
+### Running the MTP server — straight from this bundle
 
-The standalone server is **not part of this bundle** — it lives in the tt-metal checkout that produced
-it, at `models/demos/qwen3_6_a3b/demo/server.py` (needs `fastapi`, `uvicorn`, `transformers`). From
-that checkout:
+`demo/server.py` ships here, so no separate checkout of the model code is needed. One-time setup:
 
 ```bash
+pip install fastapi uvicorn transformers          # needed only by the server, not by vLLM
+hf download Qwen/Qwen3.6-35B-A3B --local-dir ~/models/qwen36
+tt-kernel serve Adartras/qwen3.6-a3b-blackhole    # or `tt-kernel pull` — just to place the bundle
+```
+
+Then run the server out of the pulled bundle:
+
+```bash
+BUNDLE=~/.cache/tt-kernel/bundles/Adartras__qwen3.6-a3b-blackhole
+
+PYTHONPATH=$BUNDLE \
+QWEN36_CKPT=~/models/qwen36 \
 QWEN36_MTP=greedy_only \
 QWEN36_LAYERS=40 \
 QWEN36_MAX_SEQ=8192 \
-python models/demos/qwen3_6_a3b/demo/server.py
+python -m models.qwen3_6_a3b.demo.server
 ```
 
-It exposes the same OpenAI-compatible `/v1/chat/completions` and `/v1/completions`, one request at a
-time:
+It needs `ttnn` installed the usual way — from a tt-metal checkout, which puts that checkout on
+`sys.path` (`ttnn-custom.pth`) and so supplies the one host-resolved module this bundle expects. First
+start builds the 40-layer model and warms the traces (~1 min warm weight cache), then reports the
+calibrated plain-decode rate it will hold speculation against.
+
+Two more entry points ship alongside it:
+
+```bash
+# CLI generation with MTP + the honest tokens/round and break-even report
+PYTHONPATH=$BUNDLE QWEN36_CKPT=~/models/qwen36 python -m models.qwen3_6_a3b.demo.demo \
+    --prompt "Explain speculative decoding." --gen 64 --mtp
+
+# pre-build the on-disk weight cache so later loads skip the 72 GB HF read
+PYTHONPATH=$BUNDLE QWEN36_CKPT=~/models/qwen36 python -m models.qwen3_6_a3b.demo.generate_weight_cache
+```
+
+The server exposes the same OpenAI-compatible `/v1/chat/completions` and `/v1/completions` as the vLLM
+path, one request at a time:
 
 ```bash
 curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '{
@@ -160,6 +187,8 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
 | `QWEN36_MTP_CHECK_ROUNDS` | `24` | re-check interval for the break-even guard; `0` disables it |
 | `QWEN36_MAX_SEQ` | `8192` | KV / recurrent-state cache length |
 | `QWEN36_EXPERT_DTYPE` | `bf4` | routed-expert precision |
+| `QWEN36_CKPT` | `~/models/qwen36` | local HF checkpoint directory (weights + tokenizer) |
+| `QWEN36_SERVER_PORT` | `8000` | listen port (`QWEN36_SERVER_HOST` for the bind address) |
 
 `QWEN36_MTP` selects **which requests speculate** — it never changes sampling behaviour. A
 `temperature=0.6` request under `greedy_only` is served by the normal sampled path with full
@@ -186,10 +215,16 @@ Two numerical regimes are worth knowing:
 
 ## Bundle contents
 
-`vllm_bundle/models/qwen3_6_a3b/` — the vLLM adapter (`generator_vllm.py`) plus the ttnn model:
-`tt/model.py`, `gated_delta.py`, `ttl_delta.py`, `moe.py`, `moe_gather.py`, `attention.py`,
-`decoder.py`, `rms_norm.py`, `mtp.py`, `mtp_sampling.py`, `model_config.py`, `load_checkpoints.py`, and
-a torch reference. `tt_kernel_manifest.json` at the repo root carries a per-file `sha256`.
+`vllm_bundle/models/qwen3_6_a3b/` holds three things:
+
+- **the vLLM adapter** — `generator_vllm.py`, the class the plugin registers;
+- **the ttnn model** — `tt/model.py`, `gated_delta.py`, `ttl_delta.py`, `moe.py`, `moe_gather.py`,
+  `attention.py`, `decoder.py`, `rms_norm.py`, `mtp.py`, `mtp_sampling.py`, `model_config.py`,
+  `load_checkpoints.py`, plus a torch reference;
+- **the standalone server** — `demo/server.py`, `demo/demo.py`, `demo/runner.py`,
+  `demo/generate_weight_cache.py`. Unused by vLLM; they exist so MTP is runnable from this repo alone.
+
+`tt_kernel_manifest.json` at the repo root carries a per-file `sha256`.
 
 Exactly **two** modules resolve from the serve host, both genuine tt-metal code:
 `models.common.lightweightmodule` and `models.tt_transformers.tt.generator`. Everything else is

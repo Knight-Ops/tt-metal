@@ -35,6 +35,11 @@ from pathlib import Path
 
 DST_PKG = "models.qwen3_6_a3b"
 ENTRIES = [f"{DST_PKG}.tt.model", f"{DST_PKG}.tt.model_config", f"{DST_PKG}.tt.load_checkpoints"]
+# The standalone server/demo ship in the bundle but need fastapi/uvicorn/transformers, which the vLLM
+# path does not. Checked BEST-EFFORT: a missing third-party dep is reported and skipped, while a broken
+# `models.*` import still fails -- otherwise the one code path that is only reachable by hand would be
+# the one nothing verifies.
+OPTIONAL_ENTRIES = [f"{DST_PKG}.demo.server", f"{DST_PKG}.demo.demo"]
 # What a serve host legitimately supplies (mirrors stage_vllm_bundle.HOST_RESOLVED).
 HOST_OK = {"models.common.lightweightmodule", "models.tt_transformers.tt.generator"}
 
@@ -62,6 +67,21 @@ def main() -> int:
             print(f"FAIL: import {mod}: {type(exc).__name__}: {exc}", file=sys.stderr)
             return 1
 
+    skipped = []
+    for mod in OPTIONAL_ENTRIES:
+        try:
+            importlib.import_module(mod)
+        except ModuleNotFoundError as exc:
+            missing = (exc.name or "").split(".")[0]
+            if missing and missing != "models":  # a third-party dep, not a bundle problem
+                skipped.append(f"{mod} (needs {missing})")
+                continue
+            print(f"FAIL: import {mod}: {exc}", file=sys.stderr)
+            return 1
+        except Exception as exc:  # noqa: BLE001
+            print(f"FAIL: import {mod}: {type(exc).__name__}: {exc}", file=sys.stderr)
+            return 1
+
     bad, n_bundle, n_host = [], 0, 0
     for name, m in sorted(sys.modules.items()):
         if not name.startswith("models.") or m is None:
@@ -77,7 +97,9 @@ def main() -> int:
         else:
             bad.append((name, str(p)))
 
-    print(f"imported {len(ENTRIES)} entry modules")
+    print(f"imported {len(ENTRIES)} entry + {len(OPTIONAL_ENTRIES) - len(skipped)} optional modules")
+    for s_ in skipped:
+        print(f"  skipped            : {s_}")
     print(f"  from bundle        : {n_bundle}")
     print(f"  from host (allowed): {n_host}  {sorted(HOST_OK & set(sys.modules))}")
     if bad:
