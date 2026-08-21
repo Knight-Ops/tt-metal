@@ -92,8 +92,7 @@ def sweep_rules_paired(model, tok, gamma, rounds, specs, base_ref, samp, round_m
     model.build_mtp_head(gamma=gamma)
     model.release_mtp_traces()
     ids = _prompt(tok, PROMPTS[0])
-    lg = model.forward(ids)
-    model.start_decode(int(lg[0, -1].argmax()))
+    _prefill(model, ids, prime=_PRIME)
     model.setup_mtp_decode()
     model._mtp_hidden = None
     model.set_mtp_sampler(_make_rule("exact", *samp))  # reference trajectory: the exact rule
@@ -152,6 +151,10 @@ def sweep_rules_paired(model, tok, gamma, rounds, specs, base_ref, samp, round_m
     return rows
 
 
+_PRIME = True  # set from --no-prime in main(); mirrors the server default (QWEN36_MTP_PRIME=1)
+_PROMPT_TOKENS = 0  # set from --prompt-tokens; 0 = the prompt as written
+
+
 def sweep_rules(model, tok, gamma, rounds, specs, base_ref, samp):
     """Measure every acceptance rule against ONE captured trace set.
 
@@ -163,8 +166,7 @@ def sweep_rules(model, tok, gamma, rounds, specs, base_ref, samp):
     model.build_mtp_head(gamma=gamma)
     model.release_mtp_traces()
     ids = _prompt(tok, PROMPTS[0])
-    lg = model.forward(ids)
-    model.start_decode(int(lg[0, -1].argmax()))
+    _prefill(model, ids, prime=_PRIME)
     model.setup_mtp_decode()
     model._mtp_hidden = None
     warm = model.setup_mtp_traces()  # capture ONCE; every rule below replays it
@@ -180,8 +182,7 @@ def sweep_rules(model, tok, gamma, rounds, specs, base_ref, samp):
     for spec in specs:
         model.set_mtp_sampler(_make_rule(spec, *samp))
         ids = _prompt(tok, PROMPTS[0])
-        lg = model.forward(ids)  # fresh sequence per rule, so they all start from the same prefix
-        model.start_decode(int(lg[0, -1].argmax()))
+        _prefill(model, ids, prime=_PRIME)  # fresh sequence per rule: same prefix, same head cache
         model.setup_mtp_decode()
         model._mtp_hidden = None
         model.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
@@ -219,7 +220,116 @@ def sweep_rules(model, tok, gamma, rounds, specs, base_ref, samp):
     return rows
 
 
+def sweep_prime(model, tok, gamma, rounds, base_ref):
+    """PAIRED A/B of MTP-head priming (TtModel.prime_mtp): same model, same captured traces, same
+    prompt -- priming is the only difference.
+
+    Paired because the earlier unpaired rule sweep taught the lesson the hard way: tokens/round is a
+    mean over Bernoulli acceptances, and a short window of it is wide enough to invert a real ordering.
+
+    ABBA-scheduled (cold, primed, primed, cold) because a straight A-then-B run cannot separate the
+    effect from any monotone drift across the run, and the first two attempts at this measurement --
+    both A-then-B -- put priming 0.11-0.13 tok/round BEHIND, which is exactly the size an ordering
+    artefact could manufacture. Two blocks per arm in mirrored order cancels a linear trend, and the
+    per-block numbers are printed so a nonlinear one is visible rather than averaged away.
+
+    Priming cannot change WHAT is emitted (a rejected draft is discarded and the token comes from the
+    backbone's own distribution), so tokens/round is the whole of the effect."""
+    model.build_mtp_head(gamma=gamma)
+    model.release_mtp_traces()
+    ids = _prompt(tok, PROMPTS[0])
+    _prefill(model, ids, prime=False)
+    model.setup_mtp_decode()
+    model._mtp_hidden = None
+    warm = model.setup_mtp_traces()  # ONE trace set, replayed by every block
+    print(f"\n[bench_mtp] prime A/B: captured verify({model.mtp_verify_tail})/draft/commit, {len(warm)} warm tokens")
+
+    SCHEDULE = (False, True, True, False)
+    per_block = max(1, rounds // 2)  # each arm gets two blocks, so 2*per_block rounds per arm
+    hdr = f"{'block':>7}{'head cache':>12}{'primed':>8}{'tok/round':>15}{'accept':>8}{'ms/round':>10}{'ms/token':>10}"
+    print(hdr)
+    print("-" * len(hdr))
+    acc, msr = {False: [], True: []}, {False: [], True: []}
+    for b, prime in enumerate(SCHEDULE):
+        ids = _prompt(tok, PROMPTS[0])
+        n_primed = _prefill(model, ids, prime=prime)
+        model.setup_mtp_decode()
+        model._mtp_hidden = None
+        model.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
+        for _ in range(3):
+            model.spec_decode_step()  # eager seed round + settle after the re-prefill
+        st0, counts = dict(model.mtp_stats), []
+        ttnn.synchronize_device(model.mesh_device)
+        t0 = time.time()
+        for _ in range(per_block):
+            counts.append(len(model.spec_decode_step()))
+        dt = time.time() - t0
+        st = model.mtp_stats
+        tpr = sum(counts) / per_block
+        acc[prime].extend(counts)
+        ms_round = dt / per_block * 1e3
+        msr[prime].append(ms_round)
+        a = (st["accepted"] - st0["accepted"]) / max(st["drafted"] - st0["drafted"], 1)
+        print(
+            f"{b:>7}{'primed' if prime else 'cold':>12}{n_primed:>8}{tpr:>11.3f}    {a:>8.2f}"
+            f"{ms_round:>10.1f}{ms_round / tpr:>10.2f}",
+            flush=True,
+        )
+
+    out = {}
+    print()
+    for prime in (False, True):
+        c = acc[prime]
+        m = sum(c) / len(c)
+        var = sum((x - m) ** 2 for x in c) / max(len(c) - 1, 1)
+        se = (var / len(c)) ** 0.5
+        ms_round = sum(msr[prime]) / len(msr[prime])
+        out[prime] = (m, se, ms_round / m)
+        print(
+            f"  {'primed' if prime else 'cold':>6}: {m:.3f}+-{se:.3f} tok/round over {len(c)} rounds"
+            f"  ({ms_round:.1f} ms/round -> {ms_round / m:.2f} ms/token, {base_ref / (ms_round / m):.2f}x base)"
+        )
+    (m0, se0, t0_), (m1, se1, t1) = out[False], out[True]
+    d, sed = m1 - m0, (se0**2 + se1**2) ** 0.5
+    print(
+        f"\n  delta {d:+.3f} tok/round +- {sed:.3f} ({abs(d) / sed if sed else 0:.1f} sigma), {t0_ / t1:.3f}x on ms/token"
+    )
+    # The +- above pools rounds as if independent, which they are not: acceptance drifts with sequence
+    # position, so BLOCK-to-block spread runs wider than round-level noise predicts (measured: the two
+    # cold blocks came in at 2.424 and 2.792, a spread as large as the effect). Print it, so nobody
+    # reads the pooled sigma as the real confidence -- the trustworthy signal is the SIGN agreeing
+    # across runs with different prompt lengths, round counts and orderings.
+    blocks = {k: [sum(acc[k][i::2]) / len(acc[k][i::2]) for i in range(2)] for k in (False, True)}
+    print(
+        f"  block spread: cold {blocks[False][0]:.3f}/{blocks[False][1]:.3f}, primed {blocks[True][0]:.3f}/{blocks[True][1]:.3f}"
+    )
+    print("  Priming is throughput-only: it cannot change which tokens are emitted, only how many a")
+    print("  round gets to skip. Trust the sign across runs before the magnitude of any one.")
+    return out
+
+
+def _prefill(model, ids, prime=True):
+    """Prefill + start_decode, priming the MTP head's KV cache when asked (the server's default).
+
+    Priming needs the prefill to keep its per-position post-final-norm hidden, which is opted into
+    BEFORE the prefill runs -- so every measured path has to go through here or it silently measures a
+    cold head cache. Returns the number of primed rows (0 = not primed)."""
+    model._keep_prefill_hidden = bool(prime) and getattr(model, "mtp", None) is not None
+    lg = model.forward(ids)
+    first = int(lg[0, -1].argmax())
+    model.start_decode(first)
+    n = model.prime_mtp(ids, first) if model._keep_prefill_hidden else 0
+    model._keep_prefill_hidden = False
+    model._prefill_hidden = None
+    return n
+
+
 def _prompt(tok, text):
+    if _PROMPT_TOKENS:
+        # Repeat the question until the chat-templated prompt is about _PROMPT_TOKENS long. Crude, but
+        # it lengthens the CONTEXT without changing what is being asked, which is what priming acts on.
+        n = max(1, _PROMPT_TOKENS // max(len(tok.encode(text)), 1))
+        text = " ".join([text] * n)
     enc = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True, return_tensors="pt")
     ids = enc["input_ids"] if hasattr(enc, "keys") else enc
     if not torch.is_tensor(ids):
@@ -241,6 +351,23 @@ def main():
     ap.add_argument("--top-p", type=float, default=0.95)
     ap.add_argument("--presence-penalty", type=float, default=0.0)
     ap.add_argument("--seed", type=int, default=1234)
+    ap.add_argument(
+        "--no-prime",
+        action="store_true",
+        help="drop MTP-head priming (TtModel.prime_mtp), i.e. draft from a cold head KV cache",
+    )
+    ap.add_argument(
+        "--prime-ab",
+        action="store_true",
+        help="paired A/B of priming on vs off, sharing one model + one captured trace set",
+    )
+    ap.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=0,
+        help="lengthen the prompt to about this many tokens (repeats the prompt text). Priming scales "
+        "with prompt length, so a 40-token prompt is the weakest possible test of it",
+    )
     # Acceptance-rule sweep. The captured verify trace is rule-INDEPENDENT (it only emits candidates),
     # so every rule is measured in ONE process against ONE capture: no rebuild, no re-capture, and the
     # numbers are directly comparable. Entries: exact | relaxed | greedy | lenient[:VALUE].
@@ -251,6 +378,9 @@ def main():
         help="comma-separated acceptance rules to sweep, e.g. exact,relaxed,lenient:0.5",
     )
     a = ap.parse_args()
+    global _PRIME, _PROMPT_TOKENS
+    _PRIME = not a.no_prime
+    _PROMPT_TOKENS = a.prompt_tokens
 
     from transformers import AutoTokenizer
 
@@ -279,8 +409,7 @@ def main():
 
         # ---- eager baseline decode, for an apples-to-apples eager comparison ----
         ids = _prompt(tok, PROMPTS[0])
-        lg = model.forward(ids)
-        model.start_decode(int(lg[0, -1].argmax()))
+        _prefill(model, ids, prime=_PRIME)
         model.decode_step_eager()  # warm/compile
         t0 = time.time()
         for _ in range(a.baseline_steps):
@@ -288,6 +417,12 @@ def main():
         base_ms = (time.time() - t0) / a.baseline_steps * 1e3
         print(f"\n  eager baseline decode: {base_ms:.1f} ms/token ({1000/base_ms:.1f} tok/s)")
         print(f"  (traced baseline for reference: {BASE_STEP_MS:.2f} ms/token " f"= {1000/BASE_STEP_MS:.1f} tok/s)\n")
+
+        if a.prime_ab:
+            for gamma in [int(g) for g in a.gammas.split(",")]:
+                print(f"\n===== gamma={gamma} (K={gamma + 1}) =====", flush=True)
+                sweep_prime(model, tok, gamma, a.rounds, base_ref)
+            return
 
         if a.rules:
             specs = [r.strip() for r in a.rules.split(",") if r.strip()]
@@ -313,8 +448,7 @@ def main():
             for mode in ("eager", "verify", "full"):
                 model.release_mtp_traces()  # each mode starts from no traces (and never leaks one)
                 ids = _prompt(tok, PROMPTS[0])
-                lg = model.forward(ids)
-                model.start_decode(int(lg[0, -1].argmax()))
+                _prefill(model, ids, prime=_PRIME)
                 model._mtp_hidden = None
                 # Same number of warm rounds in EVERY mode: the traced modes need two eager rounds
                 # before capture (K=1 seed, then a K-row verify so `_verify_pending` holds the K-shaped

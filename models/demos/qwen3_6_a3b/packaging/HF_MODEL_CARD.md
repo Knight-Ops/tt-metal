@@ -187,6 +187,7 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
 | `QWEN36_MTP_GAMMA` | `2` | draft depth. Measured optimum — `>=4` is measurably *worse* |
 | `QWEN36_MTP_ACCEPT` | `exact` | `exact` (distribution-preserving) / `lenient` (+`QWEN36_MTP_LENIENCE`, default 0.5) / `relaxed` |
 | `QWEN36_MTP_CHECK_ROUNDS` | `24` | how often (in rounds) the server logs speculative vs plain decode; `0` silences it |
+| `QWEN36_MTP_PRIME` | `0` | prime the draft head's KV cache over the prompt. Off because it is **measured 16% slower** (2.61 → 2.25 tok/round): a cold cache attenuates the head's attention branch, and the head drafts better without it. Kept for reproducibility |
 | `QWEN36_MTP_AUTODISABLE` | `0` (off) | loss ratio at which the server gives up on speculation mid-request, e.g. `1.15` = only when it is >=15% slower. Off by default: a 24-round window cannot resolve a few percent, and disengaging is sticky for the process |
 | `QWEN36_MAX_SEQ` | `8192` | KV / recurrent-state cache length |
 | `QWEN36_EXPERT_DTYPE` | `bf4` | routed-expert precision |

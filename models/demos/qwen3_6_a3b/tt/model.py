@@ -189,6 +189,10 @@ class TtModel(LightweightModule):
     # activations/attention past ~1-2K). forward() routes there above this length; QWEN36_PREFILL_CHUNK
     # sets the chunk size. The threshold stays above the chunk so the per-chunk single-shot calls don't recurse.
     _PREFILL_CHUNK = int(os.environ.get("QWEN36_PREFILL_CHUNK", "512"))
+    # Set by a caller that intends to prime the MTP head (see prime_mtp) BEFORE it calls a prefill;
+    # the prefill then leaves the per-position post-final-norm hidden in _prefill_hidden.
+    _keep_prefill_hidden = False
+    _prefill_hidden = None
     _LONG_PREFILL_THRESHOLD = int(os.environ.get("QWEN36_LONG_PREFILL_THRESHOLD", "2048"))
 
     def forward(self, input_ids: torch.Tensor):
@@ -219,6 +223,13 @@ class TtModel(LightweightModule):
             cos, sin = precompute_rope(T, self.args.rotary_dim, self.args.rope_theta, self.mesh_device)
         for layer, cache in zip(self.layers, self.caches):
             x = layer.forward_prefill(x, cos, sin, cache)
+        if self._keep_prefill_hidden:
+            # The per-position POST-final-norm hidden, for prime_mtp. This is the only moment it
+            # exists: _head slices to the last row BEFORE the norm (a T-fold lm_head + D2H saving),
+            # so nothing downstream can reconstruct it. Opt-in because it is dead weight (one T-row
+            # RMSNorm and a [1,1,T,dim] tensor) for any request that will not speculate.
+            with sp.region("prefill.keep_hidden"):
+                self._prefill_hidden = self.final_norm.forward(x)
         with prof.phase(self.mesh_device, "head"), sp.region("head"):
             out = self._head(x, T)
         prof.report()
@@ -251,6 +262,10 @@ class TtModel(LightweightModule):
             logits = self.forward_incremental(input_ids[:, P : P + M])  # carries state; self.pos -> P+M
         if T > n_full:  # ragged final block (T mod M tokens); forward_incremental pads it internally
             logits = self.forward_incremental(input_ids[:, n_full:T], ragged=True)
+        # _prefill_single stashed a hidden for the FIRST CHUNK only, and the later chunks' hiddens were
+        # never materialised — priming off that would feed the head a truncated prompt while claiming
+        # the whole one. Drop it: prime_mtp then no-ops and long prompts keep today's behaviour.
+        self._prefill_hidden = None
         return logits
 
     # ---- Traced prefill (additive; mirrors capture_decode_trace). Prefill is ~54% host-dispatch over
@@ -370,6 +385,12 @@ class TtModel(LightweightModule):
                 ttnn.copy(self._pf_conv_zero, cache["conv_state"])
         ttnn.execute_trace(self.mesh_device, self._pf_traces[B], cq_id=0, blocking=False)
         self.pos = T
+        if self._keep_prefill_hidden:
+            # Same stash as _prefill_single, sliced to the REAL length first: rows T..B-1 are padding.
+            # Kept in step with the eager path so enabling prefill tracing cannot silently turn
+            # MTP priming off.
+            real = ttnn.slice(self._pf_out[B], [0, 0, 0, 0], [1, 1, T, self.args.dim])
+            self._prefill_hidden = self.final_norm.forward(real)
         return self._head(self._pf_out[B], T)  # head slices the REAL last token (T-1), not the bucket
 
     def forward_incremental(self, input_ids: torch.Tensor, ragged: bool = False):
@@ -771,6 +792,102 @@ class TtModel(LightweightModule):
         self._mtp_hidden = None  # backbone hidden that predicted the pending token
         self.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
         return self.mtp
+
+    def prime_mtp(self, input_ids: torch.Tensor, first_id: int) -> int:
+        """Prime the MTP head's own KV cache over the prompt. Returns the number of primed rows
+        (0 = did not run). Requires ``_keep_prefill_hidden`` set before the prefill, and the head built.
+
+        MEASURED RESULT FIRST: priming makes drafting WORSE, so it is default-off in the server
+        (QWEN36_MTP_PRIME=0). Paired ABBA A/B at 40L, gamma=2, 1024-token prompt, 250 rounds per arm,
+        one model and one captured trace set shared by both arms:
+
+            cold cache   2.608 tok/round   19.60 ms/token
+            primed       2.252 tok/round   23.41 ms/token     -0.356 tok/round, 0.837x
+
+        Three runs (40/250 rounds, 40/992 primed rows, both orderings) all put priming behind, and the
+        ABBA control ruled out run-order drift -- the LAST block, cold, was the best of the four, so
+        ordering had been masking part of the effect rather than manufacturing it. Notably the deficit
+        did not grow with prompt length: 992 primed rows cost the same as 40, which is the opposite of
+        what "the head needs more context" predicts.
+
+        WHY IT LOSES -- and why the obvious reasoning had it backwards. The tempting argument is that a
+        cold cache leaves the first draft attending over zero rows, and that those rows steal softmax
+        mass from the one genuine signal (the ``(h_i, t_{i+1})`` pair arriving through ``fc``). The
+        dilution is real; the CONSEQUENCE is the opposite of harmful. Every K/V row below `pos` is
+        EXACTLY zero, so every score is exactly zero and the softmax spreads near-uniformly over ~pos
+        zero-valued V rows: the attention output is attenuated toward zero, roughly as 1/pos. A cold
+        head therefore collapses to ``fc(h_i, t_{i+1}) + MoE`` with its attention branch effectively
+        switched off -- and that drafts BETTER than the head with real context. Which makes sense once
+        stated: h_i is the post-final-norm backbone hidden, so it already carries the entire prompt
+        through 40 layers. The head's single attention layer has little left to add, and evidently adds
+        noise. Priming switches that branch back on, and costs 16%.
+
+        Corollary worth knowing even though priming is off: the cold head is not a position-invariant
+        baseline either, since its attention attenuation scales with pos. It behaves differently at
+        pos=10 than at pos=1000.
+
+        SO WHAT IS THIS STILL DOING HERE. It is the reproduction harness for the finding
+        (bench_mtp.py --prime-ab) and the answer to an obvious "did you try priming the head?". It is
+        also safe to leave in: draft quality is a THROUGHPUT property only -- a rejected draft is
+        discarded and the emitted token comes from the backbone's own distribution -- so this can never
+        change what the model emits, and it is eager, prefill-time, outside every captured trace.
+
+        MECHANICS. The head is one full-attention layer with a PRIVATE cache (``self.mtp_kv``,
+        allocated as ``ttnn.zeros`` in build_mtp_head) that nothing else ever writes -- the backbone's
+        prefill fills the backbone's caches. This runs ``TtMtpHead.forward_prefill`` over the prompt for
+        its KV-cache side effect alone.
+
+        POSITIONS — the part that is easy to get wrong. Per tt/mtp.py the head's row i consumes
+        ``(h_i, embed(t_{i+1}))`` and predicts t_{i+2}. But the ROW INDEX and the KV/RoPE POSITION the
+        decode path gives it differ by one: ``_m_pos_*`` is shared with verify (which needs true
+        absolute backbone positions), and the draft chain slices entry j of it, so a draft whose pair is
+        contract row ``pos-1+j`` is stored at head position ``pos+j``. That offset is invisible today
+        because a cold cache has no other rows for it to be relative to — but the moment anything else
+        is in the cache, priming must adopt the same convention or every relative distance is off by
+        one. So contract row i is written at head position i+1, and head position 0 gets a duplicate of
+        contract row 0 as filler (one real-but-repeated row, versus a zero row that would attract
+        softmax mass).
+
+        We can prime contract rows 0..T-1, i.e. head positions 1..T:
+          * rows 0..T-2 come entirely from the prompt;
+          * row T-1 is ``(h_{T-1}, t_T)`` where t_T is the token the prefill just produced — passed in
+            as `first_id`. Priming it matters: the head's first write of its own is at position pos+1
+            = T+1 (round 1 is a K=1 backbone seed step that does not run the head at all), so skipping
+            row T-1 would leave a zero row at position T, immediately adjacent to the first query,
+            where RoPE weights it most. With it, primed rows and drafted rows are contiguous.
+
+        SAFETY. Draft quality is a THROUGHPUT property only — a rejected draft is discarded and the
+        emitted token comes from the backbone's own distribution — so this cannot change what the model
+        emits, only how fast. It is eager and prefill-time, outside every captured trace, so it needs no
+        re-capture and cannot interact with the trace-capture hazard. Stale rows past T are left alone,
+        exactly as before: decode overwrites them as it advances.
+        """
+        h, self._prefill_hidden = self._prefill_hidden, None  # consume: never prime off a stale hidden
+        if h is None or getattr(self, "mtp", None) is None:
+            return 0
+        T, dim = int(input_ids.shape[1]), self.args.dim
+        S = T + 1  # filler row + contract rows 0..T-1
+        if T < 1 or S > int(self.mtp_kv[0].shape[2]):
+            return 0
+        with sp.region("mtp.prime"):
+            # hidden: [h_0, h_0, h_1, ..., h_{T-1}] -- h_0 duplicated as the position-0 filler
+            hs = ttnn.concat([ttnn.slice(h, [0, 0, 0, 0], [1, 1, 1, dim]), h], dim=2)
+            # tokens: [t_1, t_1, ..., t_{T-1}, t_T] -- the SHIFTED half, ending in the prefill's output
+            tok = torch.cat(
+                [
+                    input_ids[:, 1:2] if T > 1 else torch.tensor([[first_id]]),
+                    input_ids[:, 1:T],
+                    torch.tensor([[first_id]]),
+                ],
+                dim=1,
+            )
+            emb = self._embed(tok, S)
+            cos, sin = precompute_rope(S, self.args.rotary_dim, self.args.rope_theta, self.mesh_device)
+            # Output discarded: forward_prefill is run for its KV-cache side effect alone (its logits
+            # would predict t_2..t_{T+1}, and we already know all but the last).
+            self.mtp.forward_prefill(hs, emb, cos, sin, self.mtp_kv)
+        self.mtp_primed = S
+        return S
 
     def setup_mtp_decode(self):
         """Allocate the persistent, stable-address buffers a captured speculative round needs.

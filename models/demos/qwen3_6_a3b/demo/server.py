@@ -534,6 +534,12 @@ class Qwen36Engine:
         # and it must hold for QWEN36_MTP_AUTODISABLE_WINDOWS consecutive windows.
         self.mtp_autodisable = float(os.environ.get("QWEN36_MTP_AUTODISABLE", "0") or 0)
         self.mtp_autodisable_windows = max(1, int(os.environ.get("QWEN36_MTP_AUTODISABLE_WINDOWS", "2")))
+        # Prime the draft head's own KV cache over the prompt before drafting (TtModel.prime_mtp).
+        # DEFAULT OFF, and that is a MEASURED result, not caution: priming costs 0.356 tok/round
+        # (2.608 -> 2.252 at gamma=2, 40L, ABBA-scheduled) = 16% of decode throughput. It is kept as a
+        # knob because the finding is worth being able to reproduce -- see TtModel.prime_mtp for why
+        # feeding the head real context makes it draft WORSE.
+        self.mtp_prime = os.environ.get("QWEN36_MTP_PRIME", "0") == "1"
         self._RATE_WARM = 4  # steps/rounds skipped before timing anything (see _decode_plain)
         self.use_mtp = self.mtp_mode in ("1", "greedy_only", "true", "on") and use_trace and loader.has_mtp()
         if self.mtp_mode not in ("0", "false", "off") and not self.use_mtp:
@@ -713,6 +719,12 @@ class Qwen36Engine:
 
         # Prefill: eager by default (reuses persistent caches -> no leak); bucketed traced replay
         # only when the experimental QWEN36_SERVER_PREFILL_TRACE flag is set.
+        #
+        # Speculating on this request means the prefill must ALSO leave behind its per-position
+        # post-final-norm hidden, which is the input prime_mtp needs and which the head slices away
+        # otherwise. Decided here, before the prefill runs, and paid only by requests that will use it.
+        mtp = self._mtp_active(temperature)
+        self.model._keep_prefill_hidden = mtp and self.mtp_prime
         if self.use_prefill_trace:
             logits = self.model.forward_prefill_traced(ids)  # prefill -> [1, 1, vocab] host logits
         else:
@@ -720,9 +732,11 @@ class Qwen36Engine:
         next_id = int(logits[0, -1].argmax())  # first token is greedy argmax
         self.model.start_decode(next_id)
 
-        if self._mtp_active(temperature):
-            yield from self._decode_mtp(next_id, budget)
+        self.model._keep_prefill_hidden = False  # never carry the request-scoped flag forward
+        if mtp:
+            yield from self._decode_mtp(next_id, budget, ids)
             return
+        self.model._prefill_hidden = None  # not speculating: drop it rather than pin a [1,1,T,dim]
         yield from self._decode_plain(next_id, budget)
 
     def _decode_plain(self, next_id: int, budget: int, traced: bool = False) -> Iterator[int]:
@@ -797,7 +811,7 @@ class Qwen36Engine:
             return 0
         return streak + 1
 
-    def _decode_mtp(self, first_id: int, budget: int) -> Iterator[int]:
+    def _decode_mtp(self, first_id: int, budget: int, prompt_ids: torch.Tensor) -> Iterator[int]:
         """Speculative-decode drive loop: yields the prefill token then each round's emitted tokens.
 
         A round emits 1..gamma+1 tokens at once, so EOS and the token budget have to be honoured
@@ -806,9 +820,8 @@ class Qwen36Engine:
         started when that many fit.
 
         Correctness note: draft quality only affects THROUGHPUT. A rejected draft is discarded and the
-        emitted token comes from the backbone's own distribution, so a stale MTP KV cache (this flow
-        does not prime the head over the prompt — ``TtMtpHead.forward_prefill`` exists for that and is
-        the acceptance-improving follow-up) can cost tokens/round but never correctness."""
+        emitted token comes from the backbone's own distribution, so an ill-informed MTP KV cache can
+        cost tokens/round but never correctness. That is what makes priming it (below) a free bet."""
         m = self.model
         m.build_mtp_head(gamma=self.mtp_gamma)
         m.setup_mtp_decode()  # idempotent for a fixed gamma: keeps the traces captured at warmup
@@ -817,6 +830,16 @@ class Qwen36Engine:
         # so this is a ~10 ms/request no-op here — kept as insurance so any future flow that
         # interleaves plain decode steps with speculative rounds cannot silently drop conv history.
         m.refresh_conv_state()
+        # Off by default -- MEASURED to cost 16% of decode throughput, see TtModel.prime_mtp. Kept
+        # reachable so the result stays reproducible. No-ops for a long (chunked) prompt anyway.
+        if self.mtp_prime:
+            primed = m.prime_mtp(prompt_ids, first_id)
+            logger.info(
+                f"[mtp] primed the draft head over {primed} prompt positions "
+                f"(QWEN36_MTP_PRIME=1; measured 16% SLOWER than a cold head cache)"
+                if primed
+                else "[mtp] priming declined (chunked prefill or 1-token prompt)"
+            )
         m._mtp_hidden = None
         m.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
         pending, n_out, rounds, t_dec, base = [first_id], 0, 0, None, (0, 0)

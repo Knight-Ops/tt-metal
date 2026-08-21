@@ -327,6 +327,60 @@ Two smaller things fell out of the same debugging:
   raw-text prompt over its first 48 tokens (0.93x — the `<think>` boundary and cold start dominate a
   short run). Quote the steady-state number, never promise it for every prompt.
 
+## Negative result: priming the MTP head's KV cache over the prompt costs 16%
+
+The draft head is one full-attention layer with a PRIVATE KV cache (`mtp_kv`) that nothing ever wrote:
+the backbone's prefill fills the backbone's caches. So every draft attended over zeroed rows, and
+`TtMtpHead.forward_prefill` -- whose own docstring says it exists "to PRIME the head's own KV cache
+over the prompt" -- was never called by any serving path. Priming it looked like free acceptance,
+especially since the ~2.5 tok/round the 1.17x rests on was measured WITH context
+(`probe_mtp_acceptance._chain_alpha` builds a 96-token teacher-forced prefix for exactly that reason,
+and its `--warmup` flag exists to skip the cold-cache positions).
+
+Built it (`TtModel.prime_mtp`, `QWEN36_MTP_PRIME`) and measured it. It is a **16% LOSS**:
+
+| head cache | tok/round | ms/token | vs traced base |
+|---|---|---|---|
+| cold (default) | **2.608 ± 0.044** | **19.60** | 1.46x |
+| primed (992 rows) | 2.252 ± 0.049 | 23.41 | 1.22x |
+
+40L, gamma=2, greedy, 1024-token prompt, 250 rounds/arm, ONE model + ONE captured trace set shared by
+both arms (`bench_mtp.py --prime-ab`). Three runs -- 40 and 250 rounds, 40 and 992 primed rows, both
+orderings -- all put priming behind. The deficit did **not** grow with prompt length, which is the
+opposite of what "the head needs more context" predicts.
+
+The measurement needed an ABBA schedule to be trustworthy, and the control paid for itself in an
+unexpected direction. Two straight A-then-B runs gave -0.125 and -0.112 tok/round; ABBA
+(cold, primed, primed, cold) gave **-0.356 ± 0.066**, because the LAST block, cold, was the best of the
+four (2.792) -- run-order drift had been *masking* most of the effect, not manufacturing it. Caveat on
+that sigma: it pools rounds as if independent, and the two cold blocks (2.424 / 2.792) spread as widely
+as the effect itself, so the trustworthy signal is the SIGN agreeing across every run, not the
+magnitude of any one.
+
+**Why it loses, and why the obvious reasoning had it backwards.** The tempting argument -- the one this
+change was built on -- is that zeroed rows steal softmax mass from the head's one genuine signal, the
+`(h_i, t_{i+1})` pair arriving through `fc`. The dilution is real; the *consequence* is inverted. Every
+K/V row below `pos` is EXACTLY zero, so every score is exactly zero and the softmax spreads
+near-uniformly over ~pos zero-valued V rows: the attention output is attenuated toward zero, roughly as
+1/pos. **A cold head silently collapses to `fc(h_i, t_{i+1}) + MoE` with its attention branch switched
+off -- and that drafts better.** Which makes sense once stated: `h_i` is the post-final-norm backbone
+hidden, so it already carries the whole prompt through 40 layers. The head's single attention layer has
+little left to add, and evidently adds noise. Priming switches the branch back on.
+
+Two things worth keeping from this:
+- the cold head is not a position-invariant baseline either -- its attenuation scales with `pos`, so it
+  behaves differently at pos=10 than at pos=1000. Any future acceptance work should account for that.
+- the fencepost here is genuinely subtle and is now pinned by tests. `_m_pos_*` is shared with verify
+  (which needs true absolute backbone positions), so the draft chain stores the pair for contract row
+  `pos-1+j` at head position `pos+j` -- a +1 offset that is INVISIBLE while the cache is cold, because
+  there is nothing for the rows to be relative to. `tests/test_mtp_prime.py` asserts primed and drafted
+  rows form one contiguous prefix; removing the filler row makes it report exactly the predicted hole
+  (`zero row(s) inside the written prefix 0..28: [24]`, T=24).
+
+Kept as a default-off knob rather than deleted: it is the reproduction harness for the finding and the
+answer to an obvious "did you try priming the head?". Fourth time on this project a plausible mechanism
+has lost to measurement, after conv-fold, norm sharding and the "fast fused chunk_state kernel".
+
 ## Serving integration: measure the break-even, but do NOT act on it by default
 
 Because acceptance swings across that 2.0-2.7 range and break-even is 2.21, `QWEN36_MTP=1` on its own
