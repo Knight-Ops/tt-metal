@@ -190,9 +190,16 @@ packaging/vllm_bundle/
   generator_vllm.py       # the adapter (+ any deps)
 ```
 ```bash
+# --bundle-dir must be the STAGED directory, NEVER packaging/vllm_bundle itself: the checked-in
+# folder holds only the adapter, so pushing it publishes a bundle with no model code. Both steps
+# below are load-bearing -- the stager fails on host-only imports and the validator proves
+# self-containment by import. The v4 bundle shipped broken because neither check existed.
+python models/demos/qwen3_6_a3b/packaging/stage_vllm_bundle.py --out /tmp/qwen36_bundle
+python models/demos/qwen3_6_a3b/packaging/validate_bundle.py  --bundle /tmp/qwen36_bundle
+
 tt-kernel push <ns>/qwen3.6-a3b-blackhole --backend vllm \
-  --bundle-dir models/demos/qwen3_6_a3b/packaging/vllm_bundle \
-  --weights Qwen/Qwen3.6-35B-A3B
+  --manifest models/demos/qwen3_6_a3b/packaging/qwen36_v4_manifest.json \
+  --bundle-dir /tmp/qwen36_bundle
 ```
 Kernels-less (the plugin JITs at warmup); co-version `ttnn` + `ttl`. Serving host needs the
 TT vLLM fork/plugin (present here) + `tt-api`.
