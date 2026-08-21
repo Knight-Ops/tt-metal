@@ -184,7 +184,8 @@ curl localhost:8000/v1/chat/completions -H 'content-type: application/json' -d '
 | `QWEN36_MTP` | `0` | `greedy_only` speculates on `temperature==0` requests (**recommended**); `1` also on sampled requests |
 | `QWEN36_MTP_GAMMA` | `2` | draft depth. Measured optimum — `>=4` is measurably *worse* |
 | `QWEN36_MTP_ACCEPT` | `exact` | `exact` (distribution-preserving) / `lenient` (+`QWEN36_MTP_LENIENCE`, default 0.5) / `relaxed` |
-| `QWEN36_MTP_CHECK_ROUNDS` | `24` | re-check interval for the break-even guard; `0` disables it |
+| `QWEN36_MTP_CHECK_ROUNDS` | `24` | how often (in rounds) the server logs speculative vs plain decode; `0` silences it |
+| `QWEN36_MTP_AUTODISABLE` | `0` (off) | loss ratio at which the server gives up on speculation mid-request, e.g. `1.15` = only when it is >=15% slower. Off by default: a 24-round window cannot resolve a few percent, and disengaging is sticky for the process |
 | `QWEN36_MAX_SEQ` | `8192` | KV / recurrent-state cache length |
 | `QWEN36_EXPERT_DTYPE` | `bf4` | routed-expert precision |
 | `QWEN36_CKPT` | `~/models/qwen36` | local HF checkpoint directory (weights + tokenizer) |

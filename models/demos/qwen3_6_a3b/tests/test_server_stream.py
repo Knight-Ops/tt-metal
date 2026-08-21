@@ -15,6 +15,7 @@ A stub engine is enough to assert them, so this runs anywhere in milliseconds.
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 
 import torch
 
@@ -110,3 +111,40 @@ def test_completion_stream_reports_usage():
     ev = _events(list(srv._stream_completion(_StubEngine(["p", "q"]), ids, 16, "m")))
     assert ev[0]["choices"][0]["text"] == "p", "first completion chunk should be real text"
     assert ev[-1]["usage"] == {"prompt_tokens": 5, "completion_tokens": 2, "total_tokens": 7}, ev[-1]
+
+
+# --------------------------------------------------------------------------------------------------
+# MTP auto-disengage guard. The guard once fired on a 0.6% difference (34.8 vs 34.6 ms/token) inside
+# a benchmark client's own warm-up request and, being sticky for the process, served every subsequent
+# timed request without speculation. These pin it OFF by default. The method is called unbound on a
+# stub because it reads only the two knobs -- no device, no model.
+# --------------------------------------------------------------------------------------------------
+
+
+def _guard(margin, streak, ratio):
+    """Consecutive-losing-window count after one window measuring `ratio` x plain decode."""
+    stub = SimpleNamespace(mtp_autodisable=margin)
+    return srv.Qwen36Engine._mtp_losing_streak(stub, ratio, streak)
+
+
+def test_guard_never_trips_by_default():
+    """Default (margin 0 = off): no ratio, however bad, accumulates a streak."""
+    for ratio in (1.006, 1.5, 4.0, None):
+        for streak in (0, 1, 7):
+            assert _guard(0.0, streak, ratio) == 0
+
+
+def test_guard_ignores_losses_inside_the_margin():
+    """Opted in at 15%: a near-tie -- the case that actually misfired -- still does not count."""
+    assert _guard(1.15, 0, 34.8 / 34.6) == 0
+    assert _guard(1.15, 3, 1.14) == 0  # and it RESETS a streak built up earlier
+
+
+def test_guard_requires_consecutive_windows():
+    """A genuine, sustained loss accumulates; the caller trips at mtp_autodisable_windows."""
+    assert _guard(1.15, 0, 1.30) == 1
+    assert _guard(1.15, 1, 1.30) == 2
+
+
+def test_guard_counts_a_loss_exactly_at_the_margin():
+    assert _guard(1.15, 0, 1.15) == 1

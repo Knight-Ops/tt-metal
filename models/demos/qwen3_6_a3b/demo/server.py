@@ -522,9 +522,18 @@ class Qwen36Engine:
         self.mtp_mode = os.environ.get("QWEN36_MTP", "0").lower()
         self.mtp_gamma = int(os.environ.get("QWEN36_MTP_GAMMA", "2"))
         self.plain_ms_per_token = None  # measured at warmup; the break-even reference for MTP
-        # Re-check every N rounds whether speculation is beating plain decode, and disengage if not.
-        # 0 disables the guard (always speculate).
+        # Report the measured speculative-vs-plain rate every N rounds. 0 silences the report.
         self.mtp_check_rounds = int(os.environ.get("QWEN36_MTP_CHECK_ROUNDS", "24"))
+        # Acting on that report -- disengaging speculation mid-request -- is OPT-IN and OFF by
+        # default. A 24-round window on one prompt is a noisy estimate of a rate whose two sides sit
+        # within a few percent of each other, and disengaging is sticky for the process, so a
+        # near-tie measured inside a benchmark client's own warm-up request would silently serve
+        # every subsequent (timed) request without speculation. Observed exactly that: "34.8 ms/token
+        # vs plain 34.6" -- a 0.6% difference -- turned MTP off for the server's whole lifetime.
+        # The value is the loss RATIO required to act (1.15 = only when speculation is >=15% slower),
+        # and it must hold for QWEN36_MTP_AUTODISABLE_WINDOWS consecutive windows.
+        self.mtp_autodisable = float(os.environ.get("QWEN36_MTP_AUTODISABLE", "0") or 0)
+        self.mtp_autodisable_windows = max(1, int(os.environ.get("QWEN36_MTP_AUTODISABLE_WINDOWS", "2")))
         self._RATE_WARM = 4  # steps/rounds skipped before timing anything (see _decode_plain)
         self.use_mtp = self.mtp_mode in ("1", "greedy_only", "true", "on") and use_trace and loader.has_mtp()
         if self.mtp_mode not in ("0", "false", "off") and not self.use_mtp:
@@ -777,6 +786,17 @@ class Qwen36Engine:
             return False
         return self.mtp_mode in ("1", "true", "on") or temperature == 0
 
+    def _mtp_losing_streak(self, ratio: Optional[float], streak: int) -> int:
+        """Count of CONSECUTIVE measurement windows in which speculation has been behind plain decode
+        by at least the configured margin; 0 resets the streak.
+
+        Returns 0 unconditionally when auto-disengage is off (``QWEN36_MTP_AUTODISABLE`` unset, the
+        default), so the streak can never reach the trigger and speculation stays engaged for the
+        process's lifetime no matter what a single window measures."""
+        if not (self.mtp_autodisable and ratio and ratio >= self.mtp_autodisable):
+            return 0
+        return streak + 1
+
     def _decode_mtp(self, first_id: int, budget: int) -> Iterator[int]:
         """Speculative-decode drive loop: yields the prefill token then each round's emitted tokens.
 
@@ -800,6 +820,7 @@ class Qwen36Engine:
         m._mtp_hidden = None
         m.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
         pending, n_out, rounds, t_dec, base = [first_id], 0, 0, None, (0, 0)
+        losing_windows = 0
         while True:
             for tid in pending:
                 if tid in self.eos_ids:
@@ -836,27 +857,29 @@ class Qwen36Engine:
                 # Decode-only rate (the [gen] line folds in prefill and any capture). Acceptance is
                 # strongly PROMPT-dependent — measured 2.70 tok/round on one chat prompt and 2.17 on
                 # another — and a round costs ~2.3x a plain decode step, so below break-even
-                # speculation is a net LOSS. Rather than gamble on the prompt, compare the two
-                # measured rates and hand the rest of the request to plain decode when we are behind.
+                # speculation is a net LOSS. This reports that comparison every window; whether to
+                # ACT on it is the operator's call (self.mtp_autodisable, default off).
                 ms_round = (time.time() - t_dec) / timed * 1e3
                 tpr = (m.mtp_stats["tokens"] - base[1]) / timed
                 ms_tok = ms_round / max(tpr, 1e-9)
+                ratio = ms_tok / self.plain_ms_per_token if self.plain_ms_per_token else None
                 logger.info(
                     f"[mtp] {timed} rounds, {ms_round:.1f} ms/round, {tpr:.2f} tok/round "
                     f"-> {1000 / ms_tok:.1f} tok/s decode-only"
-                    + (f" (plain {1000 / self.plain_ms_per_token:.1f})" if self.plain_ms_per_token else "")
+                    + (f" (plain {1000 / self.plain_ms_per_token:.1f}, {1 / ratio:.2f}x)" if ratio else "")
                 )
-                losing = self.plain_ms_per_token and ms_tok > self.plain_ms_per_token
+                losing_windows = self._mtp_losing_streak(ratio, losing_windows)
                 # Only hand over if a plain decode trace is ALREADY live: capturing one here would
                 # capture while the MTP traces are resident, which is the condition that silently
                 # corrupts a capture (see TtModel.setup_mtp_decode). Warmup's plain generate leaves
                 # one, so this holds in practice; if it somehow does not, keep speculating.
-                if losing and self.use_trace:
+                if losing_windows >= self.mtp_autodisable_windows and self.use_trace:
                     # STICKY: acceptance is a property of the workload more than of one prompt, and
-                    # re-engaging would cost an ~8 s MTP re-capture per request. QWEN36_MTP_CHECK_ROUNDS=0
-                    # disables the guard for an operator who wants speculation regardless.
+                    # re-engaging would cost an ~8 s MTP re-capture per request. This is why the
+                    # threshold is opt-in -- one bad window should not decide the process's lifetime.
                     logger.warning(
-                        f"[mtp] disabling speculative decode: {ms_tok:.1f} ms/token vs plain "
+                        f"[mtp] disabling speculative decode ({losing_windows} windows >= "
+                        f"{self.mtp_autodisable:.2f}x): {ms_tok:.1f} ms/token vs plain "
                         f"{self.plain_ms_per_token:.1f} (break-even {ms_round / self.plain_ms_per_token:.2f} "
                         f"tok/round, got {tpr:.2f})"
                     )

@@ -327,18 +327,38 @@ Two smaller things fell out of the same debugging:
   raw-text prompt over its first 48 tokens (0.93x — the `<think>` boundary and cold start dominate a
   short run). Quote the steady-state number, never promise it for every prompt.
 
-## Serving integration: a break-even guard, because MTP is a bet on the prompt
+## Serving integration: measure the break-even, but do NOT act on it by default
 
 Because acceptance swings across that 2.0-2.7 range and break-even is 2.21, `QWEN36_MTP=1` on its own
-would sometimes make the server SLOWER. So `demo/server.py` measures both rates live and disengages:
+can sometimes make the server SLOWER. So `demo/server.py` measures both rates live:
 
 - warmup calibrates the plain traced decode step on THIS board — measured **28.51-28.64 ms/token**,
   reproducing `bench_decode.py`'s 28.65 to 0.1%, which is a nice independent check of both harnesses;
-- every `QWEN36_MTP_CHECK_ROUNDS` (24) rounds `_decode_mtp` compares its own ms/token against that
-  reference and, if it is behind, calls `sync_mtp_state()`, releases the MTP traces, captures a plain
-  decode trace and finishes the request on the plain path — sticky for the process, since acceptance is
-  a property of the workload and re-engaging would cost an ~8 s re-capture per request.
-  `QWEN36_MTP_CHECK_ROUNDS=0` disables the guard.
+- every `QWEN36_MTP_CHECK_ROUNDS` (24) rounds `_decode_mtp` logs its own ms/token against that
+  reference, as a ratio.
+
+**Acting on it is opt-in, and that is a correction of the original design.** The first version
+disengaged automatically whenever a window came in behind, and it misfired immediately:
+
+```
+[mtp] disabling speculative decode: 34.8 ms/token vs plain 34.6 (break-even 1.89 tok/round, got 1.88)
+```
+
+That is a **0.6% difference** — comfortably inside the noise of a 24-round window — and because
+disengaging is sticky for the process, it landed during a benchmark client's own warm-up request and
+served every subsequent *timed* request on the plain path. The measurement was right and the decision
+was wrong: a rule that flips a process-lifetime switch on a coin toss is worse than no rule, because
+its failure is silent and looks like a legitimate result.
+
+So `_mtp_losing_streak` now returns 0 unless `QWEN36_MTP_AUTODISABLE` is set to the loss ratio
+required to act (e.g. `1.15` = only when speculation is >=15% slower), sustained for
+`QWEN36_MTP_AUTODISABLE_WINDOWS` (2) consecutive windows. Default off: speculation stays engaged and
+the operator reads the logged ratio. When it does trip, the handover is unchanged — `sync_mtp_state()`,
+release the MTP traces, capture a plain decode trace, finish on the plain path — and still sticky,
+since re-engaging costs an ~8 s re-capture per request.
+
+Generalisable: a guard whose threshold sits inside its own measurement error is not a guard. Either
+widen the margin past the noise or demote it to an observation.
 
 That disengage path is the only consumer of the `sync_conv_rows` fix below, and the reason it matters:
 speculative rounds advance `cache["conv_state"]` while plain decode reads the `conv_rows` add-chain
