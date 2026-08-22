@@ -33,6 +33,7 @@ from models.demos.qwen3_6_a3b.tt import signpost as sp
 from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
 from models.demos.qwen3_6_a3b.tt.ttl_delta import (
+    _BATCH_SHARED_CONST,
     chunk_state_tt,
     decode_step_batch_tt,
     decode_step_chain_tt,
@@ -108,7 +109,33 @@ _GDN_FUSED = os.environ.get("QWEN36_GDN_FUSED", "1") != "0"
 # instead of driving it from Python. Not a kernel-time win — it deletes 6 of the 7 ttnn ops per step
 # per layer, and the verify trace is dispatch-bound. QWEN36_GDN_VERIFY_CHAIN=0 reverts to the
 # per-step-launch path (both are PCC-gated in tests/test_gated_delta_verify.py). See EXPERIMENTS.md.
+# Alias the fused decode kernel's S and Snew arguments to the SAME persistent buffer, so the state is
+# updated in place on-core and the separate `ttnn.copy(snew_buf -> state_buf)` disappears. Safe by
+# construction: core h reads only S[h*kt_t : (h+1)*kt_t] and writes exactly that slab (ttl_delta.py
+# :501/:614), the slabs are disjoint across cores, and within a core read() completes (t7.wait())
+# before compute() runs and write() fires. Saves 2 of the 4 MB/layer/token the state costs today.
+# QWEN36_GDN_ALIAS_STATE=0 reverts to the separate-buffer + copy form.
+_GDN_ALIAS_STATE = os.environ.get("QWEN36_GDN_ALIAS_STATE", "1") != "0"
+# Keep the gated-delta recurrent state in FLOAT32 through decode. MEASURED (tests/probe_gate_vs_state.py,
+# real layer-0 weights, 8192 steps vs an all-fp32 recurrence): the bf16 decode drifts to state PCC
+# 0.9327 / |S| x1.55 through TWO mechanisms that partially cancel -- bf16 rounds any decay g>0.998046875
+# to exactly 1.0 (deleting it; 49% of this layer's gate values are above that cliff), and the bf16 carry
+# rounds S*g back to S. Each ALONE is worse than both together, so the cheap `d=1-g` reform is a
+# REGRESSION (0.9122); only fp32 gate AND carry fix it (0.999998 / x1.000). TF32 is not enough either
+# (0.9924 / x1.071) -- its cliff at g>0.999756 still deletes this layer's longest-memory head.
+# It has to be an ALL-fp32 kernel: ttl 1.1.6 rejects an f32 tile argument next to any bf16 one, so the
+# cheap "fp32 carry, bf16 read-outs" split is not expressible (see _get_decode_op's docstring). Hence
+# the input typecasts below -- bf16 read-outs are numerically free (floor 0.999998), we just cannot ask
+# for them. QWEN36_GDN_FP32_STATE=0 reverts to the bf16 state.
+_FP32_STATE = os.environ.get("QWEN36_GDN_FP32_STATE", "0") != "0"
+_STATE_DT = ttnn.float32 if _FP32_STATE else ttnn.bfloat16
 _GDN_VERIFY_CHAIN = os.environ.get("QWEN36_GDN_VERIFY_CHAIN", "1") != "0"
+# ...but NOT with an fp32 state. The chained kernel is at 32/32 DFBs and only fits because `outer`
+# doubles as the step-to-step carry (EXPERIMENTS.md:64-96) -- and `outer` is a 16-tile matmul output,
+# the one shape fp32 DST cannot hold. The per-step path re-uses `decode_step_tt`, which already has an
+# fp32 build, for no new kernel risk. Cost is what EXPERIMENTS.md #5 measured for the chain: -1.53 ms
+# on a ~50 ms speculative round (~3%), and it is not on the single-user decode path at all.
+_GDN_VERIFY_CHAIN = _GDN_VERIFY_CHAIN and not _FP32_STATE
 # Keep speculative-verify intermediates in L1 for K up to this (rows are tiny; 8 is far inside budget).
 _VERIFY_L1_MAX_K = int(os.environ.get("QWEN36_VERIFY_L1_MAX_K", "8"))
 # MEASURED DEAD END (EXPERIMENTS.md #7): a low-op-count "stacked window" form of the causal conv
@@ -168,14 +195,30 @@ _STABLE_PREFILL = os.environ.get("QWEN36_DELTA_STABLE_PREFILL", "1") != "0"
 # are forbidden in capture is FALSE: only host writes (zeros/fills) are forbidden; matmul/eltwise
 # outputs allocate in DRAM and capture fine. MEASURED single-bucket traced vs eager: PCC 1.00000,
 # 1.55x @128 / 1.14x @256 / 1.01x @512 (tracing helps most at short prompts) — SINGLE-BUCKET IS SOLID.
-# MULTI-BUCKET CAVEAT (unresolved, tt-metal-level): capturing several prefill traces of different
-# lengths in one process corrupts the SECOND/larger trace's replay (measured 512 PCC ~0.214 captured
-# after 256; 512 ALONE is PCC 1.0). DETERMINISTIC and memory-INDEPENDENT — pooling the recurrence
-# intermediates (build_trace_pool `recur`) cut the pinned footprint ~5.8GB->~40MB and doubling
-# trace_region_size to 1.2GB BOTH left it byte-identical (0.21438), so it is a multi-trace capture-
-# isolation issue in the in-graph prefill ops, NOT a footprint overflow. Deploy a SINGLE bucket until
-# fixed at the tt-metal layer (or by pooling the ENTIRE prefill graph). Set =0 to revert to the bf16 kernel.
+# MULTI-BUCKET: FIXED 2026-08-22, and it was never a tt-metal bug. The old caveat here said capturing
+# several bucket lengths in one process corrupts the second trace's replay and to deploy a SINGLE
+# bucket. Root cause: a trace bakes its buffers' ADDRESSES, nothing pinned the in-graph transients, so
+# they were freed at end_trace_capture and the NEXT bucket's persistent pool was allocated into that
+# hole -- replaying the earlier trace then wrote over the later bucket's pool. Observed directly:
+# bucket 512's read-only zero `S0` came back |max| 33.19 and its `out[0]` came back NaN after one
+# bucket-256 replay. The earlier note's own evidence (pooling to ~40 MB and doubling trace_region_size
+# both changed nothing) was right that it is not a footprint overflow, and pointed at exactly this.
+# Fixed by allocating every bucket's persistent buffers BEFORE any capture (model.setup_prefill_traces
+# is two-pass; see TtModel.alloc_prefill_buffers). All orders now replay at PCC 1.000000. Full
+# write-up, including the checklist for avoiding this class of bug: MEMORY.md.
+# Set =0 to revert to the bf16 kernel.
 _TRACED_FP32 = os.environ.get("QWEN36_TRACED_FP32_RECURRENCE", "1") != "0"
+# Number of alternating `Snew` state-carry buffers in the traced-prefill pool (build_trace_pool).
+# 2 is all the recurrence needs; QWEN36_POOL_SNEW_ALL=1 restores the old one-per-chunk allocation as
+# an A/B fallback.
+_POOL_SNEW_ALL = os.environ.get("QWEN36_POOL_SNEW_ALL", "0") != "0"
+# Keep the traced pool's per-chunk `out` buffers in bf16 rather than fp32. `out` is a READ-OUT, not the
+# fp32 state carry (which stays fp32) -- and the path already typecasts the concatenated `core` to bf16
+# on the way out, so rounding each chunk before the concat instead of the whole thing after it is
+# BIT-IDENTICAL: elementwise rounding commutes with concatenation, which is pure data movement. Halves
+# the dominant term of the pool at long buckets and deletes the trailing typecast.
+# QWEN36_POOL_OUT_FP32=1 reverts to fp32 out buffers.
+_POOL_OUT_BF16 = os.environ.get("QWEN36_POOL_OUT_FP32", "0") == "0"
 _HIFI4 = ttnn.WormholeComputeKernelConfig(
     math_fidelity=ttnn.MathFidelity.HiFi4, math_approx_mode=False, fp32_dest_acc_en=True, packer_l1_acc=True
 )
@@ -270,14 +313,12 @@ class TtGatedDeltaNet(LightweightModule):
                 t = torch.zeros(V * TILE, TILE)
                 for h in range(V):
                     t[h * TILE : (h + 1) * TILE, :] = float(vals[h])
-                return to_tt(t, mesh_device, dtype=ttnn.bfloat16)
+                return to_tt(t, mesh_device, dtype=_STATE_DT)
 
             self._fused_negA = _uniform(-torch.exp(W("A_log").float()).reshape(V))
             self._fused_dtb = _uniform(W("dt_bias").float().reshape(V))
             nw = W("norm").float().reshape(Dv)
-            self._fused_nweight = to_tt(
-                nw.reshape(1, Dv).expand(TILE, Dv).contiguous(), mesh_device, dtype=ttnn.bfloat16
-            )
+            self._fused_nweight = to_tt(nw.reshape(1, Dv).expand(TILE, Dv).contiguous(), mesh_device, dtype=_STATE_DT)
             self._fused_scratch = None  # (out_buf, Snew_buf), allocated on first decode
             # batched-fused: B-keyed caches for the B-replicated per-head consts and the out/Snew scratch
             self._fused_batch_const = {}  # B -> (negA_b [B*V*TILE,TILE], dtb_b [B*V*TILE,TILE])
@@ -683,8 +724,8 @@ class TtGatedDeltaNet(LightweightModule):
         if core.dtype != ttnn.bfloat16:
             core = ttnn.typecast(core, ttnn.bfloat16)
         S = ttnn.reshape(S, [Vh * Dk, Dv])
-        if S.dtype != ttnn.bfloat16:
-            S = ttnn.typecast(S, ttnn.bfloat16)
+        if S.dtype != _STATE_DT:  # the native op returns an fp32 final_state; keep it if the cache is fp32
+            S = ttnn.typecast(S, _STATE_DT)
         return core, S
 
     def _forward_prefill_chunked(self, q, k, v, g, beta, pool=None, init_state=None):
@@ -821,14 +862,20 @@ class TtGatedDeltaNet(LightweightModule):
             if use_stable:  # ttnn fp32 chunk-state (numerically correct); S stays [1,Vh,Dk,Dv]
                 with prof.phase(self.mesh_device, "delta.kernel"):
                     if fp32_pooled:  # traced: write into pre-allocated pooled buffers (multi-bucket-safe)
-                        bufs = {**pool["recur"], "out": pool["out"][ci], "Snew": pool["Snew"][ci]}
+                        # Snew alternates (build_trace_pool holds 2): this chunk's carry-out must not be
+                        # the buffer S currently points at, which is the previous chunk's.
+                        bufs = {
+                            **pool["recur"],
+                            "out": pool["out"][ci],
+                            "Snew": pool["Snew"][ci % len(pool["Snew"])],
+                        }
                         out4, S = self._chunk_state_ttnn(tc, S, bufs=bufs)
                     else:
                         out4, S = self._chunk_state_ttnn(tc, S)
                 outs.append(out4)
                 continue
             if pool is not None:  # kernel-written output buffers: pre-allocated (no in-graph zeros)
-                out, Snew = pool["out"][ci], pool["Snew"][ci]
+                out, Snew = pool["out"][ci], pool["Snew"][ci % len(pool["Snew"])]  # carry alternates
             else:
                 out = ttnn.zeros([Vh * C, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
                 Snew = ttnn.zeros([Vh * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
@@ -852,8 +899,12 @@ class TtGatedDeltaNet(LightweightModule):
         core = ttnn.concat(outs, dim=2)  # [1,Vh,Tp,Dv]
         if pad:
             core = ttnn.slice(core, [0, 0, 0, 0], [1, Vh, T, Dv])
-        if use_stable:  # back to bf16 head-major state + bf16 core (the path's interface)
-            S = ttnn.typecast(ttnn.reshape(S, [Vh * Dk, Dv]), ttnn.bfloat16)
+        if use_stable:  # back to head-major state + bf16 core (the path's interface)
+            # The chunked prefill already computes S in fp32; with _FP32_STATE the decode cache is fp32
+            # too, so this demotion is pure loss and the typecast disappears (one fewer op per layer).
+            S = ttnn.reshape(S, [Vh * Dk, Dv])
+            if S.dtype != _STATE_DT:
+                S = ttnn.typecast(S, _STATE_DT)
             if core.dtype != ttnn.bfloat16:
                 core = ttnn.typecast(core, ttnn.bfloat16)
         return core, S
@@ -867,8 +918,15 @@ class TtGatedDeltaNet(LightweightModule):
         per-chunk intermediates would otherwise be allocated IN-GRAPH — ~24 MB/chunk x Nc x 30 layers,
         all PINNED for the trace lifetime (~5.8 GB at bucket 512), which overflows DRAM once a second
         bucket is captured (the real 'bucket-256 wedge'). So we pre-allocate the recurrence intermediates
-        as a small SHARED set (reused across every chunk and layer -> ~20 MB total) plus per-chunk out/
-        Snew, all fp32, and _chunk_state_ttnn writes into them via output_tensor= (see `recur`)."""
+        as a small SHARED set (reused across every chunk and layer -> ~20 MB total) plus per-chunk out,
+        all fp32, and _chunk_state_ttnn writes into them via output_tensor= (see `recur`).
+
+        `Snew` is only TWO buffers, alternating, not Nc. It is purely the state carry: chunk ci writes
+        Snew[ci%2] and chunk ci+1 reads it as S while writing Snew[(ci+1)%2], so a buffer is dead as
+        soon as the next chunk has consumed it and input/output never collide. Only `out` needs one
+        buffer per chunk, because the final `concat` reads all Nc at once. Nc buffers of [1,Vh,Dk,Dv]
+        fp32 is 2 MB per chunk: MEASURED 16 MB at bucket 512 and 1.02 GB at bucket 32768, against 4 MB
+        either way here."""
         C = _CHUNK
         Vh, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
         Nc = T // C
@@ -881,8 +939,10 @@ class TtGatedDeltaNet(LightweightModule):
             f = ttnn.float32
             return {
                 "S0": z([1, Vh, Dk, Dv], f),  # fp32 [1,Vh,Dk,Dv] (matches _chunk_state_ttnn S); read-only
-                "out": [z([1, Vh, C, Dv], f) for _ in range(Nc)],  # per-chunk (persist for the concat)
-                "Snew": [z([1, Vh, Dk, Dv], f) for _ in range(Nc)],  # per-chunk (S carry)
+                # per-chunk, persisted for the final concat -- bf16 by default, see _POOL_OUT_BF16
+                "out": [z([1, Vh, C, Dv], ttnn.bfloat16 if _POOL_OUT_BF16 else f) for _ in range(Nc)],
+                # 2 alternating carry buffers, indexed ci % 2 — see the docstring
+                "Snew": [z([1, Vh, Dk, Dv], f) for _ in range(Nc if _POOL_SNEW_ALL else min(2, Nc))],
                 # shared transients — reused across all chunks and all 30 layers (each fully consumed
                 # within a chunk before the next overwrites it), so the pinned footprint is O(1) not O(Nc*L)
                 "recur": {
@@ -900,7 +960,7 @@ class TtGatedDeltaNet(LightweightModule):
         return {
             "S0": z([Vh * Dk, Dv]),
             "out": [z([Vh * C, Dv]) for _ in range(Nc)],
-            "Snew": [z([Vh * Dk, Dv]) for _ in range(Nc)],
+            "Snew": [z([Vh * Dk, Dv]) for _ in range(Nc if _POOL_SNEW_ALL else min(2, Nc))],  # as above
             "valid": valid,
         }
 
@@ -1039,27 +1099,46 @@ class TtGatedDeltaNet(LightweightModule):
             y = ttnn.pad(y, [(0, 0), (0, 0), (0, T_full - T), (0, 0)], value=0.0)
         return y
 
-    def _verify_scratch(self, K):
-        """Persistent per-K scratch, allocated once and reused so the addresses are stable (required
-        under trace capture): K state buffers [V*Dk,Dv], K output tile-rows, and the [K, conv_dim] copy
-        of the conv input that `commit_verify` reads.
+    def _verify_conv_buf(self, K):
+        """Persistent [K, conv_dim] copy of the conv INPUT rows, allocated once per K.
 
-        Everything here is keyed BY K. The conv buffer in particular must be — a round with gamma>0
-        alternates between the K=1 seed step and K-row verifies, and a single shared attribute would
-        hand a [K, conv_dim] buffer to a [1, conv_dim] copy (measured: TT_FATAL shape mismatch
-        [1,8192] vs [3,8192])."""
+        `commit_verify` recomputes the rolled-back conv_state from these, and it runs in its OWN
+        captured trace — a trace cannot reference a transient produced inside a DIFFERENT trace, so
+        this has to be a stable buffer.
+
+        Keyed BY K, and that is load-bearing: a round with gamma>0 alternates between the K=1 seed
+        step and K-row verifies, and a single shared attribute would hand a [K, conv_dim] buffer to a
+        [1, conv_dim] copy (measured: TT_FATAL shape mismatch [1,8192] vs [3,8192]).
+
+        BF16 whatever the state dtype: commit_verify concats it with the (bf16) conv_state, and
+        ttnn.concat requires matching dtypes.
+
+        Split out of the old `_verify_scratch`, which also built the per-step `states`/`outs` that
+        ONLY the non-chain path reads (see `_verify_step_scratch`). With `_GDN_VERIFY_CHAIN` on — the
+        default — those were allocated and never touched: K x ([V*Dk,Dv] + [TILE,value_dim]) per
+        layer, i.e. a MEASURED 150 MB across 30 layers at gamma=2 (both K=1 and K=3 are cached)."""
+        if not hasattr(self, "_verify_conv_cache"):
+            self._verify_conv_cache = {}
+        buf = self._verify_conv_cache.get(K)
+        if buf is None:
+            buf = ttnn.zeros([K, self.conv_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            self._verify_conv_cache[K] = buf
+        return buf
+
+    def _verify_step_scratch(self, K):
+        """Per-STEP persistent scratch for the NON-chained verify path (`_GDN_VERIFY_CHAIN=0`): K
+        state buffers [V*Dk,Dv] and K output tile-rows. Stable addresses, as trace capture requires.
+
+        Only built when that path actually runs — the chained kernel writes one [K*nv*Dk,Dv] stack
+        instead (`_verify_chain_scratch`), so allocating these too was pure waste."""
         if not hasattr(self, "_verify_scratch_cache"):
             self._verify_scratch_cache = {}
         sc = self._verify_scratch_cache.get(K)
         if sc is None:
             V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
-            z_ = lambda shp: ttnn.zeros(shp, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            z_ = lambda shp: ttnn.zeros(shp, dtype=_STATE_DT, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
             # out buffers are a FULL tile-row each (the kernel writes tile-row 0 of `out`)
             sc = ([z_([V * Dk, Dv]) for _ in range(K)], [z_([TILE, self.value_dim]) for _ in range(K)])
-            # persistent copy of the conv INPUT rows: commit_verify recomputes the rolled-back
-            # conv_state from these, and it runs in its own captured trace — a trace cannot reference a
-            # transient produced inside a DIFFERENT trace, so this has to be a stable buffer.
-            sc = sc + (z_([K, self.conv_dim]),)
             self._verify_scratch_cache[K] = sc
         return sc
 
@@ -1105,7 +1184,10 @@ class TtGatedDeltaNet(LightweightModule):
         The persistent `recurrent_state` and `conv_state` are NOT modified — every step writes into
         scratch — so the caller can accept any prefix and then call `commit_verify(cache, j)`."""
         V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
-        states, outs, conv_buf = self._verify_scratch(K)
+        conv_buf = self._verify_conv_buf(K)
+        # per-step state/out buffers exist ONLY for the non-chained path; the chained kernel writes a
+        # single [K*nv*Dk,Dv] stack instead, so building them there allocated 150 MB nothing read.
+        states, outs = (None, None) if _GDN_VERIFY_CHAIN else self._verify_step_scratch(K)
 
         # ttl indexes in TILE units, not rows: `ct = 1` is one 32-row tile, and the kernel's outer
         # product k^T @ delta contracts over ALL 32 rows of it. So each step's operand must be a tile
@@ -1189,6 +1271,11 @@ class TtGatedDeltaNet(LightweightModule):
                 # Layout: ba is [K, 2V] and row t is [b(V) | a(V)], so flattening row-major puts (t, j) at
                 # index t*2V + j -> tile-row (t*2V + j). Hence b for step t occupies tile-rows
                 # [t*2V, t*2V+V) and a occupies [t*2V+V, (t+1)*2V).
+                if _FP32_STATE:
+                    # all-fp32 kernel: convert the hoisted operands ONCE, outside the K loop
+                    ba = ttnn.typecast(ba, ttnn.float32)
+                    qkT = ttnn.typecast(qkT, ttnn.float32)
+                    vzT = ttnn.typecast(vzT, ttnn.float32)
                 ba_all = ttnn.repeat(ttnn.reshape(ba, [K * 2 * V, 1, 1]), ttnn.Shape([1, TILE, TILE]))
                 ba_all = ttnn.reshape(ba_all, [K * 2 * V * TILE, TILE])
                 keep.append(ba_all)
@@ -1226,6 +1313,7 @@ class TtGatedDeltaNet(LightweightModule):
                         self.num_k_heads,
                         self.qk_scale,
                         self.eps,
+                        _FP32_STATE,
                     )
             pending_states = states  # list of persistent per-step buffers
         # stash what commit_verify needs. conv_in is the PRE-conv projection (the conv's own input);
@@ -1278,7 +1366,7 @@ class TtGatedDeltaNet(LightweightModule):
                     cs_m[i, r] = 1.0
                 else:
                     ci_m[i, r - P] = 1.0
-            mk = lambda m: to_tt(m, self.mesh_device, dtype=ttnn.bfloat16)
+            mk = lambda m: to_tt(m, self.mesh_device, dtype=_STATE_DT)
             c = (
                 mk(cs_m) if bool(cs_m.any()) else None,
                 mk(ci_m) if bool(ci_m.any()) else None,
@@ -1350,9 +1438,7 @@ class TtGatedDeltaNet(LightweightModule):
             state_buf = cache.get("recurrent_state") if cache else None
             state = state_buf
             if state is None:
-                state = ttnn.zeros(
-                    [B, Vh, Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
-                )
+                state = ttnn.zeros([B, Vh, Dk, Dv], dtype=_STATE_DT, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
             q_row = ttnn.reshape(q, [B, Vh, 1, Dk])
             k_row = ttnn.reshape(k, [B, Vh, 1, Dk])
             k_col = ttnn.reshape(k, [B, Vh, Dk, 1])
@@ -1385,7 +1471,7 @@ class TtGatedDeltaNet(LightweightModule):
         state_buf = cache.get("recurrent_state") if cache else None
         state = state_buf
         if state is None:
-            state = ttnn.zeros([1, Vh, Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            state = ttnn.zeros([1, Vh, Dk, Dv], dtype=_STATE_DT, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
         outs = []
         for t in range(T):
             q_row = ttnn.reshape(ttnn.slice(q, [t, 0, 0], [t + 1, Vh, Dk]), [1, Vh, 1, Dk])
@@ -1426,22 +1512,30 @@ class TtGatedDeltaNet(LightweightModule):
         with sp.region("delta.recurrence"):
             # raw a|b -> per-head uniform [V*TILE, TILE] tiles. transpose [1,2V]->[2V,1] moves heads to
             # rows; repeat fills each head's tile; slice splits b|a (one expansion for both, then split).
+            if _FP32_STATE:
+                # The all-fp32 kernel needs every argument f32. Convert as FEW tensors as possible:
+                # `ba` here (tiny, [1,2V]) so both per-head tiles inherit it, and q/k/v/z below.
+                ba = ttnn.typecast(ba, ttnn.float32)
             bat = ttnn.transpose(ba, 0, 1)  # [2V, 1]
             bat = ttnn.repeat(ttnn.reshape(bat, [2 * V, 1, 1]), ttnn.Shape([1, TILE, TILE]))  # [2V, TILE, TILE]
             bat = ttnn.reshape(bat, [2 * V * TILE, TILE])
             braw_tile = ttnn.slice(bat, [0, 0], [V * TILE, TILE])  # b is the first V
             araw_tile = ttnn.slice(bat, [V * TILE, 0], [2 * V * TILE, TILE])  # a is the second V
 
+            if _FP32_STATE:
+                q, k, v, z = (ttnn.typecast(t, ttnn.float32) for t in (q, k, v, z))
             state_buf = cache["recurrent_state"]  # persistent [1,V,Dk,Dv]
             S_in = ttnn.reshape(state_buf, [V * Dk, Dv])  # head-major view for the kernel
             if self._fused_scratch is None:  # persistent scratch (allocated once; reused every step/trace)
+                z_ = lambda shp: ttnn.zeros(shp, dtype=_STATE_DT, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+                # With _GDN_ALIAS_STATE the kernel writes the state in place, so no Snew buffer exists.
                 self._fused_scratch = (
-                    ttnn.zeros(
-                        [1, self.value_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
-                    ),
-                    ttnn.zeros([V * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device),
+                    z_([1, self.value_dim]),
+                    None if _GDN_ALIAS_STATE else z_([V * Dk, Dv]),
                 )
             out_buf, snew_buf = self._fused_scratch
+            if _GDN_ALIAS_STATE:
+                snew_buf = S_in  # in-place: S and Snew are the same buffer
 
             decode_step_tt(
                 q,
@@ -1460,8 +1554,10 @@ class TtGatedDeltaNet(LightweightModule):
                 self.num_k_heads,
                 self.qk_scale,
                 self.eps,
+                _FP32_STATE,
             )
-            ttnn.copy(ttnn.reshape(snew_buf, [1, V, Dk, Dv]), state_buf)  # in-place state update (trace-safe)
+            if not _GDN_ALIAS_STATE:
+                ttnn.copy(ttnn.reshape(snew_buf, [1, V, Dk, Dv]), state_buf)  # in-place update (trace-safe)
         with sp.region("delta.w_out"):
             if self._wout_dram is not None:
                 # DRAM-sharded output projection: L1-shard the activation, matmul, reshard back to L1.
@@ -1472,6 +1568,10 @@ class TtGatedDeltaNet(LightweightModule):
                     memory_config=self._wout_omc,
                 )  # [1, hidden] width-sharded
                 y = ttnn.to_memory_config(osh, ttnn.L1_MEMORY_CONFIG if _GDN_L1 else ttnn.DRAM_MEMORY_CONFIG)
+            elif _FP32_STATE:
+                # out_buf is f32 (all-fp32 kernel) while w_out is bf16; pin the result back to bf16 so
+                # the residual stream dtype is unchanged downstream.
+                y = ttnn.linear(out_buf, self.w_out, memory_config=_MC, dtype=ttnn.bfloat16)
             else:
                 y = ttnn.linear(out_buf, self.w_out, memory_config=_MC)  # [1, hidden]
             return ttnn.reshape(y, [1, 1, 1, hidden])
@@ -1491,8 +1591,15 @@ class TtGatedDeltaNet(LightweightModule):
         return ttnn.reshape(x, [B, feat])
 
     def _batch_const(self, B):
-        """Per-head consts (-exp(A_log), dt_bias) replicated across B users: [V*TILE,TILE] ->
-        [B*V*TILE,TILE] (user-b/head-h tile at row (b*V+h)). Cached per B."""
+        """Per-head consts (-exp(A_log), dt_bias) for the batched kernel.
+
+        With `_BATCH_SHARED_CONST` (the default) the kernel indexes them at tile-row h, so the
+        un-replicated [V*TILE,TILE] tensors go straight through and nothing is allocated here at all.
+        Otherwise they are replicated to [B*V*TILE,TILE] (user-b/head-h tile at row (b*V+h)) to match
+        the kernel's old (b*V+h) indexing -- 4 MB/layer at B=32 (MEASURED 120 MB over 30 layers) to
+        hold V=32 scalars. Cached per B."""
+        if _BATCH_SHARED_CONST:
+            return self._fused_negA, self._fused_dtb
         if B not in self._fused_batch_const:
             V = self.num_v_heads
 
@@ -1505,14 +1612,29 @@ class TtGatedDeltaNet(LightweightModule):
 
     def _batch_scratch(self, B):
         """Persistent (out, Snew) scratch for the batched kernel, allocated once per B (reused every
-        step/trace, so the in-place state write points at a stable address)."""
+        step/trace, so the in-place state write points at a stable address).
+
+        Under _GDN_ALIAS_STATE there is NO Snew buffer: the kernel updates the persistent state in
+        place, exactly as the B=1 path does. That buffer is [B*nv*Dk, Dv], which is the single largest
+        per-layer allocation in batched decode -- MEASURED 32 MB/layer at B=32, i.e. ~960 MB across
+        the 30 gated-delta layers -- plus a same-sized copy back into the cache every step. Batched
+        decode is memory-capped (that is why the ttnn scan OOMs at B>=16), so this is batch headroom.
+
+        It also removes a latent dtype bug: `Snew` here was hardcoded BFLOAT16 while the batched
+        `recurrent_state` follows `_STATE_DT`, and `decode_step_batch_tt` has no fp32 build -- so
+        QWEN36_GDN_FP32_STATE=1 + batched decode mismatched on the copy. With no buffer there is
+        nothing to mismatch."""
         if B not in self._fused_batch_scratch:
             V, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
             self._fused_batch_scratch[B] = (
                 ttnn.zeros(
                     [B * TILE, self.value_dim], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
                 ),
-                ttnn.zeros([B * V * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device),
+                None
+                if _GDN_ALIAS_STATE
+                else ttnn.zeros(
+                    [B * V * Dk, Dv], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+                ),
             )
         return self._fused_batch_scratch[B]
 
@@ -1547,6 +1669,15 @@ class TtGatedDeltaNet(LightweightModule):
             state_buf = cache["recurrent_state"]  # persistent [B,V,Dk,Dv]
             S_in = ttnn.reshape(state_buf, [B * V * Dk, Dv])  # head-major view over (b,h)
             out_buf, snew_buf = self._batch_scratch(B)
+            if _GDN_ALIAS_STATE:
+                # In-place on-core state update, same as the B=1 path. Safe by the same argument,
+                # generalised over b: core h owns only slab (b*nv+h)*kt_t, so the slabs are disjoint
+                # across BOTH cores (h) and loop iterations (b); read() copies S(b) and t7.wait()s it
+                # before compute() can Sd.wait() it, and write() fires only after compute() produces
+                # Snd(b) -- so per slab the read strictly precedes the write. block_count=2 lets
+                # read() run at most two iterations ahead, and those touch OTHER b slabs, never the
+                # one write() is on (ttl_delta.py:791/:907).
+                snew_buf = S_in
 
             decode_step_batch_tt(
                 qk,
@@ -1567,7 +1698,8 @@ class TtGatedDeltaNet(LightweightModule):
                 self.eps,
                 B,
             )
-            ttnn.copy(ttnn.reshape(snew_buf, [B, V, Dk, Dv]), state_buf)  # in-place state update (trace-safe)
+            if not _GDN_ALIAS_STATE:
+                ttnn.copy(ttnn.reshape(snew_buf, [B, V, Dk, Dv]), state_buf)  # in-place (trace-safe)
         with sp.region("delta.w_out"):
             core = self._from_tilerows(out_buf, self.value_dim, B)  # [B, value_dim]
             y = ttnn.linear(core, self.w_out, memory_config=_MC)  # interleaved (DRAM-shard is a B=1 opt)

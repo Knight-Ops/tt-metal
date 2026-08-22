@@ -74,6 +74,8 @@ tt-lang (ttl) authoring lessons — READ BEFORE EDITING (learned building these 
     the next run. Use generous timeouts; first-time kernel compiles can take minutes.
 """
 
+import os
+
 import torch
 import ttl
 
@@ -419,18 +421,59 @@ def chunk_state_tt(q, kt, w, kcd, decay, qg, kgt, glast, S, out, Snew, n_heads):
 # k-l2norm, and core gated-norm phases (sequential, no overlap). bf16 DST (fp32_dest_acc_en=False).
 # ============================================================================================
 _GDN_EPS = 1e-6  # l2norm eps (matches reference)
+# fp32 DST halves capacity (4 tiles double-buffered / 8 with full sync). `outer` is a 16-tile
+# matmul output, so full sync looked required -- but it also changes accumulation order, so it
+# is a suspect whenever the fp32 build disagrees with fp64. QWEN36_GDN_FP32_FULLSYNC=0 tests that.
+_FP32_FULLSYNC = os.environ.get("QWEN36_GDN_FP32_FULLSYNC", "1") != "0"
+# MEASURED: --no-ttl-fpu-binary-ops makes this kernel produce inf/nan, so it is OFF by default.
+# That leaves the fp32 build with a TF32-precision (and truncating) carry -- i.e. a TRUE fp32
+# carry is not reachable in ttl 1.1.6 for this kernel. See QWEN36_GDN_FP32_STATE.
+_FP32_SFPU = os.environ.get("QWEN36_GDN_FP32_SFPU", "0") != "0"
 _decode_ops = {}
 
 
-def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
-    key = (n_v_heads, n_k_heads, scale, norm_eps)
+def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps, fp32_state=False):
+    """`fp32_state`: build the ALL-fp32 variant, for a float32 recurrent state.
+
+    It has to be all-or-nothing. ttl 1.1.6 rejects an f32 tile argument alongside any bf16 one
+    ("mixed f32 and non-f32 tile arguments"; TTLOpsUtils.h:679-691 -- and an f32->f32 self-cast does
+    NOT satisfy the checker, probed). So the cheap "fp32 carry + bf16 read-out operands" split is not
+    expressible here: EVERY tensor argument must be float32, which the caller must arrange.
+    Consequences: fp32 DST is forced on (halving DST capacity, hence dst_full_sync_en), and the state
+    DFBs double in L1 -- so they drop to block_count=1, which is free at B=1 (single iteration, so
+    there is no next block to prefetch).
+    """
+    key = (n_v_heads, n_k_heads, scale, norm_eps, fp32_state)
     if key in _decode_ops:
         return _decode_ops[key]
     gn, gm = _grid_dims(n_v_heads)
     rep = n_v_heads // n_k_heads
     EPS, NEPS = _GDN_EPS, norm_eps
+    # bf16 DST is 16 tiles; fp32 is 4 double-buffered / 8 with full sync. `outer` is a 16-tile matmul
+    # output, so the fp32 build needs full sync (and may still need the matmul split -- measured).
+    # block_count for the state-shaped DFBs. fp32 doubles their L1, so 1 was chosen to stay in
+    # budget; QWEN36_GDN_FP32_BC lets that be tested against correctness.
+    SBC = int(os.environ.get("QWEN36_GDN_FP32_BC", "1")) if fp32_state else 2
 
-    @ttl.operation(grid=(gn, gm), fp32_dest_acc_en=False)
+    # MEASURED: with the default FPU path, the fp32 carry is only TF32. `Sb * gb` is an FPU-eligible
+    # multiply, so its operands go through SRCA/SRCB in Default unpack mode, which converts f32 -> TF32
+    # on the way into DST (tech_reports/.../accuracy_tips.md:58-60) -- and it TRUNCATES, so the state
+    # loses magnitude every step (identity test: max|d| 2^-12, norm 0.07% low; 8192-step norm 0.735x).
+    # ttl sets UnpackToDestFp32 only for SFPU consumers, so routing add/sub/mul to the SFPU is what
+    # actually buys fp32. QWEN36_GDN_FP32_SFPU=0 reverts (and reproduces the TF32 behaviour).
+    _OPTS = "--no-ttl-fpu-binary-ops" if (fp32_state and _FP32_SFPU) else None
+
+    # NOTE: pass None, not False, for the bf16 build. `dst_full_sync_en=None` means "auto-detect"
+    # (compiler_options.py) while False explicitly DISABLES full sync -- they are different DST
+    # decisions, and forcing False on the bf16 path hung the ttl compiler.
+    _FULLSYNC = True if (fp32_state and _FP32_FULLSYNC) else None
+
+    @ttl.operation(
+        grid=(gn, gm),
+        fp32_dest_acc_en=fp32_state,
+        dst_full_sync_en=_FULLSYNC,
+        options=_OPTS,
+    )
     def _decode_step(
         q: ttnn.Tensor,  # [1, key_dim]    raw q (heads along columns)
         kr: ttnn.Tensor,  # [1, key_dim]    raw k
@@ -448,27 +491,35 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
         Dk, Dv = q.shape[1] // n_k_heads, v.shape[1] // n_v_heads
         ct, kt_t, vt = 1, Dk // TILE, Dv // TILE
         inv_dv = 1.0 / Dv
+        # Every `ttl.block.fill` below passes `dtype=S.dtype`. fill() defaults to bf16 regardless of
+        # surrounding dtypes (operators.py:854-855), which poisons the all-fp32 build with a mixed-dtype
+        # op; and the dtype cannot be a CAPTURED variable ("Unhandled capture for vars of type
+        # torch.dtype"). Reading it off a tensor ARGUMENT is resolved at trace time, so one body serves
+        # both builds.
 
-        def mk(t, s):
-            return ttl.make_dataflow_buffer_like(t, shape=s, block_count=2)
+        def mk(t, s, bc=2):
+            return ttl.make_dataflow_buffer_like(t, shape=s, block_count=bc)
+
+        def mkS(t, s):  # state-shaped: block_count=1 in the fp32 build to stay inside the L1 budget
+            return ttl.make_dataflow_buffer_like(t, shape=s, block_count=SBC)
 
         qd, krd, vd, zd = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t)), mk(v, (ct, vt)), mk(z, (ct, vt))
         ard, brd, nAd, dtd = mk(araw, (ct, 1)), mk(braw, (ct, 1)), mk(negA, (ct, 1)), mk(dtb, (ct, 1))
-        Sd = mk(S, (kt_t, vt))
+        Sd = mkS(S, (kt_t, vt))
         nwd = mk(nweight, (ct, vt))
-        od, Snd = mk(out, (ct, vt)), mk(Snew, (kt_t, vt))
-        gbd, bbd = mk(S, (kt_t, vt)), mk(out, (ct, vt))
+        od, Snd = mk(out, (ct, vt)), mkS(Snew, (kt_t, vt))
+        gbd, bbd = mkS(S, (kt_t, vt)), mk(out, (ct, vt))
         # shared sum/norm temps (reused for q-l2norm, k-l2norm, and core gated-norm — DFB budget)
         sq_t, ss_t, cp_t, onesm = mk(q, (ct, kt_t)), mk(q, (ct, 1)), mk(q, (ct, kt_t)), mk(S, (kt_t, 1))
         qn_d, kn_d = mk(q, (ct, kt_t)), mk(kr, (ct, kt_t))  # persist: qn to end, kn to transpose
         kn2, kcol = mk(kr, (ct, kt_t)), mk(S, (kt_t, ct))
         Sg, Sg2, kv, dl, outer, st = (
-            mk(S, (kt_t, vt)),
-            mk(S, (kt_t, vt)),
+            mkS(S, (kt_t, vt)),
+            mkS(S, (kt_t, vt)),
             mk(out, (ct, vt)),
             mk(out, (ct, vt)),
-            mk(S, (kt_t, vt)),
-            mk(S, (kt_t, vt)),
+            mkS(S, (kt_t, vt)),
+            mkS(S, (kt_t, vt)),
         )
         core_d = mk(out, (ct, vt))
 
@@ -518,13 +569,22 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
                 with bbd.reserve() as o:
                     o.store(ttl.block.broadcast(ttl.math.sigmoid(bb), dims=[-1], shape=(ct, vt)))
             with ard.wait() as ab, dtd.wait() as dtbk, nAd.wait() as nAk:
-                sp = ttl.math.log(ttl.math.exp(ab + dtbk) + ttl.block.fill(1.0, shape=(ct, 1)))
-                ge = ttl.math.exp(nAk * sp)
+                sp = ttl.math.log(ttl.math.exp(ab + dtbk) + ttl.block.fill(1.0, shape=(ct, 1), dtype=S.dtype))
+                # Broadcast the EXPONENT, then exp it -- not exp first and broadcast the gate.
+                # MEASURED: ttl.block.broadcast TRUNCATES to an 11-bit mantissa (0.999 -> 2045/2048 =
+                # 0.998535156, relerr -4.65e-4) because tile_bcast is excluded from UnpackToDestFp32
+                # (TTLSetComputeKernelConfig.cpp:86-95). Applied to the gate, which sits just below 1.0,
+                # that is a one-sided -4.65e-4 on the decay EVERY step: it dropped the 8192-step state
+                # norm to 0.735x the fp32 reference (worse than bf16's 1.187x, in the other direction).
+                # Applied to the exponent x = negA*softplus (a small negative number, ~-1e-4 for a
+                # long-memory head), the same relative truncation is ~5e-8 of g since dg/g = dx. Same
+                # arithmetic, precision moved to where it is free. Costs one exp over (kt_t,vt) tiles
+                # instead of (ct,1) -- the gate math is a small share of the kernel.
                 with gbd.reserve() as o:
-                    o.store(ttl.block.broadcast(ge, dims=[-2, -1], shape=(kt_t, vt)))
+                    o.store(ttl.math.exp(ttl.block.broadcast(nAk * sp, dims=[-2, -1], shape=(kt_t, vt))))
             # ---- l2norm(q) * scale  (shared temps) ----
             with onesm.reserve() as o:
-                o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+                o.store(ttl.block.fill(1.0, shape=(kt_t, 1), dtype=S.dtype))
             with qd.wait() as qb:
                 with sq_t.reserve() as o:
                     o.store(qb * qb)
@@ -535,13 +595,13 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
                     o.store(sqb @ oc)
             with ss_t.wait() as ssb, cp_t.wait() as qcb:
                 rq = ttl.block.broadcast(
-                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1), dtype=S.dtype)), dims=[-1], shape=(ct, kt_t)
                 )
                 with qn_d.reserve() as o:
                     o.store((qcb * rq) * scale)
             # ---- l2norm(k)  (reuse shared temps) ----
             with onesm.reserve() as o:
-                o.store(ttl.block.fill(1.0, shape=(kt_t, 1)))
+                o.store(ttl.block.fill(1.0, shape=(kt_t, 1), dtype=S.dtype))
             with krd.wait() as kb:
                 with sq_t.reserve() as o:
                     o.store(kb * kb)
@@ -552,7 +612,7 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
                     o.store(sqb @ oc)
             with ss_t.wait() as ssb, cp_t.wait() as kcb:
                 rk = ttl.block.broadcast(
-                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1))), dims=[-1], shape=(ct, kt_t)
+                    ttl.math.rsqrt(ssb + ttl.block.fill(EPS, shape=(ct, 1), dtype=S.dtype)), dims=[-1], shape=(ct, kt_t)
                 )
                 with kn_d.reserve() as o:
                     o.store(kcb * rk)
@@ -586,7 +646,7 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
                     o.store(stb)
             # ---- gated RMSNorm: out = (core * rsqrt(mean(core^2,Dv)+eps) * weight) * silu(z) ----
             with onesm.reserve() as o:
-                o.store(ttl.block.fill(1.0, shape=(vt, 1)))
+                o.store(ttl.block.fill(1.0, shape=(vt, 1), dtype=S.dtype))
             with core_d.wait() as cb:
                 with sq_t.reserve() as o:
                     o.store(cb * cb)
@@ -597,7 +657,9 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
                     o.store(csqb @ ocn)
             with ss_t.wait() as ssnb, cp_t.wait() as cb, nwd.wait() as nwb, zd.wait() as zb:
                 rms = ttl.block.broadcast(
-                    ttl.math.rsqrt(ssnb * inv_dv + ttl.block.fill(NEPS, shape=(ct, 1))), dims=[-1], shape=(ct, vt)
+                    ttl.math.rsqrt(ssnb * inv_dv + ttl.block.fill(NEPS, shape=(ct, 1), dtype=S.dtype)),
+                    dims=[-1],
+                    shape=(ct, vt),
                 )
                 y = (cb * rms) * nwb
                 with od.reserve() as o:
@@ -617,11 +679,31 @@ def _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps):
     return _decode_step
 
 
-def decode_step_tt(q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew, n_v_heads, n_k_heads, scale, norm_eps):
+def decode_step_tt(
+    q,
+    kr,
+    v,
+    z,
+    araw,
+    braw,
+    negA,
+    dtb,
+    S,
+    nweight,
+    out,
+    Snew,
+    n_v_heads,
+    n_k_heads,
+    scale,
+    norm_eps,
+    fp32_state=False,
+):
     """ttnn-native entry for the fused single-step decode kernel. All args are device ttnn tensors:
     q/kr [1,key_dim], v/z/out [1,value_dim] (heads along columns); araw/braw/negA/dtb [nv*TILE,TILE]
     (uniform per head); S/Snew [nv*Dk,Dv] head-major; nweight [TILE,Dv]. Writes `out` and `Snew`."""
-    _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps)(q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew)
+    _get_decode_op(n_v_heads, n_k_heads, scale, norm_eps, fp32_state)(
+        q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew
+    )
 
 
 # ============================================================================================
@@ -647,15 +729,29 @@ def decode_step_tt(q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew, n_
 # ============================================================================================
 _decode_batch_ops = {}
 
+# Read negA/dt_bias from a SHARED per-head tensor ([nv*TILE, TILE], tile-row h) instead of a
+# B-replicated one ([B*nv*TILE, TILE], tile-row b*nv+h). They are per-HEAD constants -- the caller was
+# repeating each B times purely to satisfy this kernel's (b*nv+h) indexing, which costs 4 MB/layer at
+# B=32 (MEASURED 120 MB across the 30 gated-delta layers) to store 32 scalars. Indexing at h instead
+# lets the un-replicated tensors be passed straight through. araw/braw are genuinely per-(b,h) and are
+# untouched. Baked into the factory key, so both forms can coexist in one process.
+# QWEN36_GDN_BATCH_SHARED_CONST=0 reverts to the replicated form.
+_BATCH_SHARED_CONST = os.environ.get("QWEN36_GDN_BATCH_SHARED_CONST", "1") != "0"
 
-def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B):
-    key = (n_v_heads, n_k_heads, scale, norm_eps, B)
+
+def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B, shared_const=None):
+    shared_const = _BATCH_SHARED_CONST if shared_const is None else shared_const
+    key = (n_v_heads, n_k_heads, scale, norm_eps, B, shared_const)
     if key in _decode_batch_ops:
         return _decode_batch_ops[key]
     gn, gm = _grid_dims(n_v_heads)
     rep = n_v_heads // n_k_heads
     nv = n_v_heads
     EPS, NEPS = _GDN_EPS, norm_eps
+    # Per-user stride into negA/dtb: 0 for the shared per-head tensor (every b reads tile-row h),
+    # nv for the B-replicated one (row b*nv+h). A compile-time int, because TT-Lang forbids a
+    # conditional expression inside the kernel body -- so the choice has to be arithmetic there.
+    cstride = 0 if shared_const else nv
 
     @ttl.operation(grid=(gn, gm), fp32_dest_acc_en=False)
     def _decode_step_batch(
@@ -665,8 +761,8 @@ def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B):
         z: ttnn.Tensor,  # [B*TILE, value_dim]  w_z projection (gate)
         araw: ttnn.Tensor,  # [B*nv*TILE, TILE]  raw a (uniform per (b,h))
         braw: ttnn.Tensor,  # [B*nv*TILE, TILE]  raw b
-        negA: ttnn.Tensor,  # [B*nv*TILE, TILE]  -exp(A_log) const (per head, repeated over b)
-        dtb: ttnn.Tensor,  # [B*nv*TILE, TILE]  dt_bias const
+        negA: ttnn.Tensor,  # [nv*TILE, TILE] per-head ([B*nv*TILE, TILE] if not shared_const)
+        dtb: ttnn.Tensor,  # [nv*TILE, TILE] per-head ([B*nv*TILE, TILE] if not shared_const)
         S: ttnn.Tensor,  # [B*nv*Dk, Dv]
         nweight: ttnn.Tensor,  # [TILE, Dv]  gated-norm weight (replicated rows; same all (b,h))
         out: ttnn.Tensor,  # [B*TILE, value_dim]  final (normed+gated) output
@@ -706,8 +802,10 @@ def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B):
             h = node_n * gm + node_m
             hk = h // rep
             cq, cv = hk * kt_t, h * vt  # COLUMN slabs into [B*TILE, key/value_dim]
+            # negA/dtb are per-HEAD: tile-row h of a shared tensor, else b*nv+h of a replicated one.
             for b in range(B):
                 rMv, rKv, rb = (b * nv + h) * ct, (b * nv + h) * kt_t, b * ct
+                rMc = (cstride * b + h) * ct  # cstride=0 -> shared per-head row h; nv -> b*nv+h
                 with (
                     qd.reserve() as a0,
                     krd.reserve() as a1,
@@ -726,8 +824,8 @@ def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B):
                     tz = ttl.copy(z[rb : rb + ct, cv : cv + vt], az)
                     t3 = ttl.copy(araw[rMv : rMv + ct, 0:1], a3)
                     t4 = ttl.copy(braw[rMv : rMv + ct, 0:1], a4)
-                    t5 = ttl.copy(negA[rMv : rMv + ct, 0:1], a5)
-                    t6 = ttl.copy(dtb[rMv : rMv + ct, 0:1], a6)
+                    t5 = ttl.copy(negA[rMc : rMc + ct, 0:1], a5)
+                    t6 = ttl.copy(dtb[rMc : rMc + ct, 0:1], a6)
                     t7 = ttl.copy(S[rKv : rKv + kt_t, 0:vt], a7)
                     t11 = ttl.copy(nweight[0:ct, 0:vt], a11)
                     t0.wait()
@@ -851,13 +949,34 @@ def _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B):
 
 
 def decode_step_batch_tt(
-    q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew, n_v_heads, n_k_heads, scale, norm_eps, B
+    q,
+    kr,
+    v,
+    z,
+    araw,
+    braw,
+    negA,
+    dtb,
+    S,
+    nweight,
+    out,
+    Snew,
+    n_v_heads,
+    n_k_heads,
+    scale,
+    norm_eps,
+    B,
+    shared_const=None,
 ):
     """ttnn-native entry for the BATCHED fused decode kernel (B independent users). All args device
     ttnn tensors: q/kr [B*TILE,key_dim], v/z/out [B*TILE,value_dim] (user b on tile-row b, heads along
-    columns); araw/braw/negA/dtb [B*nv*TILE,TILE] (uniform per (b,h)); S/Snew [B*nv*Dk,Dv] head-major
-    over (b,h); nweight [TILE,Dv]. Writes `out` and `Snew`."""
-    _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B)(
+    columns); araw/braw [B*nv*TILE,TILE] (uniform per (b,h)); S/Snew [B*nv*Dk,Dv] head-major over
+    (b,h); nweight [TILE,Dv]. Writes `out` and `Snew`.
+
+    negA/dtb are per-HEAD: [nv*TILE,TILE] when `shared_const` (the default -- see
+    _BATCH_SHARED_CONST), else the B-replicated [B*nv*TILE,TILE]. `Snew` may ALIAS `S`, in which case
+    the state is updated in place on-core (see gated_delta._GDN_ALIAS_STATE)."""
+    _get_decode_op_batch(n_v_heads, n_k_heads, scale, norm_eps, B, shared_const)(
         q, kr, v, z, araw, braw, negA, dtb, S, nweight, out, Snew
     )
 

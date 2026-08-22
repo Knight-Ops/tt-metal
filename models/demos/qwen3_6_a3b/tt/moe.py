@@ -81,9 +81,16 @@ _DENSE_TMAX = 256
 #
 # Set on the two tensors that FEED a matmul: `xe` (gate_up's in0, the E-fold activation broadcast and
 # the single largest tensor in the block) and `h` (the down projection's in0). `ttnn.matmul` inherits
-# its output dtype from in0, so `ye` = down(h) is carried along too and three of the four big
-# intermediates narrow for one knob. The remaining one, the [E, tc, 2*inter] gate_up output, must stay
-# BFLOAT16: it is consumed by `ttnn.slice`, which overflows L1 on a block-float tensor of that shape.
+# its output dtype from in0, so BOTH matmul outputs are carried along too -- `hgu` = gate_up(xe) and
+# `ye` = down(h) -- and with them the slices/silu/multiply derived from `hgu`. So this one knob narrows
+# every big intermediate in the block, not three of four.
+#
+# CORRECTION (measured 2026-08-22, allocator trace through one tc=256 chunk): an earlier note here
+# claimed the [E, tc, 2*inter] gate_up output "must stay BFLOAT16" because `ttnn.slice` overflows L1 on
+# a block-float tensor of that shape. It does not. At the shipping default it is BFLOAT8_B --
+# `matmul->256x256x1024 BFLOAT8_B` -- the two slices of it succeed, `_FAST_DENSE_OK` never trips, and
+# the tensor is 68 MB rather than the 128 MB the old note implies. That note also contradicted the
+# `_DENSE_IN0BW` table below, which records "BFP8 in0, block 8 -> fits" for this very shape.
 _MOE_ACT_BF16 = os.environ.get("QWEN36_MOE_ACT_BF16") == "1"
 _MOE_ACT_DT = ttnn.bfloat16 if _MOE_ACT_BF16 else ttnn.bfloat8_b
 
@@ -100,6 +107,58 @@ _MOE_ACT_DT = ttnn.bfloat16 if _MOE_ACT_BF16 else ttnn.bfloat8_b
 # Reverting the dtype reverts this too (bf16 in0 with block 8 does not fit L1 at tc=256), unless the
 # caller overrides it explicitly.
 _DENSE_IN0BW = int(os.environ.get("QWEN36_DENSE_IN0BW", "1" if _MOE_ACT_BF16 else "8"))
+
+# Free each dense-prefill expert intermediate as soon as it is dead, instead of letting it live to the
+# end of the enclosing python frame. The stage holds six big [E, tc, *] tensors and only two of them
+# are live at the down projection, so the frame-lifetime default carries a few hundred MB of
+# already-dead data. MEASURED (allocator trace, one tc=256 chunk, 2026-08-22): stage peak
+# 449.3 -> 205.8 MB, i.e. 243.5 MB less, and the peak MOVES from the down projection to the gate_up
+# matmul -- where it is now structural (that matmul's in0 and output must both exist), so this is
+# roughly as far as freeing alone can go. Footprint only: no op changes, no numeric change. It is also
+# what the rest of the repo does (deepseek_v3 has 465 ttnn.deallocate calls; tt_transformers
+# deallocates inside its captured bodies too, so this is legal under trace capture).
+#
+# ONLY genuine op outputs are freed. `ttnn.deallocate` defaults to force=True, so it releases the
+# buffer even when another tensor shares it -- which makes a `ttnn.reshape` VIEW unsafe to pass here
+# (`gate_up_w`/`down_w` below are reshape views of the expert WEIGHTS; freeing those would destroy the
+# model). Every tensor freed below comes straight out of a matmul / slice / repeat / multiply.
+#
+# Deallocating an operand after its consumer has been ENQUEUED is safe for standard ttnn ops: one
+# command queue is FIFO, so the earlier program reads the buffer before any later allocation can write
+# it. That is NOT true of the custom ttl kernels in tt/gated_delta.py -- see the `keep` list there,
+# which documents a measured corruption from exactly this. Nothing here is a ttl operand.
+# QWEN36_MOE_DEALLOC=0 reverts to frame-lifetime frees.
+_MOE_DEALLOC = os.environ.get("QWEN36_MOE_DEALLOC", "1") != "0"
+
+
+def _drop(*tensors):
+    """Release dead device intermediates now. See _MOE_DEALLOC for why this is safe here."""
+    if _MOE_DEALLOC:
+        for t in tensors:
+            ttnn.deallocate(t)
+
+
+# Compute the SwiGLU's activation inside the multiply's compute kernel (`input_tensor_a_activations`)
+# instead of as a separate `ttnn.silu` op. Removes one full-size intermediate and one read+write pass
+# over it -- on the dense prefill stage that is 34 MB of tensor and ~68 MB of traffic per layer per
+# chunk, on a stage measured to be DRAM-bandwidth-bound at ~76% of peak (see forward()).
+#
+# It is NOT bit-identical: the activation is evaluated in DST and fed straight to the multiply rather
+# than round-tripped through a packed DRAM tensor, so it carries MORE precision but a different
+# rounding. That is why it ships DEFAULT OFF behind this flag rather than as a silent change -- the
+# routed-expert path feeds a BFP4-weight matmul at LoFi so the headroom is ample, but "ample" is a
+# claim for `evaluation/run_mmlu_bench.py` to settle against the 79.5% BFP4 baseline, not for a
+# comment. QWEN36_MOE_FUSED_SILU=1 enables. Used at all six SwiGLU sites in this module.
+_MOE_FUSED_SILU = os.environ.get("QWEN36_MOE_FUSED_SILU", "0") != "0"
+_SILU_ACT = [ttnn.UnaryOpType.SILU]
+
+
+def _swiglu(gate, up, **kw):
+    """silu(gate) * up -- fused into one op when _MOE_FUSED_SILU, else silu then multiply."""
+    if _MOE_FUSED_SILU:
+        return ttnn.multiply(gate, up, input_tensor_a_activations=_SILU_ACT, **kw)
+    return ttnn.multiply(ttnn.silu(gate), up, **kw)
+
 
 # Tri-state guard on the (BFP8 in0, in0_block_w=8) pair: None = not yet tried, True/False after the
 # first full-size chunk. L1 fit is NOT monotonic in the chunk size -- measured, bf16 in0 with block 8
@@ -231,12 +290,14 @@ class TtMoE(LightweightModule):
                 K-tiles per block; it must divide Kt for BOTH expert matmuls (gate_up Kt=64, down Kt=16).
 
                 NOTE this config type hard-requires ``per_core_N == Nt`` (matmul_device_operation.cpp:1615),
-                so the per-core output block can only be shrunk via per_core_M, i.e. via the token chunk. That
-                is why the [E,tc,2*inter] swiglu tensor cannot be block-float: a BLOCK-FLOAT matmul output
-                makes the op allocate a bf16 intermediate CB *in addition to* the packed output CB (~2.5x the
-                L1 for the same block; measured 1.81 MB against a 1.5 MB budget), and the only way to pay for
-                that would be halving tc — which doubles the number of chunks and therefore doubles the
-                453 MB/layer expert-weight read, costing more than the narrower activation saves."""
+                so the per-core output block can only be shrunk via per_core_M, i.e. via the token chunk. A
+                BLOCK-FLOAT matmul output makes the op allocate a bf16 intermediate CB *in addition to* the
+                packed output CB (~2.5x the L1 for the same block), so it is the (dtype, in0_block_w) PAIR
+                that has to fit — see the `_DENSE_IN0BW` table, which is where the 1.81 MB-against-1.5 MB
+                measurement belongs. It does fit at the shipping default: `hgu` is BFLOAT8_B at tc=256 with
+                in0_block_w=8 (measured), so the older blanket claim that this tensor "cannot be block-float"
+                was wrong. Halving tc to buy L1 would be the wrong trade anyway — it doubles the number of
+                chunks and therefore doubles the 453 MB/layer expert-weight read."""
         m_tiles = (m + 31) // 32
         n_tiles = (n + 31) // 32
         ck = self.compute_kernel_config
@@ -327,7 +388,7 @@ class TtMoE(LightweightModule):
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )  # [.., top_k, 1, 2I]
             gate, up = self._split_last(gu, I)
-            h = ttnn.multiply(ttnn.silu(gate), up)  # [.., top_k, 1, I]
+            h = _swiglu(gate, up)  # [.., top_k, 1, I]
             down = ttnn.sparse_matmul(
                 h,
                 self.down_sp,
@@ -350,7 +411,7 @@ class TtMoE(LightweightModule):
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         gate, up = self._split_last(gu, I)
-        h = ttnn.multiply(ttnn.silu(gate), up)  # [1, E, 1, I]
+        h = _swiglu(gate, up)  # [1, E, 1, I]
         down = ttnn.sparse_matmul(
             h,
             self.down_sp,
@@ -437,7 +498,7 @@ class TtMoE(LightweightModule):
                 memory_config=ttnn.L1_MEMORY_CONFIG,
             )  # [1, na, K, 2I]
             gate, up = self._split_last(gu, I)
-            h = ttnn.reshape(ttnn.multiply(ttnn.silu(gate), up), [1, na, K, I])
+            h = ttnn.reshape(_swiglu(gate, up), [1, na, K, I])
             down = ttnn.sparse_matmul(
                 h,
                 self.down_sp,
@@ -468,7 +529,7 @@ class TtMoE(LightweightModule):
             memory_config=ttnn.L1_MEMORY_CONFIG,
         )
         gate, up = self._split_last(gu, I)
-        h = ttnn.multiply(ttnn.silu(gate), up)  # [1, E, 32, I]
+        h = _swiglu(gate, up)  # [1, E, 32, I]
         h = ttnn.reshape(h, [1, E, 32, I])
         down = ttnn.sparse_matmul(
             h,
@@ -502,7 +563,7 @@ class TtMoE(LightweightModule):
         with sp.region("moe.shared"):
             se_gu = ttnn.linear(x2, self.se_gate_up)  # [T, 2*se_inter]
             se_gate, se_up = self._split_last(se_gu, self.se_inter)
-            shared = ttnn.multiply(ttnn.silu(se_gate), se_up)
+            shared = _swiglu(se_gate, se_up)
             if self._se_down_dram is not None and x2.shape[0] == 1:
                 # Decode: DRAM-sharded se_down. Reshard in, matmul, reshard back to interleaved DRAM.
                 sh_in = ttnn.to_memory_config(shared, self._se_amc)
@@ -618,16 +679,23 @@ class TtMoE(LightweightModule):
                     gate_up_w,
                     program_config=self._dense_expert_pc(tc, 2 * I, cbw),
                     compute_kernel_config=self.compute_kernel_config,
-                )  # [E, tc, 2*inter], BFLOAT16 — see the _MOE_ACT_DT note (slice + block-float)
+                )  # [E, tc, 2*inter]; dtype INHERITED from in0 (BFLOAT8_B by default, 68 MB at tc=256)
+                _drop(xe)  # the E-fold broadcast (136 MB at tc=256), dead the moment it is consumed
             with prof.phase(self.mesh_device, "moe.swiglu"), sp.region("moe.swiglu"):
                 gate = ttnn.slice(hgu, [0, 0, 0], [E, tc, I])
                 up = ttnn.slice(hgu, [0, 0, I], [E, tc, 2 * I])
-                h = ttnn.multiply(ttnn.silu(gate), up)  # [E, tc, inter]
+                _drop(hgu)  # fully consumed by the two slices (68 MB at tc=256; BFLOAT8_B, measured)
+                h = _swiglu(gate, up)  # [E, tc, inter]
+                _drop(gate, up)  # 34 MB each at tc=256
                 # Fold the routing weight into the down-projection INPUT. down is a linear matmul (no
                 # bias), so sum_e w_e·down(h_e) == sum_e down(w_e·h_e); scaling the [E,tc,I] input is
                 # ~4x less data than scaling the [E,tc,H] output and lets the expert-reduce be a sum.
                 wc = ttnn.reshape(ttnn.transpose(ttnn.slice(routing, [t0, 0], [t1, E]), 0, 1), [E, tc, 1])
-                h = ttnn.multiply(h, wc, dtype=cdt)  # down's in0: fold + narrow in one pass
+                hw = ttnn.multiply(h, wc, dtype=cdt)  # down's in0: fold + narrow in one pass
+                # `hw` is the routing-weighted copy that down consumes; the raw swiglu output is dead.
+                # (At the default both are already BFLOAT8_B, so `dtype=cdt` folds rather than narrows.)
+                _drop(h)
+                h = hw
             with prof.phase(self.mesh_device, "moe.down_mm"), sp.region("moe.down_mm"):
                 ye = ttnn.matmul(
                     h,
@@ -635,11 +703,13 @@ class TtMoE(LightweightModule):
                     program_config=self._dense_expert_pc(tc, H, cbw),
                     compute_kernel_config=self.compute_kernel_config,
                 )  # [E, tc, hidden] — `dtype` is INHERITED from in0, so this is `cdt` too
+                _drop(h)
             with prof.phase(self.mesh_device, "moe.reduce"), sp.region("moe.reduce"):
                 # Land every chunk in BFLOAT16: `ye` (and so this sum) inherits in0's dtype, which
                 # differs between a full chunk and a short tail, and ttnn.concat rejects mixed dtypes.
                 # Only [tc, hidden] crosses this boundary, so the upcast is ~1 MB, and the residual /
                 # norm chain downstream never sees a block-float tensor.
                 y = ttnn.sum(ye, dim=0)  # [tc, hidden]
+                _drop(ye)  # 136 MB at tc=256; only the [tc, hidden] reduction survives the chunk
                 outs.append(y if y.dtype == ttnn.bfloat16 else ttnn.typecast(y, ttnn.bfloat16))
         return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # [T, hidden]
