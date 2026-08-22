@@ -18,7 +18,7 @@ import ttnn
 from models.common.utility_functions import comp_pcc
 from models.demos.qwen3_6_a3b.reference.qwen3_5_moe import Qwen35MoeConfig
 from models.demos.qwen3_6_a3b.tt.common import from_tt, to_tt
-from models.demos.qwen3_6_a3b.tt.gated_delta import TtGatedDeltaNet
+from models.demos.qwen3_6_a3b.tt.gated_delta import _STATE_DT, TtGatedDeltaNet
 
 PCC_GATE = 0.99
 
@@ -69,7 +69,10 @@ def _fresh(mesh_device, cfg, gdn, Tp, x_pre):
             layout=ttnn.TILE_LAYOUT,
             device=mesh_device,
         ),
-        "recurrent_state": ttnn.zeros([1, V, kd, vd], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=mesh_device),
+        # dtype must follow QWEN36_GDN_FP32_STATE: the fused kernel is all-bf16 or all-fp32 (ttl
+        # rejects mixed tile arguments), so a hardcoded bf16 state fails to compile against an
+        # fp32 build rather than testing it.
+        "recurrent_state": ttnn.zeros([1, V, kd, vd], dtype=_STATE_DT, layout=ttnn.TILE_LAYOUT, device=mesh_device),
     }
     gdn.forward(to_tt(x_pre.reshape(1, 1, Tp, cfg.hidden_size), mesh_device), cache=cache)
     return cache

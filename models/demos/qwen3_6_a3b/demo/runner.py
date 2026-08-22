@@ -75,7 +75,7 @@ class Qwen36Runner:
         self,
         model_path: str,
         device,
-        max_seq: int = 8192,
+        max_seq: int = 32768,
         trace_region_size: Optional[int] = None,
         use_trace: bool = True,
         enable_thinking: bool = True,

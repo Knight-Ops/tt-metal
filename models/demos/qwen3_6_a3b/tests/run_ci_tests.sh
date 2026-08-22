@@ -6,7 +6,8 @@
 # checkpoint: these are the checkpoint-free module tests (random / per-module weights). The
 # checkpoint-required tests (test_model/test_trace/test_long_prefill/test_ragged_prefill) and the
 # reference-venv cross-validation (test_reference_smoke) are intentionally excluded — see
-# pcc_thresholds.json.
+# pcc_thresholds.json. test_cache_topology reads only the checkpoint's config.json (no weights) and
+# skips cleanly if it is absent.
 #
 # Wire this into tt-metal CI by adding one entry that invokes this script to the Blackhole
 # single-card unit-test matrix (tests/pipeline_reorg/*.yaml, consumed by
@@ -18,6 +19,7 @@ PYTHON="${PYTHON:-./python_env/bin/python}"
 TESTDIR="models/demos/qwen3_6_a3b/tests"
 
 exec "$PYTHON" -m pytest -p no:cacheprovider -q \
+  "$TESTDIR/test_cache_topology.py" \
   "$TESTDIR/test_norms.py" \
   "$TESTDIR/test_attention.py" \
   "$TESTDIR/test_attention_decode.py" \

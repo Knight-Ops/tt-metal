@@ -142,36 +142,64 @@ to use the eager decode path (no per-request trace capture).
 
 ### vLLM / tt-inference-server status
 
-`demo/generator_vllm.py` is a **scaffold** of the vLLM `Qwen36ForCausalLM` wrapper
-that tt-inference-server would load. It imports cleanly under a vLLM environment and
-makes the contract explicit, but its forward / kv-cache methods raise
-`NotImplementedError`. The test server above is enough for interactive use; full
-vLLM serving is blocked on the barriers below (the same list lives in the scaffold's
-docstring, keyed to the method that needs each one closed):
+The vLLM adapter lives in `packaging/vllm_bundle/generator_vllm.py`, shipped inside a
+`tt-kernel --backend vllm` bundle; `packaging/VLLM_CONTINUOUS_BATCHING.md` holds the full plan
+and status. **Milestone V1 (single-sequence, B=1) is drafted but hardware-unverified** — every
+`VERIFY-ON-DEVICE` note in that file's docstring is an assumption about the plugin contract that
+still needs a running P150 plus the TT plugin to confirm.
 
-1. **Batched / multi-user.** `TtModel` is batch-1 (input `[1, T]`); vLLM drives
-   `max_num_seqs > 1`. A batch dimension must be threaded through prefill + decode.
-2. **Paged KV cache.** Attention layers use a contiguous `[1, n_kv, max_seq, hd]`
-   cache updated at a scalar position (`paged_update_cache`); vLLM owns a paged cache
-   and passes per-layer `page_table` / block tables the model must consume.
-3. **Linear-attention has no KV-cache spec (biggest blocker).** `config.layer_types`
-   contains `linear_attention` (Gated DeltaNet — recurrent state, not attention KV).
-   The hybrid base's `get_kv_cache_spec` only accepts `sliding_attention` /
-   `full_attention` and raises on `linear_attention`; these layers need a recurrent
-   ("Mamba-style") state spec that the TT vLLM plugin must support. Confirm plugin
-   support before committing to the rest.
-4. **Sampling.** Decode bakes greedy argmax on-device and returns only the next token
-   id; vLLM expects host-side sampling from logits (or a verified on-device-sample
-   contract). A logits-returning decode path is needed.
-5. **Generator-base mismatch.** Stock wrappers delegate to `prefill_forward_text` /
-   `decode_forward` on a `tt_transformers.Transformer`; `TtModel` implements neither,
-   so the bridge must be written against this model.
+Closed since the original barrier list:
 
-Once those are closed, register `TTQwen3_5MoeForConditionalGeneration` →
-`models.demos.qwen3_6_a3b.demo.generator_vllm:Qwen36ForCausalLM` in the tt-vllm-plugin
-`ModelRegistry`, and add an `ImplSpec` + Blackhole/P150 `ModelSpec`
-(`InferenceEngine.VLLM`, `override_tt_config={"optimizations": "performance"}`) in the
-tt-inference-server workflows.
+- **Linear-attention has no KV-cache spec — closed, by not needing one.** The Tenstorrent
+  plugin's KV-cache layer hard-rejects any non-`AttentionSpec`, so it can never carry a
+  Mamba-style recurrent spec for the 30 `linear_attention` layers. The adapter therefore
+  inherits plain `Generator`, defines **no** `get_kv_cache_spec`, and keeps **both** the
+  attention KV and the GDN conv/recurrent state in the model's own device buffers, re-zeroed
+  per sequence (`_reset_linear_state`). Note this was a *plugin* constraint, not a framework
+  one: upstream vLLM V1 does ship a `MambaSpec` and does serve the Qwen3-Next hybrid on GPU.
+- **Sampling — closed.** `decode_forward_logits()` returns `[B, vocab]` for host-side
+  sampling; on-device sampling stays available via `enable_sampling()`.
+- **Generator-base mismatch — closed.** V1 overrides `prefill_forward` / `decode_forward` to
+  drive this model's own loop (`start_decode` → `decode_forward_logits` → `set_decode_tokens`)
+  rather than the `tt_transformers.Transformer` contract.
+
+Still open:
+
+1. **Paged KV.** Attention layers use a contiguous `[B, n_kv, max_seq, hd]` cache updated at a
+   position tensor (`paged_update_cache`); vLLM's block manager is bypassed
+   (`allocate_kv_cache` returns `[]`). This is what forces the per-slot context cap at B>1.
+2. **Per-slot (rather than synchronized) continuous batching.** The on-device pieces exist —
+   batched GDN state and kernel (`decode_step_batch_tt`, 4.52× at B=32 ≈ 157 tok/s), batched
+   attention KV, dense MoE for B>1, and `prefill_into_slot` — but batched prefill and the
+   scheduler bridge are unfinished, and the per-slot state writes are unverified on device.
+
+Registration is by HF architecture name: the plugin must resolve
+`Qwen3_5MoeForConditionalGeneration` to the bundle's class via `EXTRA_MODELS_DIR`. Add an
+`ImplSpec` plus a Blackhole/P150 `ModelSpec` (`InferenceEngine.VLLM`,
+`override_tt_config={"optimizations": "performance"}`) in the tt-inference-server workflows.
+
+### Memory: KV cache and Gated-DeltaNet state
+
+Worth knowing before setting `QWEN36_MAX_SEQ`, because the hybrid changes the arithmetic.
+Only the **10 `full_attention` layers** hold a KV cache; the **30 `linear_attention` layers**
+carry a Gated-DeltaNet recurrent state whose size does not depend on context length.
+
+| | per token | at 32K | at 262144 (native) |
+|---|---|---|---|
+| this model (10 attn layers) | **20 KiB** | 0.67 GB | **5.4 GB** |
+| dense-equivalent (all 40 layers) | 80 KiB | 2.7 GB | 21.5 GB |
+
+`20 KiB = 10 layers x 2 (K,V) x n_kv_heads(2) x head_dim(256) x 2 B` (bfloat16) — a **4x**
+reduction, and what makes both long context and B=32 fit a 32 GB P150 alongside ~17.5 GB of
+BFP4 weights. Decode reads are bounded by position (`cur_pos_tensor`), not by `max_seq`, so a
+generous `max_seq` costs DRAM but not tokens/s.
+
+The state is not free, though, and it does not shrink with short prompts: GDN state is
+**~90 MiB per user at B=1** (30 x [1 MiB recurrent + tile-padded conv history]),
+sequence-independent. Against 20 KiB/token, the crossover is **~4.6K tokens** — below that
+context the "cheap" linear layers cost *more* memory per user than the attention layers do. At
+B=32 the conv buffers fill their tiles exactly, so per-user state falls to ~33 MiB and the
+crossover to ~1.7K tokens. `tests/test_cache_topology.py` pins all of this.
 
 ### Useful env vars
 
@@ -179,7 +207,8 @@ tt-inference-server workflows.
 |-----|---------|--------|
 | `QWEN36_CKPT` | `~/models/qwen36` | checkpoint dir |
 | `QWEN36_LAYERS` | 40 | number of decoder layers to build |
-| `QWEN36_MAX_SEQ` | 512 | KV/state cache length |
+| `QWEN36_MAX_SEQ` | 32768 | KV/state cache length, i.e. the hard prompt+generation limit. At 20 KiB/token (see Memory above) 32K is ~0.67 GB of KV; the checkpoint's native 262144 is ~5.4 GB |
+| `QWEN36_MAX_NEW_DEFAULT` | 8192 | `server.py`: generation cap for a request that sends no `max_tokens`. Deliberately independent of `QWEN36_MAX_SEQ` so widening the context does not lengthen runaway generations |
 | `QWEN36_SERVER_HOST` | `0.0.0.0` | server bind host (`server.py`) |
 | `QWEN36_SERVER_PORT` | 8000 | server port (`server.py`) |
 | `QWEN36_SERVER_TRACE` | 1 | `0` uses the eager decode path (no trace capture) |
@@ -197,6 +226,7 @@ tt-inference-server workflows.
 | `QWEN36_SPARSE_IN0BW_GU` | 32 | MoE `gate_up` sparse-matmul `in0_block_w` (its Kt=64 is not constrained by `down`'s Kt=16) |
 | `QWEN36_GDN_VERIFY_CONV_STACK` | 1 | stacked-matmul verify conv (verify 52.5→44.0 ms, PCC 0.9997→0.99998); `0` reverts to the slice loop |
 | `QWEN36_GDN_COMMIT_COPY` | 1 | full-accept conv commit as one copy (round −2.6 ms) |
+| `QWEN36_GDN_ALIAS_STATE` | 1 | fused decode kernel writes the recurrent state **in place** (S and Snew are the same buffer), deleting the per-layer `ttnn.copy` and its 1 MB scratch. **Bit-identical** (probe_state_alias.py: max\|Δ\|=0 on state and output at real dims); measured 28.44 → 28.16 ms/token (35.2 → 35.5 tok/s), GDN 0.319 → 0.312 ms/op, −30 MB pinned. `0` reverts |
 | `QWEN36_GDN_COMMIT_SELECT` | 0 | general commit as selection matmuls: −5.1 ms but breaks sampled acceptance at 40L — see EXPERIMENTS.md |
 
 ## Correctness

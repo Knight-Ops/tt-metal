@@ -39,6 +39,10 @@ class Qwen35MoeConfig:
     hidden_act: str = "silu"
     rms_norm_eps: float = 1e-6
     attention_bias: bool = False
+    # Per-head output gate on full attention (q_proj emits n_heads*head_dim*2; the second half gates
+    # the attention output through sigmoid). The tt-nn attention implements this unconditionally, so
+    # ModelArgs asserts it is set — see Qwen35MoeAttention / tt/attention.py.
+    attn_output_gate: bool = True
     # rope
     rope_theta: float = 1e7
     partial_rotary_factor: float = 0.25
@@ -87,6 +91,7 @@ class Qwen35MoeConfig:
             hidden_act=tc.get("hidden_act", "silu"),
             rms_norm_eps=tc.get("rms_norm_eps", 1e-6),
             attention_bias=tc.get("attention_bias", False),
+            attn_output_gate=tc.get("attn_output_gate", True),
             rope_theta=rope.get("rope_theta", tc.get("rope_theta", 1e7)),
             partial_rotary_factor=rope.get("partial_rotary_factor", tc.get("partial_rotary_factor", 0.25)),
             mrope_section=tuple(rope.get("mrope_section", [11, 11, 10])),

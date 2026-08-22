@@ -19,7 +19,20 @@ from models.demos.qwen3_6_a3b.reference.qwen3_5_moe import Qwen35MoeConfig
 class ModelArgs:
     """Holds architecture dims (from HF config) plus tt-nn device/precision config."""
 
-    def __init__(self, mesh_device, ckpt_dir: str | None = None, max_batch_size: int = 1, max_seq_len: int = 4096):
+    # Default context. Only the 10 full_attention layers hold a KV cache (the 30 linear_attention
+    # layers carry a fixed-size recurrent state), so KV costs 10 * 2(K,V) * n_kv_heads(2) *
+    # head_dim(256) * 2 B = 20 KiB/token -- a quarter of the 80 KiB/token a dense 40-layer model of
+    # these dims would need. 32K context is therefore ~0.64 GB of KV against ~17.5 GB of BFP4
+    # weights; even the checkpoint's native 262144 is only ~5.0 GB. See README ("Memory").
+    DEFAULT_MAX_SEQ_LEN = 32768
+
+    def __init__(
+        self,
+        mesh_device,
+        ckpt_dir: str | None = None,
+        max_batch_size: int = 1,
+        max_seq_len: int = DEFAULT_MAX_SEQ_LEN,
+    ):
         self.mesh_device = mesh_device
         self.max_batch_size = max_batch_size
         self.max_seq_len = max_seq_len
@@ -49,6 +62,13 @@ class ModelArgs:
         self.rope_theta = c.rope_theta
         self.rotary_dim = int(c.head_dim * c.partial_rotary_factor)  # 64
         self.layer_types = c.layer_types
+        # Fidelity guards for the two architecture facts the tt-nn modules hardcode rather than
+        # read: the per-head attention output gate (tt/attention.py splits q_proj into query and
+        # gate halves and always applies sigmoid(gate)), and the absence of attention bias. Both
+        # hold for this checkpoint; a variant that flipped either would produce silently wrong
+        # output, so fail loudly at build time instead of generating garbage.
+        assert c.attn_output_gate, "attn_output_gate=False is not implemented (tt/attention.py always gates)"
+        assert not c.attention_bias, "attention_bias=True is not implemented (q/k/v/o are bias-free)"
 
         # linear-attention (Gated DeltaNet) dims
         self.lin_num_k_heads = c.linear_num_key_heads
