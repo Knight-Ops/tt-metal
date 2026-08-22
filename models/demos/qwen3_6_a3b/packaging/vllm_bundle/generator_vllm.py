@@ -470,8 +470,19 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             rfd = read_from_device
             if enable_trace:
                 if not model._vllm_traced:
-                    out = model.decode_step_eager(read_from_device=rfd)  # compile
-                    model.capture_decode_trace()
+                    if model.decode_trace_ready():
+                        # An earlier request already captured this exact tail, and the buffers the
+                        # graph reads (token/positions, and the sampling params) are written in place
+                        # at stable addresses rather than reallocated -- so replay it directly and skip
+                        # BOTH the eager warm-up step and the capture. Per-request top_k / top_p /
+                        # temperature / seed still take effect: they are device tensors the graph
+                        # reads. presence_penalty is the exception (a baked scalar) and is part of the
+                        # readiness signature, so changing it re-captures rather than silently
+                        # reusing the previous request's value.
+                        out = model.decode_step_traced(read_from_device=rfd)
+                    else:
+                        out = model.decode_step_eager(read_from_device=rfd)  # compile
+                        model.capture_decode_trace()
                     model._vllm_traced = True
                 else:
                     out = model.decode_step_traced(read_from_device=rfd)  # fast replay (~30 tok/s)
@@ -488,8 +499,11 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         rfd = read_from_device
         if enable_trace:
             if not model._vllm_traced:
-                out = model.decode_forward_logits(read_from_device=rfd)
-                model.capture_decode_logits_trace()
+                if model.logits_trace_ready():
+                    out = model.decode_step_logits_traced(read_from_device=rfd)  # reuse; see above
+                else:
+                    out = model.decode_forward_logits(read_from_device=rfd)
+                    model.capture_decode_logits_trace()
                 model._vllm_traced = True
             else:
                 out = model.decode_step_logits_traced(read_from_device=rfd)

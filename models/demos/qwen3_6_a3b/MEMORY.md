@@ -217,6 +217,22 @@ including inside traced bodies — so it is legal under capture).
 | fused SiLU into the multiply (**default OFF**, pending MMLU) | `QWEN36_MOE_FUSED_SILU` | 3.1% of the stage @ T=512 |
 | decode-trace reuse across requests | `QWEN36_TRACE_REUSE` | **~460–487 ms per request** |
 
+Trace reuse covers **both** decode graphs, because the vLLM adapter drives both and each used to pay
+an eager warm-up call plus a full capture on the first step of every request:
+
+| adapter branch | model call | readiness check | what the signature must cover |
+|---|---|---|---|
+| on-device sampling | `decode_step_*` / `capture_decode_trace` | `decode_trace_ready()` | sampling on/off, **presence-penalty value**, decode batch B, `_samp_nc` |
+| host sampling | `decode_forward_logits` / `capture_decode_logits_trace` | `logits_trace_ready()` | decode batch B only — this graph has no sampling tail |
+
+The presence penalty is in the first signature and nothing else from the sampling params is, and the
+distinction matters: `top_k` / `top_p` / `temperature` / `seed` are read from device tensors
+(`t_k` / `t_p` / `t_temp` / `t_seed`) so a per-request write takes effect under reuse, which is the
+whole point. `presence_penalty` is multiplied into the graph as a python scalar, so it is frozen at
+capture and a change must force a re-capture. `demo/server.py` uses one server-wide default and would
+never have noticed; the vLLM adapter passes the request's own value, and the manifest sets
+`sample_on_device_mode: decode_only`, so that path is live in production.
+
 End to end, 40 layers, defaults vs every switch flipped:
 
 | | reverted | new | saved |

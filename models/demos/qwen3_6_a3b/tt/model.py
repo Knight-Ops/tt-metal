@@ -1882,7 +1882,26 @@ class TtModel(LightweightModule):
             return ttnn.clone(self.t_tok)
         return int(from_tt(self.t_tok, self.mesh_device).flatten()[0])
 
-    def capture_decode_logits_trace(self):
+    def _logits_trace_sig(self):
+        """What changes the LOGITS decode graph's shape. Only the decode batch: this graph is
+        embed -> layers -> norm -> lm_head with no sampling tail, so none of the sampling params
+        (baked or tensor-borne) can affect it -- unlike _decode_trace_sig."""
+        return (int(self.t_tok.shape[0]) if getattr(self, "t_tok", None) is not None else 0,)
+
+    def logits_trace_ready(self):
+        """Can the live logits trace serve the current config? If so the caller can skip both the
+        re-capture and the eager warm-up call, and go straight to decode_step_logits_traced().
+
+        Sound for the same reason as decode_trace_ready: the buffers this graph reads (t_tok,
+        t_curpos, t_ropepos) are now written in place at stable addresses rather than reallocated per
+        request, so a trace outlives the request that recorded it."""
+        if not self._TRACE_REUSE:
+            return False
+        return getattr(self, "logits_trace_id", None) is not None and (
+            getattr(self, "_logits_trace_sig_v", None) == self._logits_trace_sig()
+        )
+
+    def capture_decode_logits_trace(self, force=False):
         """Record the LOGITS-returning decode step (embed -> layers -> norm -> lm_head) as a trace,
         for the vLLM host-sampling path: replay computes logits into a persistent buffer and the host
         samples from them (per-request temperature/top-p/penalties/logprobs stay in vLLM's sampler).
@@ -1892,7 +1911,12 @@ class TtModel(LightweightModule):
         Mirrors capture_decode_trace: releases any prior logits trace, snapshots/restores the decode
         state around the dummy recording step (the recorded step advances positions on device, so it
         would perturb generation otherwise). PRECONDITION: one eager decode_forward_logits() has run so
-        all kernels are compiled (capture must not JIT)."""
+        all kernels are compiled (capture must not JIT).
+
+        NO-OP when the live logits trace already matches (logits_trace_ready) — the same
+        across-requests reuse capture_decode_trace does. force=True re-records regardless."""
+        if not force and self.logits_trace_ready():
+            return self.logits_trace_id
         if getattr(self, "logits_trace_id", None) is not None:
             ttnn.release_trace(self.mesh_device, self.logits_trace_id)
         snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
@@ -1906,6 +1930,8 @@ class TtModel(LightweightModule):
         ttnn.end_trace_capture(self.mesh_device, self.logits_trace_id, cq_id=0)
         for orig, s in zip(self._trace_snapshot_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
+        self._logits_trace_sig_v = self._logits_trace_sig()
+        return self.logits_trace_id
 
     def decode_step_logits_traced(self, read_from_device: bool = True):
         """Replay the captured logits trace for one real step. The 40-layer compute is replayed from
