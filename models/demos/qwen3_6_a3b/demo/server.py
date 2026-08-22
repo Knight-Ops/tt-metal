@@ -36,7 +36,7 @@ This is a testing server; for multi-user serving see ``generator_vllm.py``.
 Launch (tt-metal python_env), standalone — opens the 1x1 mesh directly like demo.py:
     QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/demo/server.py
 Env knobs: QWEN36_SERVER_HOST (0.0.0.0), QWEN36_SERVER_PORT (8000),
-QWEN36_CKPT, QWEN36_LAYERS (40), QWEN36_MAX_SEQ (512),
+QWEN36_CKPT, QWEN36_LAYERS (40), QWEN36_MAX_SEQ (32768), QWEN36_MAX_NEW_DEFAULT (8192),
 QWEN36_SERVER_TRACE (1 = capture a decode trace per request for the fast path).
 """
 
@@ -747,6 +747,11 @@ class Qwen36Engine:
         `traced=True` means a usable decode trace is already live — used when `_decode_mtp` disengages
         mid-request and hands the rest of the generation over.
 
+        The first step re-captures ONLY when the live trace cannot serve this request's tail
+        (`decode_trace_ready`). Same-tail requests -- the common case -- reuse it and pay neither the
+        eager warm-up step nor the capture, so the 43-46 ms/token settling described below applies to
+        the first request of a tail, not to every request.
+
         Also records `plain_ms_per_token` END TO END — i.e. including the caller's per-token work
         (`_generate_text` re-decodes the whole token list each step). That is deliberately the number
         `_decode_mtp` compares against: a speculative round pays the same host cost per token, so
@@ -763,8 +768,15 @@ class Qwen36Engine:
             yield next_id
             t_step = time.time()
             if self.use_trace and not traced:
-                next_id = self.model.decode_step_eager()  # warmup compiles kernels
-                self.model.capture_decode_trace()
+                if self.model.decode_trace_ready():
+                    # A previous request already captured this exact tail, and the buffers the graph
+                    # reads are now reused in place rather than reallocated -- so replay it directly
+                    # and skip BOTH the eager warm-up step and the capture. That is what removes the
+                    # per-request 43-46 ms/token drain measured in this docstring.
+                    next_id = self.model.decode_step_traced()
+                else:
+                    next_id = self.model.decode_step_eager()  # warmup compiles kernels
+                    self.model.capture_decode_trace()
                 traced = True
             elif self.use_trace:
                 next_id = self.model.decode_step_traced()
@@ -914,8 +926,11 @@ class Qwen36Engine:
                     m.release_mtp_traces()  # capture the plain trace from a clean slate (see above)
                     # _mtp_cur was already yielded, so take one step for the NEXT token, then capture
                     # this request's own decode tail exactly as the plain path's first step does.
-                    nxt = self.model.decode_step_eager()
-                    self.model.capture_decode_trace()
+                    if self.model.decode_trace_ready():
+                        nxt = self.model.decode_step_traced()
+                    else:
+                        nxt = self.model.decode_step_eager()
+                        self.model.capture_decode_trace()
                     yield from self._decode_plain(nxt, budget - n_out, traced=True)
                     return
 
@@ -1006,13 +1021,21 @@ def list_models():
     return {"object": "list", "data": [{"id": MODEL_ID, "object": "model"}]}
 
 
+_MAX_NEW_DEFAULT = int(os.environ.get("QWEN36_MAX_NEW_DEFAULT", "8192"))
+
+
 def _default_max_new(eng: Qwen36Engine, req_max: Optional[int]) -> int:
     # When the client sets max_tokens, honor it. Otherwise offer the FULL remaining context, not a
     # fraction: this is a thinking model and agentic clients (e.g. OpenCode) emit whole files as tool
     # arguments — a small default (the old max_seq//4) truncates the reasoning or the file before the
     # <tool_call> closes, so the call is incomplete/dropped. _generate_ids caps this to the real
     # budget (max_seq - prompt_len - 1) and generation stops early on EOS, so this is an upper bound.
-    return req_max if req_max and req_max > 0 else eng.max_seq
+    # Bounded independently of max_seq: raising the CONTEXT window should not quadruple how long a
+    # runaway (non-EOS) generation runs for a client that sent no max_tokens. QWEN36_MAX_NEW_DEFAULT
+    # raises/lowers this; _generate_ids still caps it to the real remaining budget.
+    if req_max and req_max > 0:
+        return req_max
+    return min(eng.max_seq, _MAX_NEW_DEFAULT)
 
 
 def _sse(payload: dict) -> str:
@@ -1218,7 +1241,10 @@ def completions(req: CompletionRequest):
 def main():
     ckpt = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
     n_layers = int(os.environ.get("QWEN36_LAYERS", "40"))
-    max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "8192"))
+    # 32K default: KV is only 20 KiB/token here (10 of 40 layers hold KV -- the rest are Gated
+    # DeltaNet, whose state does not grow with context), so 32K costs ~0.64 GB against ~17.5 GB of
+    # weights. The old 8192 was priced as though all 40 layers cached KV.
+    max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "32768"))
     use_trace = os.environ.get("QWEN36_SERVER_TRACE", "1") != "0"
     host = os.environ.get("QWEN36_SERVER_HOST", "0.0.0.0")
     port = int(os.environ.get("QWEN36_SERVER_PORT", "8000"))

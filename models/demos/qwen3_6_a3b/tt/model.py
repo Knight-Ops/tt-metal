@@ -24,7 +24,7 @@ from models.demos.qwen3_6_a3b.tt import signpost as sp
 from models.demos.qwen3_6_a3b.tt.attention import precompute_rope
 from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt
 from models.demos.qwen3_6_a3b.tt.decoder import TtDecoderLayer
-from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN
+from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN, _STATE_DT
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
@@ -152,9 +152,11 @@ class TtModel(LightweightModule):
                     layout=ttnn.TILE_LAYOUT,
                     device=self.mesh_device,
                 ),
+                # dtype follows QWEN36_GDN_FP32_STATE: the recurrent state is a feedback accumulator
+                # and bf16 drifts measurably over a long decode (see gated_delta._FP32_STATE).
                 "recurrent_state": ttnn.zeros(
                     [1, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim],
-                    dtype=ttnn.bfloat16,
+                    dtype=_STATE_DT,
                     layout=ttnn.TILE_LAYOUT,
                     device=self.mesh_device,
                 ),
@@ -283,10 +285,32 @@ class TtModel(LightweightModule):
             x = layer.forward_prefill_traced(x, self._pf_cos[T], self._pf_sin[T], cache, self._pf_pool[T])
         ttnn.copy(x, self._pf_out[T])  # land the result at a stable address for the eager head
 
-    def capture_prefill_trace(self, T):
-        """Allocate persistent buffers for length T, run one eager compile pass (builds kernels +
-        creates the per-layer cache entries), then record the trace. PRECONDITION: mesh opened with
-        trace_region_size>0."""
+    def alloc_prefill_buffers(self, T):
+        """Allocate the persistent buffers bucket ``T``'s traced prefill reads and writes: the input id
+        buffer, its RoPE tables, the output landing buffer, and the gated-delta pool. Idempotent.
+
+        MUST happen for EVERY bucket BEFORE the FIRST capture, which is why it is split out of
+        capture_prefill_trace. Reason, MEASURED 2026-08-22 (t4_smoking_gun.py):
+
+          A trace bakes the ADDRESSES of the buffers it touches, and nothing pins its in-graph
+          transients — so they are freed the moment `end_trace_capture` returns. Allocating the NEXT
+          bucket's persistent buffers then hands them exactly that freed hole. Replaying the earlier
+          trace afterwards writes its recorded addresses, which now belong to the later bucket's pool:
+          observed bucket 512's read-only zero `S0` come back with |max| 33.19 and its `out[0]` come
+          back NaN after a single bucket-256 replay. That is the "multi-bucket prefill wedge" — the
+          later-captured bucket replayed at PCC ~0 (-0.0495), the earlier one always fine, whichever
+          way round the two were captured.
+
+          It was never a footprint problem (each bucket retains only ~18-21 MB against ~11 GB free,
+          which is why raising trace_region_size never helped) and never specific to bucket 512.
+
+        Allocating every bucket's persistent buffers up front puts them all BELOW the region the
+        captures then use for transients, so no trace's recorded writes can land on another bucket's
+        state. The transient region is still shared between traces, which is harmless: every transient
+        is written before it is read within a replay, so stale bytes there are overwritten, unlike the
+        read-only `S0` that used to be corrupted. tt-metal warns about exactly this hazard in
+        allocator.cpp ("buffers allocated when a trace is active may be corrupted once a trace is
+        executed")."""
         if not hasattr(self, "_pf_traces"):
             self._pf_traces, self._pf_ids, self._pf_cos, self._pf_sin, self._pf_out = {}, {}, {}, {}, {}
             self._pf_pool = {}
@@ -311,23 +335,23 @@ class TtModel(LightweightModule):
         # per-chunk in-graph ttnn.zeros that capture forbids). Built from the first linear layer's mixer.
         lin = next(l for l in self.layers if l.is_linear)
         self._pf_pool[T] = lin.mixer.build_trace_pool(T)
-        # Zero source to reset each layer's conv_state before a replay: prefill is always fresh (no
-        # prior context), but the conv reads conv_state as its left-pad, and that buffer persists
-        # across replays. (recurrent_state is output-only — the chunked path starts S=0 internally;
-        # KV is written fresh and prefill attends fresh k/v, so only conv_state needs resetting.)
-        if not hasattr(self, "_pf_conv_zero"):
-            self._pf_conv_zero = ttnn.zeros(
-                [self.args.conv_kernel_size - 1, self.args.lin_conv_dim],
-                dtype=ttnn.bfloat16,
-                layout=ttnn.TILE_LAYOUT,
-                device=self.mesh_device,
-            )
-        self._prefill_graph(T)  # eager compile pass (must precede capture: capture cannot JIT)
+
+    def record_prefill_trace(self, T):
+        """Eager compile pass (capture cannot JIT) then record bucket ``T``'s trace. PRECONDITION:
+        alloc_prefill_buffers has run for EVERY bucket that will be captured — see its docstring."""
+        self._prefill_graph(T)
         ttnn.synchronize_device(self.mesh_device)
         tid = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         self._prefill_graph(T)
         ttnn.end_trace_capture(self.mesh_device, tid, cq_id=0)
         self._pf_traces[T] = tid
+
+    def capture_prefill_trace(self, T):
+        """Allocate + record ONE bucket. Safe on its own; for several buckets use
+        setup_prefill_traces, which allocates them all before capturing any (see
+        alloc_prefill_buffers for why interleaving the two corrupts the later bucket)."""
+        self.alloc_prefill_buffers(T)
+        self.record_prefill_trace(T)
 
     def _default_prefill_buckets(self):
         """Powers of two that are chunk-multiples, up to (and including) max_seq_len — the model's hard
@@ -342,8 +366,14 @@ class TtModel(LightweightModule):
         """Pre-capture one prefill trace per bucket (call once at startup so capture never happens
         mid-serving). Prompts are padded up to the smallest bucket >= their length at replay."""
         self._pf_buckets = sorted(buckets) if buckets else self._default_prefill_buckets()
+        # TWO passes, and the order is load-bearing: every bucket's persistent buffers must exist
+        # before the first capture, or the later buckets' pools get allocated into the hole left by an
+        # earlier capture's freed transients and are then overwritten by that earlier trace's replay.
+        # See alloc_prefill_buffers for the measurement. This is the multi-bucket wedge fix.
         for B in self._pf_buckets:
-            self.capture_prefill_trace(B)
+            self.alloc_prefill_buffers(B)
+        for B in self._pf_buckets:
+            self.record_prefill_trace(B)
 
     def _write_valid_mask(self, B, T):
         """Write the per-request [1,1,B] valid mask (1 for the real T tokens, 0 for right-padding) into
@@ -364,10 +394,11 @@ class TtModel(LightweightModule):
         (QWEN36_TRACED_FP32_RECURRENCE=1, default) — trace capture only forbids host writes (zeros/
         fills), not the recurrence's in-graph matmul/eltwise outputs, so no bf16 kernel is needed.
         MEASURED single-bucket traced vs eager: PCC 1.00000 (was the old bf16-kernel caveat).
-        MULTI-BUCKET CAVEAT: capturing several bucket lengths can corrupt the larger trace once the
-        pinned per-trace intermediate footprint exceeds free DRAM (the real "bucket-256 wedge"); use a
-        single bucket, or pool the recurrence intermediates (follow-up), until that lands. Opt-in in
-        demo/server.py via QWEN36_SERVER_PREFILL_TRACE."""
+        MULTI-BUCKET: works as of 2026-08-22. It was never a footprint problem — it was trace address
+        aliasing (an earlier trace's replay writing into a later bucket's pool, because the earlier
+        capture's transients were freed and the later pool was allocated into the hole). Fixed by
+        allocating every bucket's buffers before any capture; see alloc_prefill_buffers and MEMORY.md.
+        Opt-in in demo/server.py via QWEN36_SERVER_PREFILL_TRACE."""
         T = input_ids.shape[1]
         buckets = getattr(self, "_pf_buckets", None) or sorted(getattr(self, "_pf_traces", {}).keys())
         B = next((b for b in buckets if b >= T), None)
@@ -380,9 +411,14 @@ class TtModel(LightweightModule):
         host_ids = ttnn.from_torch(padded, dtype=ttnn.uint32, layout=ttnn.ROW_MAJOR_LAYOUT)
         ttnn.copy_host_to_device_tensor(host_ids, self._pf_ids[B])
         self._write_valid_mask(B, T)  # zero the gated-delta state contribution of the pad tokens
-        for cache in self.caches:  # fresh prefill: reset conv left-pad to zeros before replay
-            if isinstance(cache, dict) and "conv_state" in cache:
-                ttnn.copy(self._pf_conv_zero, cache["conv_state"])
+        # Fresh prefill: reset the conv left-pad. The conv reads conv_state as its left-pad and that
+        # buffer persists across replays, so it has to be cleared — but IN PLACE, via the same
+        # multiply-by-zero _reset_linear_state uses, not by copying from a zero buffer. This runs
+        # eagerly before execute_trace, so it is an ordinary op; the old form kept a whole
+        # [conv_k-1, conv_dim] zero source alive and paid a DRAM->DRAM copy per linear layer per
+        # replay to read it. (recurrent_state is output-only — the chunked path starts S=0 internally;
+        # KV is written fresh and prefill attends fresh k/v, so only conv_state needs resetting.)
+        self._reset_linear_state()
         ttnn.execute_trace(self.mesh_device, self._pf_traces[B], cq_id=0, blocking=False)
         self.pos = T
         if self._keep_prefill_hidden:
@@ -494,36 +530,56 @@ class TtModel(LightweightModule):
         # Host-side copy of the truncation params: speculative decode applies them on the host (over
         # verify's candidates) rather than in `ttnn.sampling`, so it needs the python values.
         self._samp_params = (float(temperature), int(k), float(p), float(self._presence_penalty))
-        self.t_k = _t(torch.full((B,), k, dtype=torch.int32), ttnn.uint32)
-        self.t_p = _t(torch.full((B,), p), ttnn.bfloat16)
-        self.t_temp = _t(torch.full((B,), 1.0 / temperature), ttnn.bfloat16)  # ttnn.sampling scales by 1/T
+        # These five are written IN PLACE at stable addresses, not reallocated per request. They are
+        # read by the captured decode graph, so a fresh allocation moved their addresses and silently
+        # invalidated the trace -- which is why a re-capture was needed every request (see
+        # _decode_state_buf for what that cost). The batched path already did it this way in
+        # set_sampling_params_batch; this is the single-user analogue.
+        self._h2d([k] * B, ttnn.uint32, self._decode_state_buf("t_k", ttnn.uint32, B))
+        self._h2d([p] * B, ttnn.bfloat16, self._decode_state_buf("t_p", ttnn.bfloat16, B), torch.float32)
+        # ttnn.sampling scales by 1/T
+        self._h2d(
+            [1.0 / temperature] * B, ttnn.bfloat16, self._decode_state_buf("t_temp", ttnn.bfloat16, B), torch.float32
+        )
         # Per-step RNG seed, advanced on device each decode step (plus_one) so a static trace still
         # draws fresh randomness every replay; deterministic for a fixed starting `seed`.
-        self.t_seed = _t(torch.full((B,), seed, dtype=torch.int32), ttnn.uint32)
-        # Presence mask over the vocab (generated tokens), reset per request, accumulated on device.
-        self.t_presence = _t(torch.zeros(1, 1, 1, V), ttnn.bfloat16, ttnn.TILE_LAYOUT)
+        self._h2d([seed] * B, ttnn.uint32, self._decode_state_buf("t_seed", ttnn.uint32, B))
+        # Presence mask over the vocab (generated tokens), accumulated on device across a request.
+        # Allocated once; the per-request RESET is now explicit. It used to come free from
+        # reallocating the tensor, and losing it would leak one request's repetition penalties into
+        # the next -- the in-place multiply-by-zero is the same trick _reset_linear_state uses (a
+        # device op, no host write, so it stays legal next to a live trace).
+        if getattr(self, "t_presence", None) is None or self.t_presence.shape[-1] != V:
+            self.t_presence = ttnn.zeros(
+                [1, 1, 1, V], dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+            )
+        else:
+            ttnn.multiply(self.t_presence, 0.0, output_tensor=self.t_presence)
+
+    def _decode_state_buf(self, name, dtype, n=1):
+        """Persistent [n] decode-state buffer, allocated once and thereafter REUSED at a stable address.
+
+        The address is the point. A captured decode trace bakes in the addresses of the buffers it
+        reads, so reallocating `t_tok`/`t_curpos`/`t_ropepos` per request — which `start_decode` used to
+        do — silently invalidated the trace and forced a re-capture every request. That re-capture is
+        not cheap: demo/server.py measures the 16 steps after one at 43-46 ms/token against a settled
+        ~29, i.e. ~225 ms of drained throughput per request, on top of a full eager decode step and a
+        ~35 MB clone snapshot. Reused in place, one trace serves every request with the same tail."""
+        buf = getattr(self, name, None)
+        if buf is None or tuple(buf.shape) != (n,) or buf.dtype != dtype:
+            buf = ttnn.zeros([n], dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT, device=self.mesh_device)
+            setattr(self, name, buf)
+        return buf
 
     def start_decode(self, first_token_id: int):
         """Seed the device-resident decode state from the prefill's first token. After this, drive
-        generation with decode_step_eager() (compiles) and/or decode_step_traced()."""
-        self.t_tok = to_tt(
-            torch.tensor([first_token_id], dtype=torch.int32),
-            self.mesh_device,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-        )
-        self.t_curpos = to_tt(
-            torch.tensor([self.pos], dtype=torch.int32),
-            self.mesh_device,
-            dtype=ttnn.int32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-        )
-        self.t_ropepos = to_tt(
-            torch.tensor([self.pos], dtype=torch.int32),
-            self.mesh_device,
-            dtype=ttnn.uint32,
-            layout=ttnn.ROW_MAJOR_LAYOUT,
-        )
+        generation with decode_step_eager() (compiles) and/or decode_step_traced().
+
+        Writes the three state buffers IN PLACE (see _decode_state_buf) so a decode trace captured for
+        an earlier request stays valid — `decode_trace_ready()` is what decides whether it is reused."""
+        self._h2d([first_token_id], ttnn.uint32, self._decode_state_buf("t_tok", ttnn.uint32))
+        self._h2d([self.pos], ttnn.int32, self._decode_state_buf("t_curpos", ttnn.int32))
+        self._h2d([self.pos], ttnn.uint32, self._decode_state_buf("t_ropepos", ttnn.uint32))
         if _CONV_ADDCHAIN:
             # seed the decode conv add-chain's history rows from the prefill-filled conv_state (once,
             # eager). After this, each decode step reads/shifts conv_rows in place; conv_state is unused.
@@ -573,7 +629,14 @@ class TtModel(LightweightModule):
         self.caches = []
         for layer in self.layers:
             if layer.is_linear:
-                c = {"recurrent_state": z([batch_size, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim])}
+                c = {
+                    "recurrent_state": ttnn.zeros(
+                        [batch_size, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim],
+                        dtype=_STATE_DT,
+                        layout=ttnn.TILE_LAYOUT,
+                        device=self.mesh_device,
+                    )
+                }
                 if _CONV_ADDCHAIN:
                     c["conv_rows"] = [z([batch_size, a.lin_conv_dim]) for _ in range(a.conv_kernel_size - 1)]
                 self.caches.append(c)
@@ -997,7 +1060,7 @@ class TtModel(LightweightModule):
         eagerly (verified model-free). One dtype also halves the readback to a single D2H.
 
         Allocated on the WARM run — `ttnn.zeros` is a host write, which trace capture forbids — and
-        cached, exactly like gated_delta's `_verify_scratch`."""
+        cached, exactly like gated_delta's `_verify_conv_buf`."""
         assert self.sampling is not None, "call enable_sampling() before capturing a sampling verify"
         w = self._samp_nc * self.SAMP_K
         key = (K, w)
@@ -1010,14 +1073,18 @@ class TtModel(LightweightModule):
         self._m_cand = buf
         return buf
 
-    def _h2d(self, values, dtype, dst):
+    def _h2d(self, values, dtype, dst, src_dtype=torch.int32):
         """Write a small python/torch vector into an EXISTING device buffer.
 
         `copy_host_to_device_tensor` writes into the already-allocated `dst`; the obvious
         `ttnn.copy(to_tt(...), dst)` instead allocates a fresh device buffer per call and frees it
         again. A speculative round does ~9 of these, so at 40 layers that allocation churn is a real
-        share of the round's host time — the same reason gemma4 keeps persistent traced inputs."""
-        t = torch.as_tensor(list(values), dtype=torch.int32).flatten()
+        share of the round's host time — the same reason gemma4 keeps persistent traced inputs.
+
+        Keeping `dst`'s ADDRESS stable is the other reason, and it is what lets a captured decode trace
+        outlive the request that recorded it (see _decode_trace_sig). `src_dtype` is the torch dtype of
+        the staging tensor: int32 for token/position/seed vectors, float32 for the bf16 sampling params."""
+        t = torch.as_tensor(list(values), dtype=src_dtype).flatten()
         ttnn.copy_host_to_device_tensor(ttnn.from_torch(t, dtype=dtype, layout=ttnn.ROW_MAJOR_LAYOUT), dst)
 
     def _mtp_write_round(self, tokens, positions):
@@ -1741,16 +1808,58 @@ class TtModel(LightweightModule):
                 ts.append(self.t_presence_b)
         return ts
 
-    def capture_decode_trace(self):
+    def _decode_trace_sig(self):
+        """Everything about the CURRENT config that changes the shape of the recorded decode graph.
+
+        Two configs with the same signature produce the same op sequence over the same (now stable)
+        buffer addresses, so one capture serves both. The tail (greedy argmax vs chunked topk +
+        ttnn.sampling) and the presence-penalty ops are both decided at graph-BUILD time in
+        _select_token, and the decode batch B unrolls into the graph, so all three belong here."""
+        # The presence penalty is the one sampling parameter that is a baked python SCALAR rather than
+        # a device tensor -- `_select_token` emits `sub(logits, multiply(t_presence, penalty))`, so the
+        # value is frozen into the graph at capture. top_k / top_p / temperature / seed are all read
+        # from tensors (t_k / t_p / t_temp / t_seed) and therefore DO pick up per-request writes, which
+        # is what makes reuse worthwhile at all. Recording only "penalty > 0" here would let a request
+        # with penalty 0.8 replay a trace baked with 1.5 -- harmless for demo/server.py, which uses one
+        # server-wide default, but wrong for the vLLM adapter, which passes the request's own value.
+        return (
+            self.sampling is not None,
+            float(getattr(self, "_presence_penalty", 0.0)) if self.sampling is not None else 0.0,
+            int(self.t_tok.shape[0]) if getattr(self, "t_tok", None) is not None else 0,
+            getattr(self, "_samp_nc", None),
+        )
+
+    # Reuse a live decode trace across requests when the tail matches. QWEN36_TRACE_REUSE=0 forces the
+    # old per-request re-capture (A/B fallback).
+    _TRACE_REUSE = os.environ.get("QWEN36_TRACE_REUSE", "1") != "0"
+
+    def decode_trace_ready(self):
+        """Can the live decode trace serve the current config? If so the caller can skip BOTH the
+        re-capture and the eager warm-up step that precedes it, and go straight to decode_step_traced().
+
+        This is only sound because the buffers the graph reads are now reused in place rather than
+        reallocated per request (see _decode_state_buf / enable_sampling). Before that, every request
+        moved t_tok/t_curpos/t_ropepos and the sampling params, so no trace could ever be reused."""
+        if not self._TRACE_REUSE:
+            return False
+        return self.trace_id is not None and getattr(self, "_trace_sig", None) == self._decode_trace_sig()
+
+    def capture_decode_trace(self, force=False):
         """Record the self-contained decode graph as a trace. PRECONDITION: at least one
         decode_step_eager() has run so all kernels are compiled (capture must not JIT). The decode
         state (caches + token + positions) is snapshotted and restored so recording the dummy step
         doesn't perturb generation. After this, drive every real step through decode_step_traced().
 
-        Releases any PRIOR decode trace first: traces are captured per request, and without the
-        release the device's trace region accumulates one trace per request (and pins the buffers
-        each references) — that, with per-request cache reallocation, was the OOM. Persistent caches
-        (reused across requests) + this release keep device memory flat."""
+        NO-OP when the live trace already matches the current config (decode_trace_ready), which is the
+        common case across requests: same model, same sampling tail. That skip is worth having — the
+        capture costs a ~35 MB clone snapshot plus a drained pipeline that demo/server.py measures at
+        43-46 ms/token for 16 steps against a settled ~29. Pass force=True to re-record regardless.
+
+        Otherwise releases any PRIOR decode trace first: without the release the device's trace region
+        accumulates one trace per capture (and pins the buffers each references) — that, with
+        per-request cache reallocation, was the OOM. Persistent caches + this release keep memory flat."""
+        if not force and self.decode_trace_ready():
+            return self.trace_id
         if self.trace_id is not None:
             ttnn.release_trace(self.mesh_device, self.trace_id)
         snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
@@ -1759,6 +1868,8 @@ class TtModel(LightweightModule):
         ttnn.end_trace_capture(self.mesh_device, self.trace_id, cq_id=0)
         for orig, s in zip(self._trace_snapshot_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
+        self._trace_sig = self._decode_trace_sig()
+        return self.trace_id
 
     def decode_step_traced(self, read_from_device: bool = True):
         """Replay the captured decode trace for one real step. Host work: kick off the trace and
