@@ -74,6 +74,10 @@ def _stub_args(cfg):
         expert_weight_dtype=ttnn.bfloat16,
         expert_down_weight_dtype=ttnn.bfloat16,
         activation_dtype=ttnn.bfloat16,
+        # Mirrors ModelArgs: TtMoE's `dtype` (router / shared-expert / gate weights) comes from this,
+        # NOT from activation_dtype. Kept as a separate field because they are separate decisions --
+        # see ModelArgs.moe_shared_weight_dtype.
+        moe_shared_weight_dtype=ttnn.bfloat16,
         sparse_moe_decode=False,
         compute_kernel_lofi=None,
         weight_cache_path=None,

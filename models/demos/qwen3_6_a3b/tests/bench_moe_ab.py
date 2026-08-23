@@ -8,18 +8,33 @@ tt-metal. tt-metal ships ``ttnn.experimental.moe_compute`` (a fused selective-ti
 activation → w2 matmul, BFP4) that might be faster and would let us drop the custom op. The open
 question is purely timing — is it faster or slower? — measured here head-to-head in one process.
 
-KEY ARCHITECTURAL FACT (verified against live source, not any prior notes):
-``moe_compute(compute_only=True)`` on a *single card* has NO combine. In ComputeOnly mode its final
-output (slot 4) is ``[num_cores, DOUBLE_BUFFER_SIZE(=2), TOKEN_SIZE, hidden]`` — a 2-expert rolling
-double-buffer window, not a per-token combined MoE output
-(``moe_compute_device_operation.cpp:307-342``). The fused ``SelectiveReduceCombine`` only exists on the
-non-ComputeOnly (CCL / multi-device) path. The op still *streams all 256 experts*, so its measured
-latency IS the full expert compute — a valid quantity to A/B — but it is NOT a drop-in single-card
-replacement without extra combine work. Hence the only sound single-card metric is **pre-combine
-expert-compute latency**, and the combine is reported SEPARATELY (see ``combine_cost``).
+KEY ARCHITECTURAL FACT (verified against live source, 2026-08-22 — this CORRECTS the original
+version of this docstring, which claimed the fused combine was multi-device only):
+``moe_compute`` has THREE paths (``moe_compute_device_operation.cpp:463-495``):
 
-WHAT IS COMPARED (all pre-combine expert compute, traced ms/call), across token counts {1,32,64,96,128,256}:
-  * moe_compute  — ``ttnn.experimental.moe_compute(compute_only=True)``            [candidate]
+    ComputeOnly : compute_only=True,  cluster_axis=None   -> 5 tensors, NO combine
+    FullLocal   : compute_only=False, cluster_axis=None   -> ONLY valid on a 1x1 mesh; 6 tensors,
+                                                            FUSED LOCAL combine, no fabric
+    FullCcl     : compute_only=False, cluster_axis set    -> multi-device
+
+So **FullLocal is a single-card path WITH the score-weighted combine**, and it is exercised on
+Blackhole at this model's exact dimensions by
+``tests/ttnn/nightly/unit_tests/operations/experimental/test_moe_compute_single_card.py:783``
+(``hidden_size=2048, N=512, selected_experts_k=8, tokens_per_device=1, compute_only=False`` —
+"Regression for tt-metal#52371: B=1 dense token-map stride in FullLocal mode").
+
+In ComputeOnly mode the final output (slot 4) is ``[num_cores, DOUBLE_BUFFER_SIZE(=2), TOKEN_SIZE,
+hidden]`` — a 2-expert rolling double-buffer window, not a per-token combined MoE output
+(``moe_compute_device_operation.cpp:307-342``) — so that leg measures pre-combine expert compute only.
+FullLocal instead writes a caller-allocated ``[k, tokens, hidden]`` combine output with the routing
+scores already applied, which this model reduces with the ``ttnn.sum(dim=0)`` it already has
+(``moe_gather.gather_combine``). Both legs are timed below; the combine is ALSO reported separately
+(see ``combine_cost``) so the ComputeOnly leg stays comparable to the pre-combine current paths.
+
+WHAT IS COMPARED (traced ms/call), across token counts {1,32,64,96,128,256}:
+  * moe_compute  — ``ttnn.experimental.moe_compute(compute_only=True)``   [candidate, pre-combine]
+  * moe_full     — ``ttnn.experimental.moe_compute(compute_only=False)``  [candidate, FullLocal:
+                   compute + fused score-weighted combine — the drop-in-shaped one]
   * sparse       — custom sparse_matmul: ``forward_sparse_decode`` (T=1, indexed/gather)
                    / ``forward_sparse_prefill`` (T>1, per-tile union)               [current custom op]
   * dense_xo     — dense batched matmul over all E experts, experts-only (router/shared/combine excluded)
@@ -44,7 +59,9 @@ Env: QWEN36_MOE_AB_ITERS (pytest iters, default 50), QWEN36_MOE_AB_DEEPSEEK=1 (a
 from __future__ import annotations
 
 import argparse
+import gc
 import os
+import resource
 import time
 
 import pytest
@@ -56,7 +73,12 @@ from models.demos.qwen3_6_a3b.tt import moe_gather
 from models.demos.qwen3_6_a3b.tt.moe import _DENSE_TMAX, TtMoE
 
 # ---------------------------------------------------------------------------- Qwen3.6 MoE dims
-QWEN_E = 256  # num_experts (all resident on one card)
+# num_experts. Overridable (QWEN36_MOE_AB_EXPERTS) for two reasons:
+#   1. the moe_compute weight packer needs ~0.034 GB of HOST RAM per expert (measured,
+#      tests/probe_moe_compute_packmem.py), i.e. ~10-12 GB peak at E=256 -- an OOM kill on a 15 GB box;
+#   2. sweeping E is how you find out whether moe_compute STREAMS every expert or SKIPS the inactive
+#      ones, which decides whether it can ever help T=1 decode (top_k=8 of 256). Linear in E = streams.
+QWEN_E = int(os.environ.get("QWEN36_MOE_AB_EXPERTS", "256"))
 QWEN_H = 2048  # hidden_size
 QWEN_I = 512  # moe_intermediate (per-expert FFN dim)
 QWEN_SE = 512  # shared_expert_intermediate
@@ -104,22 +126,35 @@ def _try_time(mesh_device, make_call, iters, warmup):
 
 
 # ---------------------------------------------------------------------------- current path (TtMoE)
+def _rss_gb():
+    """Peak host RSS so far, in GB. The moe_compute weight packers are the memory hazard in this file
+    (a 256-expert pack OOM-KILLED this bench twice on a 15 GB box -- rc=137, and the log just stops,
+    which reads exactly like a device hang). Print it around them so the failure is self-diagnosing."""
+    return resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1048576.0
+
+
 def build_moe(mesh_device, expert_dtype=ttnn.bfloat4_b):
     """Standalone random-weight ``TtMoE`` at Qwen dims (BFP4 experts, matching production). The weight
     dict is built directly from torch — no reference module / checkpoint (timing is value-independent).
     Weight shapes verified against reference/qwen3_5_moe.py; construction mirrors tests/test_moe.py."""
     torch.manual_seed(2026)
     E, H, I, SE = QWEN_E, QWEN_H, QWEN_I, QWEN_SE
+    # bfloat16, not the torch default float32. These are random values that get quantized to BFP4 on
+    # upload, so fp32 buys nothing -- and it costs 3.2 GB of HOST RAM for the two expert tensors alone
+    # (gate_up [256, 1024, 2048] is 2.1 GB at fp32). This box has ~8 GB free and the moe_compute
+    # weight packer below needs ~3.2 GB of its own, so the fp32 version got the whole run OOM-KILLED
+    # (SIGKILL/rc=137, silent -- it looks exactly like a device hang in the log).
+    bf = torch.bfloat16
     weights = {
-        "gate": torch.randn(E, H) * 0.04,  # [E, hidden]
-        "gate_up_proj": torch.randn(E, 2 * I, H) * 0.04,  # [E, 2*inter, hidden]
-        "down_proj": torch.randn(E, H, I) * 0.04,  # [E, hidden, inter]
-        "se_gate_proj": torch.randn(SE, H) * 0.04,  # [se_inter, hidden]
-        "se_up_proj": torch.randn(SE, H) * 0.04,  # [se_inter, hidden]
-        "se_down_proj": torch.randn(H, SE) * 0.04,  # [hidden, se_inter]
-        "se_router": torch.randn(1, H) * 0.04,  # [1, hidden]
+        "gate": (torch.randn(E, H) * 0.04).to(bf),  # [E, hidden]
+        "gate_up_proj": (torch.randn(E, 2 * I, H, dtype=bf) * 0.04),  # [E, 2*inter, hidden]
+        "down_proj": (torch.randn(E, H, I, dtype=bf) * 0.04),  # [E, hidden, inter]
+        "se_gate_proj": (torch.randn(SE, H) * 0.04).to(bf),  # [se_inter, hidden]
+        "se_up_proj": (torch.randn(SE, H) * 0.04).to(bf),  # [se_inter, hidden]
+        "se_down_proj": (torch.randn(H, SE) * 0.04).to(bf),  # [hidden, se_inter]
+        "se_router": (torch.randn(1, H) * 0.04).to(bf),  # [1, hidden]
     }
-    return TtMoE(
+    moe = TtMoE(
         mesh_device,
         weights,
         E,
@@ -130,6 +165,9 @@ def build_moe(mesh_device, expert_dtype=ttnn.bfloat4_b):
         inter=I,
         se_inter=SE,
     )
+    weights.clear()  # the device copies are made in __init__; do not hold the host originals
+    gc.collect()
+    return moe
 
 
 def build_sparse_inputs(mesh_device, moe, T):
@@ -228,6 +266,7 @@ def build_moe_compute_common(mesh_device):
     ring_n = effective_matmul_ring_size(mesh_device)
     owsd = auto_output_width_shard_dim(H, matmul_ring_size=ring_n)
     try:
+        logger.info(f"[moe-ab] before moe_compute weight build: peak RSS {_rss_gb():.2f} GB")
         w0_w1_shard_map, w2_shard_map, dram_core_range_set = get_weight_core_shard_maps(mesh_device, H, N)
         torch_w0 = create_torch_w0(num_layers, experts_per_device, H, N)
         torch_w1 = create_torch_w1(num_layers, experts_per_device, H, N)
@@ -245,6 +284,11 @@ def build_moe_compute_common(mesh_device):
             memory_config=w0_w1_mem_config,
             mesh_mapper=ttnn.ReplicateTensorToMesh(mesh_device),
         )
+        # w0/w1 are dead the moment the packed tensor is on device: drop them before packing w2, or
+        # the two packers' peaks overlap (~3.2 GB) on top of everything else.
+        logger.info(f"[moe-ab] after w0_w1 pack+upload: peak RSS {_rss_gb():.2f} GB")
+        del torch_w0, torch_w1
+        gc.collect()
         tt_w2 = ttnn.from_torch(
             prepare_w2_tensor_for_moe_compute(
                 torch_w2, num_layers, experts_per_device, N, H, w2_shard_map, w0_w1_shard_map
@@ -257,13 +301,22 @@ def build_moe_compute_common(mesh_device):
         )
     except Exception as e:  # noqa: BLE001
         return None, f"weights {type(e).__name__}: {str(e)[:60]}"
+    torch_w2 = None
+    gc.collect()
+    logger.info(f"[moe-ab] after w2 pack+upload: peak RSS {_rss_gb():.2f} GB")
     return {"tt_w0_w1": tt_w0_w1, "tt_w2": tt_w2, "owsd": owsd, "ring_n": ring_n}, None
 
 
-def build_moe_compute_call(mesh_device, common, T):
+def build_moe_compute_call(mesh_device, common, T, compute_only=True):
     """Build the per-T moe_compute inputs (dispatched sparse buffer + indices + scores + mapping) and
     return a zero-arg ``make_call`` closure, or (None, reason). Ports the token-dependent setup from
-    test_moe_compute_qwen36_probe.py:287-408. Never call at T=1 (sub-tile SIGFPE — caller must use T>=32)."""
+    test_moe_compute_qwen36_probe.py:287-408. Never call at T=1 (sub-tile SIGFPE — caller must use T>=32).
+
+    compute_only=False selects the FULLLOCAL path (single-card fused compute + score-weighted
+    combine), which additionally requires a caller-allocated ``[k, T, hidden]`` bf16 ROW_MAJOR
+    output tensor. Contract copied from ``test_moe_compute_single_card.py``
+    ``::_run_moe_compute_single_card_test::create_combine_output_tensor``. Allocated ONCE here,
+    outside the timed closure, so the measurement is the op and not an allocation."""
     try:
         from ttnn.operations.ccl import MoEActivationFunction
 
@@ -337,6 +390,21 @@ def build_moe_compute_call(mesh_device, common, T):
 
     tt_w0_w1, tt_w2 = common["tt_w0_w1"], common["tt_w2"]
 
+    # FullLocal needs a pre-allocated [k, total_tokens, hidden] combine output; ComputeOnly must be
+    # handed None (the op TT_FATALs on optional_output_tensor when compute_only=True).
+    tt_combine_out = None
+    if not compute_only:
+        try:
+            tt_combine_out = ttnn.from_torch(
+                torch.zeros([k, total_tokens, H], dtype=torch.bfloat16),
+                device=mesh_device,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+                dtype=ttnn.bfloat16,
+                mesh_mapper=ttnn.ShardTensorToMesh(mesh_device, dim=1),
+            )
+        except Exception as e:  # noqa: BLE001
+            return None, f"combine_out {type(e).__name__}: {str(e)[:60]}"
+
     def _call():
         # kwargs mirror the validated probe closure (test_moe_compute_qwen36_probe.py:388-408).
         return ttnn.experimental.moe_compute(
@@ -354,10 +422,10 @@ def build_moe_compute_call(mesh_device, common, T):
             topology=None,
             num_links=None,
             mux_core_range_set=None,
-            optional_output_tensor=None,
+            optional_output_tensor=tt_combine_out,
             optional_cross_device_semaphore=None,
             activation_type=MoEActivationFunction.SILU,
-            compute_only=True,
+            compute_only=compute_only,
         )
 
     return _call, None
@@ -471,16 +539,37 @@ def _cell(v):
     return f"{v:8.3f}" if isinstance(v, (int, float)) else f"{str(v)[:8]:>8}"
 
 
-def run(mesh_device, iters=100, warmup=3):
-    logger.info(f"[moe-ab] building random-weight TtMoE (BFP4 experts) at Qwen dims E={QWEN_E} H={QWEN_H} ...")
-    moe = build_moe(mesh_device)
-    mc_common, mc_reason = build_moe_compute_common(mesh_device)
+def run(mesh_device, iters=100, warmup=3, legs="all"):
+    """legs: "all" | "current" (TtMoE sparse/dense only) | "moe_compute" (candidate only).
+
+    The split exists because the two sides' HOST peaks add up: the TtMoE build holds ~1.6 GB of
+    bfloat16 expert weights while the moe_compute packers need several GB of their own, and on a 15 GB
+    box that is an OOM kill (rc=137) rather than an error. Run them in separate processes when tight."""
+    moe = mc_common = None
+    mc_reason = "skipped (--legs)"
+    if legs in ("all", "current"):
+        logger.info(f"[moe-ab] building random-weight TtMoE (BFP4 experts) at Qwen dims E={QWEN_E} H={QWEN_H} ...")
+        moe = build_moe(mesh_device)
+    if legs in ("all", "moe_compute"):
+        mc_common, mc_reason = build_moe_compute_common(mesh_device)
     if mc_common is None:
         logger.warning(f"[moe-ab] moe_compute unavailable: {mc_reason} (current-path legs still run)")
 
     res = {}  # (leg, T) -> ms(float) | reason(str)
     for T in TOKENS:
         logger.info(f"[moe-ab] T={T}: building inputs + timing legs ...")
+        if moe is None:  # --legs moe_compute: no TtMoE, so the current-path legs are unavailable
+            for leg in ("sparse", "dense_xo", "dense_full"):
+                res[(leg, T)] = "skipped"
+            if T in MC_TOKENS and mc_common is not None:
+                for leg, co in (("moe_compute", True), ("moe_full", False)):
+                    call, r = build_moe_compute_call(mesh_device, mc_common, T, compute_only=co)
+                    ms, r2 = _try_time(mesh_device, call, iters, warmup) if call else (None, r)
+                    res[(leg, T)] = ms if ms is not None else r2
+            else:
+                res[("moe_compute", T)] = res[("moe_full", T)] = mc_reason if T in MC_TOKENS else "->T=32"
+            ttnn.synchronize_device(mesh_device)
+            continue
         x, x2, routing, sparsity, topv, indices = build_sparse_inputs(mesh_device, moe, T)
 
         # --- current custom sparse_matmul path: decode (T=1) vs per-tile prefill (T>1) ---
@@ -514,11 +603,25 @@ def run(mesh_device, iters=100, warmup=3):
                 else:
                     ms, r = _try_time(mesh_device, mc_call, iters, warmup)
                     res[("moe_compute", T)] = ms if ms is not None else r
+            # FullLocal: compute + fused score-weighted combine — the shape that could actually
+            # replace this model's MoE block on one card. Timed separately from ComputeOnly because
+            # only this leg includes the combine.
+            if mc_common is None:
+                res[("moe_full", T)] = mc_reason
+            else:
+                mf_call, r = build_moe_compute_call(mesh_device, mc_common, T, compute_only=False)
+                if mf_call is None:
+                    res[("moe_full", T)] = r
+                else:
+                    ms, r = _try_time(mesh_device, mf_call, iters, warmup)
+                    res[("moe_full", T)] = ms if ms is not None else r
         else:
             res[("moe_compute", T)] = "->T=32"
+            res[("moe_full", T)] = "->T=32"
         ttnn.synchronize_device(mesh_device)
 
     combine = combine_cost(mesh_device, iters, warmup)
+    logger.info(f"[moe-ab] final peak RSS {_rss_gb():.2f} GB")
     _report(res, combine, iters)
 
 
@@ -529,13 +632,17 @@ def _report(res, combine, iters):
         f" dims: E={QWEN_E} H={QWEN_H} inter={QWEN_I} top_k={QWEN_TOPK}, BFP4 experts. Pre-combine ms/call (lower=faster)."
     )
     print("=" * 96)
-    print(f"  {'T':>4} | {'moe_compute':>10} | {'sparse':>10} | {'dense_xo':>10} | {'dense_full':>10}   (regime)")
-    print("  " + "-" * 76)
+    print(
+        f"  {'T':>4} | {'moe_compute':>10} | {'moe_full':>10} | {'sparse':>10} | {'dense_xo':>10} | "
+        f"{'dense_full':>10}   (regime)"
+    )
+    print("  " + "-" * 89)
     regime = {1: "decode", 32: "batched", 64: "prefill", 96: "prefill", 128: "prefill", 256: "prefill"}
     for T in TOKENS:
         print(
-            f"  {T:>4} | {_cell(res[('moe_compute', T)])} | {_cell(res[('sparse', T)])} | "
-            f"{_cell(res[('dense_xo', T)])} | {_cell(res[('dense_full', T)])}   ({regime[T]})"
+            f"  {T:>4} | {_cell(res[('moe_compute', T)])} | {_cell(res[('moe_full', T)])} | "
+            f"{_cell(res[('sparse', T)])} | {_cell(res[('dense_xo', T)])} | "
+            f"{_cell(res[('dense_full', T)])}   ({regime[T]})"
         )
 
     print("\n  --- verdict (candidate moe_compute vs best current pre-combine path) ---")
@@ -556,7 +663,15 @@ def _report(res, combine, iters):
             f"  ->  {_verdict(res.get(('moe_compute', T)), best)}"
         )
 
-    print("\n  --- combine cost (reported SEPARATELY; moe_compute has no single-card combine) ---")
+    print("\n  --- verdict (FullLocal vs the production full block; both INCLUDE the combine) ---")
+    for T in TOKENS:
+        mf, df = res.get(("moe_full", T)), res.get(("dense_full", T))
+        if isinstance(mf, (int, float)) and isinstance(df, (int, float)):
+            print(f"  T={T:>3}: dense_full={_cell(df)}  vs  moe_full={_cell(mf)}  ->  {_verdict(mf, df)}")
+        else:
+            print(f"  T={T:>3}: dense_full={_cell(df)}  vs  moe_full={_cell(mf)}  ->  n/a")
+
+    print("\n  --- combine cost (for the ComputeOnly leg, which has no combine of its own) ---")
     print(f"  gather_combine (decode, current path) : {_cell(combine['gather_combine'])} ms")
     print(
         f"  deepseek_moe_fast_reduce_nc_fused     : {_cell(combine['deepseek_fused'])}"
@@ -564,9 +679,12 @@ def _report(res, combine, iters):
     )
 
     print("\n  caveats:")
-    print("   * moe_compute streams all 256 experts but retains no combinable output on one card")
-    print("     (double-buffer, combine is CCL/multi-device only) -> a faster compute number is")
-    print("     necessary-but-not-sufficient to replace the custom op; the combine is the follow-up.")
+    print("   * moe_compute (ComputeOnly) streams all 256 experts but retains no combinable output:")
+    print("     its slot-4 result is a 2-expert double-buffer window, so that leg is PRE-combine and")
+    print("     is only comparable to sparse/dense_xo. moe_full (FullLocal) DOES combine and is the")
+    print("     leg to compare against dense_full -- it is the only drop-in-shaped candidate.")
+    print("   * moe_full writes [k, T, hidden] with the routing scores already applied, so adopting it")
+    print("     still needs one ttnn.sum(dim=0) over k -- the gather_combine below, ~2 us.")
     print("   * moe_compute T=1 is measured at T=32: it pays a full 32-row tile for one real decode token.")
     print("   * moe_compute FAIL at T=128/256 is the expected L1 clash (prefill max-fit ~96 tokens).")
     print("   * weight ring-pack + TtMoE weight upload are one-time host cost, excluded from ms/call.")
@@ -588,6 +706,12 @@ def test_bench_moe_ab(mesh_device, mesh_shape):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--iters", type=int, default=100)
+    ap.add_argument(
+        "--legs",
+        choices=["all", "current", "moe_compute"],
+        default="all",
+        help="run only one side; see run() -- the two host peaks add up and can OOM",
+    )
     a = ap.parse_args()
     mesh = ttnn.open_mesh_device(
         ttnn.MeshShape(1, 1),
@@ -595,7 +719,7 @@ def main():
         dispatch_core_config=ttnn.DispatchCoreConfig(axis=ttnn.DispatchCoreAxis.COL),
     )
     try:
-        run(mesh, iters=a.iters, warmup=3)
+        run(mesh, iters=a.iters, warmup=3, legs=a.legs)
     finally:
         ttnn.close_mesh_device(mesh)
 

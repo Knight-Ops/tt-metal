@@ -156,7 +156,10 @@ def bench_components(mesh_device, model, args, iters):
     x_h = rand(1, dim)
 
     def head():
-        logits = ttnn.linear(x_h, model.lm_head_w)
+        # model._lmh, not a bare ttnn.linear: the model picks a tuned program config for <=32-row
+        # activations, and timing the raw op here made the breakdown blind to it (the lm_head row read
+        # identical with the config on and off while the full-model number moved).
+        logits = model._lmh(x_h)
         logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         return ttnn.argmax(logits, dim=-1, keepdim=False)
 

@@ -59,7 +59,7 @@ from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import moe_gather
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt, wide1d_enabled, wide_1d_decode_pc
 
 # DRAM-shard the DECODE shared-expert down projection se_down (K=se_inter, N=hidden). Microbench showed
 # 1.46x per op, but at 40L it is a WASH: se_down's ~6us matmul saving is eaten by the ~8us reshard in/out
@@ -129,6 +129,27 @@ _DENSE_IN0BW = int(os.environ.get("QWEN36_DENSE_IN0BW", "1" if _MOE_ACT_BF16 els
 # which documents a measured corruption from exactly this. Nothing here is a ttl operand.
 # QWEN36_MOE_DEALLOC=0 reverts to frame-lifetime frees.
 _MOE_DEALLOC = os.environ.get("QWEN36_MOE_DEALLOC", "1") != "0"
+
+# Router/gather fast path. Two INDEPENDENT changes, split across two flags because they carry very
+# different risk. Together they remove 6 of the 9 ops the T==1 MoE spends on
+# routing (measured moe.router 0.091 + moe.scatter 0.023 ms/layer = ~4.55 ms/token, 15.9% of the
+# decode step, at ~3% of DRAM peak -- the least bandwidth-efficient block in the step):
+#   1. top-k of the raw LOGITS + softmax over the k survivors, instead of softmax over all E, then
+#      top-k, then sum+divide. Mathematically identical (top-k is order-preserving under softmax, and
+#      renormalizing the top-k of a softmax IS a softmax over those k logits), and better conditioned
+#      in bf16 -- it normalizes once, over k values, instead of over E and again over the survivors.
+#   2. the T==1 gather path passes the CACHED CONSTANT sparsity, because sparse_matmul indexed mode
+#      never reads that operand (see _const_sparsity). The scatter that built it was dead work.
+# (2) is BIT-IDENTICAL -- it deletes ops whose output the kernels provably ignore. (1) is NOT: it
+# reorders a reduction, and although the selected expert SET is bit-identical (measured), the routing
+# WEIGHTS move by <=0.005, which is enough to flip a near-tie downstream. That difference in risk is
+# why they get separate flags:
+#   QWEN36_MOE_CONST_SPARSITY=0  reverts (2) -- should never be needed; it is provably free
+#   QWEN36_MOE_ROUTER_FAST=0     reverts (1) -- the one to reach for if a tie-sensitive gate regresses
+# Measured cost of reverting (1) alone: see FUTURE_OPTIMIZATIONS Lever 5. Dense prefill is unaffected
+# by either -- its scatter genuinely needs a real [T, E].
+_ROUTER_FAST = os.environ.get("QWEN36_MOE_ROUTER_FAST", "1") != "0"
+_CONST_SPARSITY = os.environ.get("QWEN36_MOE_CONST_SPARSITY", "1") != "0"
 
 
 def _drop(*tensors):
@@ -263,6 +284,26 @@ class TtMoE(LightweightModule):
             self._se_down_dram, self._se_amc, self._se_omc, self._se_pc = build_dram_shard(
                 self.se_down, self.se_down.shape[-2], self.se_down.shape[-1]
             )
+
+        # Tuned wide 1D mcast_in0 configs for the three DECODE matmuls in this block that otherwise run
+        # on the ttnn AUTO config. Measured per-matmul (tests/bench_matmul_layout.py, traced, us/call):
+        #   gate_w      [2048, 256]  AUTO 29.7 -> 12.1  at (66 cores, in0_block_w=16)   2.45x
+        #   se_gate_up  [2048, 1024] AUTO 38.0 -> 18.4  at (22 cores, in0_block_w=8)    2.07x
+        #   se_down     [512, 2048]  AUTO 19.9 -> 12.8  at (22 cores, in0_block_w=4)    1.55x
+        # Applied only when the activation is a single row (prefill wants a 2D config over T rows).
+        # NOT numerically neutral: in0_block_w is the K-block size, so it changes the matmul's
+        # accumulation ORDER and at bf16/bf8 that shifts the low bits. Measured on this block --
+        # expert SELECTION (topi) is bit-identical, routing weights move <=0.005, shared expert
+        # <=0.006 -- so it is rounding, not routing. Built once here, never per forward.
+        self._pc_gate_w = (
+            wide_1d_decode_pc(32, H, num_experts, 66, in0_block_w=16) if wide1d_enabled("gate_w") else None
+        )
+        self._pc_se_gu = (
+            wide_1d_decode_pc(32, H, 2 * self.se_inter, 22, in0_block_w=8) if wide1d_enabled("se_gate_up") else None
+        )
+        self._pc_se_down = (
+            wide_1d_decode_pc(32, self.se_inter, H, 22, in0_block_w=4) if wide1d_enabled("se_down") else None
+        )
 
     @staticmethod
     def _grid_for(Nt):
@@ -451,9 +492,16 @@ class TtMoE(LightweightModule):
         idx = ttnn.reshape(idx, [1, 1, 1, na])
         return ttnn.to_layout(ttnn.typecast(idx, ttnn.uint16), ttnn.ROW_MAJOR_LAYOUT)
 
-    def _verify_sparsity(self):
-        """`sparsity` is a REQUIRED sparse_matmul operand that indexed/gather mode never reads (the
-        gather loop is driven by `indices`). Cache one constant instead of deriving a per-call tensor."""
+    def _const_sparsity(self):
+        """`sparsity` is a REQUIRED sparse_matmul operand that indexed/gather mode never READS -- the
+        gather loop is driven by `indices`. Verbatim from the op docs (matmul_nanobind.cpp): "sparsity
+        is still a required operand but is NOT read by the kernels in this mode (the indexed loop
+        visits only active groups, so there is no per-slot validity scan or multicast)."
+
+        So cache ONE device constant instead of deriving a per-call tensor. Used by BOTH the verify
+        path and the T==1 decode path (see forward()). Built lazily, so it must be materialized by
+        the mandatory warm run BEFORE any trace capture -- a host upload inside a capture is illegal.
+        """
         if getattr(self, "_verify_sparsity_t", None) is None:
             self._verify_sparsity_t = to_tt(
                 torch.ones(1, 1, 1, self.num_experts) / self.num_experts,
@@ -483,10 +531,10 @@ class TtMoE(LightweightModule):
         E, H, I = self.num_experts, self.hidden, self.inter
         na = K * self.top_k
         x2 = ttnn.reshape(x, [K, hidden])
-        shared, topv, topi, probs = self._shared_and_router(x2)  # all flat in K
+        shared, topv, topi, _logits = self._shared_and_router(x2)  # all flat in K
 
         with sp.region("moe.experts"):
-            sparsity = self._verify_sparsity()
+            sparsity = self._const_sparsity()
             indices = self._verify_indices(topi, na)  # [1,1,1,K*top_k] uint16 RM
             x4 = ttnn.reshape(x2, [1, 1, K, H])
             gu = ttnn.sparse_matmul(
@@ -560,8 +608,23 @@ class TtMoE(LightweightModule):
         return outs[0] if num_tiles == 1 else ttnn.concat(outs, dim=0)  # [T, hidden]
 
     def _shared_and_router(self, x2):
+        # T == 1 -> the tuned decode configs above; T > 1 keeps the ttnn heuristic (these configs are
+        # per_core_M=1, i.e. shaped for a single tile-row of activations). Each config is gated on ITS
+        # OWN presence, not on a sibling's, so one can be disabled independently -- which is what makes
+        # a per-config numerical bisect possible (an earlier version keyed all three off _pc_gate_w and
+        # silently made such a bisect measure nothing).
+        # <= 32 rows, not == 1. per_core_M in these configs is one TILE row, which covers 32
+        # activation rows, so the K-row speculative verify path qualifies too -- and it MUST, for a
+        # reason beyond speed: `test_spec_decode_token_identical` compares plain decode against
+        # speculative decode, so tuning one path and not the other makes those two numerically
+        # further apart than they need to be. Measured: gating on == 1 moved that test's first
+        # divergence to token 2 (below its MIN_IDENTICAL=4 prefix guard), while the divergence itself
+        # was a tie (top-2 gap 0.25 against a TIE_EPS of 2.0). Prefill (T in the hundreds) is still
+        # excluded and keeps the ttnn heuristic.
+        dec = x2.shape[0] <= 32
+        pc = lambda p: p if dec else None
         with sp.region("moe.shared"):
-            se_gu = ttnn.linear(x2, self.se_gate_up)  # [T, 2*se_inter]
+            se_gu = ttnn.linear(x2, self.se_gate_up, program_config=pc(self._pc_se_gu))
             se_gate, se_up = self._split_last(se_gu, self.se_inter)
             shared = _swiglu(se_gate, se_up)
             if self._se_down_dram is not None and x2.shape[0] == 1:
@@ -570,14 +633,30 @@ class TtMoE(LightweightModule):
                 shared = ttnn.linear(sh_in, self._se_down_dram, program_config=self._se_pc, memory_config=self._se_omc)
                 shared = ttnn.to_memory_config(shared, ttnn.DRAM_MEMORY_CONFIG)
             else:
-                shared = ttnn.linear(shared, self.se_down)
+                shared = ttnn.linear(shared, self.se_down, program_config=pc(self._pc_se_down))
             shared = ttnn.multiply(shared, ttnn.sigmoid(ttnn.linear(x2, self.se_router)))  # [T, hidden]
         with sp.region("moe.router"):
-            logits = ttnn.linear(x2, self.gate_w)  # [T, E]
-            probs = ttnn.softmax(logits, dim=-1)
-            topv, topi = ttnn.topk(probs, self.top_k, dim=-1, largest=True, sorted=True)  # [T, k]
-            topv = ttnn.divide(topv, ttnn.sum(topv, dim=-1, keepdim=True))  # renormalize
-        return shared, topv, topi, probs
+            logits = ttnn.linear(x2, self.gate_w, program_config=pc(self._pc_gate_w))  # [T, E]
+            # "softmax over E -> top-k -> renormalize" IS "softmax over the top-k LOGITS":
+            #   top-k of softmax_E(l), renormalized  ==  exp(l_i) / sum_{j in top-k} exp(l_j)
+            # and top-k is order-preserving under softmax, so the selected SET is identical too.
+            # Taking the top-k of the raw logits therefore drops the 256-wide softmax AND the
+            # sum+divide renormalize: 4 ops -> 2, on the step's least bandwidth-efficient block
+            # (moe.router measured 3.63 ms/token = 12.7% of decode at ~3% of DRAM peak).
+            # It is also better conditioned in bf16 -- the normalization happens once, over k
+            # values, instead of over E and then again over the k survivors.
+            if _ROUTER_FAST:
+                topl, topi = ttnn.topk(logits, self.top_k, dim=-1, largest=True, sorted=True)  # [T, k]
+                topv = ttnn.softmax(topl, dim=-1)  # [T, k]
+            else:  # legacy: softmax over E, then top-k, then renormalize
+                probs = ttnn.softmax(logits, dim=-1)
+                topv, topi = ttnn.topk(probs, self.top_k, dim=-1, largest=True, sorted=True)
+                topv = ttnn.divide(topv, ttnn.sum(topv, dim=-1, keepdim=True))
+                logits = probs  # legacy zero-base for scatter_routing
+        # 4th return is the ZERO BASE for the dense-prefill scatter (see scatter_routing). It used to
+        # be `probs`; the full distribution is no longer computed and nothing reads it -- the scatter
+        # only needs a correctly-shaped [T, E] tensor to multiply by 0.
+        return shared, topv, topi, logits
 
     def forward(self, x, traced=False):
         """x: [1, 1, T, hidden] -> [1, 1, T, hidden]. sparse_matmul decode (T==1); dense prefill
@@ -593,27 +672,41 @@ class TtMoE(LightweightModule):
         # NOTE: no prof.phase here — this runs in the T==1 decode path too, and prof.phase syncs the
         # device (would break trace capture if profiling were enabled during decode). The prefill-only
         # sub-timers below (T>1 dense branch) are safe.
-        shared, topv, topi, probs = self._shared_and_router(x2)
+        shared, topv, topi, logits = self._shared_and_router(x2)
 
         def scatter_routing():
-            # zeros via a compute op (probs*0), not ttnn.zeros_like: a fill is illegal inside a
+            # zeros via a compute op (logits*0), not ttnn.zeros_like: a fill is illegal inside a
             # captured trace, whereas an eltwise multiply is a normal traced kernel (PCC-identical,
-            # also fine eager). Built lazily — the gathered prefill path below never reads it.
+            # also fine eager). Built lazily — neither the gathered prefill path nor the T==1 decode
+            # path reads it, so on those paths none of these ops are issued at all.
             with sp.region("moe.scatter"):
-                return ttnn.scatter(ttnn.multiply(probs, 0.0), 1, topi, topv)  # [T, E]
+                return ttnn.scatter(ttnn.multiply(logits, 0.0), 1, topi, topv)  # [T, E]
 
         if T == 1:
             # --- sparse_matmul decode: compute only selected experts, NO host sync (traceable) ---
             with sp.region("moe.experts"):
-                sparsity = ttnn.to_layout(
-                    ttnn.reshape(scatter_routing(), [1, 1, 1, self.num_experts]), ttnn.ROW_MAJOR_LAYOUT
-                )
-                if self._decode_gather:
-                    # gather path: pass the active expert ids -> kernels iterate top_k, not all E
+                if self._decode_gather and _CONST_SPARSITY:
+                    # gather path: pass the active expert ids -> kernels iterate top_k, not all E.
+                    # `sparsity` is never READ in this mode (see _const_sparsity), so hand it the
+                    # cached constant. Scattering the routing weights into [1,1,1,E] here was
+                    # multiply + scatter + reshape + to_layout, x40 layers, every token, for a tensor
+                    # the kernels ignore: measured moe.scatter 0.023 ms/layer = ~0.92 ms/token (3.2%
+                    # of the step) of pure dead work. Removing it is bit-identical.
                     indices = moe_gather.topk_to_indices(topi, self.top_k)
-                    routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity, topv, indices), [1, hidden])
+                    routed = ttnn.reshape(
+                        self.forward_sparse_decode(x2, self._const_sparsity(), topv, indices), [1, hidden]
+                    )
                 else:
-                    routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity), [1, hidden])
+                    # Legacy: the 256-slot scan DOES read sparsity, and _CONST_SPARSITY=0 keeps
+                    # building it for the gather path too -- that is the whole point of the A/B.
+                    sparsity = ttnn.to_layout(
+                        ttnn.reshape(scatter_routing(), [1, 1, 1, self.num_experts]), ttnn.ROW_MAJOR_LAYOUT
+                    )
+                    if self._decode_gather:
+                        indices = moe_gather.topk_to_indices(topi, self.top_k)
+                        routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity, topv, indices), [1, hidden])
+                    else:
+                        routed = ttnn.reshape(self.forward_sparse_decode(x2, sparsity), [1, hidden])
             with sp.region("moe.combine"):
                 return ttnn.reshape(ttnn.add(routed, shared), [1, 1, T, hidden])
 

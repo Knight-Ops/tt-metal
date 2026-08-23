@@ -40,6 +40,21 @@ def test_model_real_weights(mesh_device):
     # sanity: top token ids are valid
     assert int(logits.argmax(-1).max()) < args.vocab_size
 
+    # ---- both branches of TtModel._lmh, on ONE model build (the load dominates this test) ----
+    # _head slices to the last token, so the path above is always the <=32-row branch and the >32-row
+    # fallback is only reached by _head_all, i.e. by evaluation/ (loglikelihood scoring). A blanket
+    # edit once rewrote that fallback into `return self._lmh(x)` -- infinite recursion that NOTHING in
+    # the suite caught, because no test asked for per-position logits. It does now.
+    S = 64  # > 32, so _lmh must fall back to the ttnn heuristic
+    all_logits = model.forward_prefill_all_logits(torch.randint(0, args.vocab_size, (1, S)))
+    assert all_logits.shape == (S, args.vocab_size), all_logits.shape
+    assert torch.isfinite(all_logits).all(), "non-finite per-position logits"
+    # and the <=32-row branch, explicitly, through the same helper
+    assert model.forward_prefill_all_logits(torch.randint(0, args.vocab_size, (1, S)), last_n=8).shape == (
+        8,
+        args.vocab_size,
+    )
+
 
 @torch.no_grad()
 def test_decode_logits_matches_greedy(mesh_device):

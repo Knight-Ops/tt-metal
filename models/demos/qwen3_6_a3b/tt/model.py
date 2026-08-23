@@ -16,15 +16,17 @@ from __future__ import annotations
 import os
 
 import torch
+from loguru import logger
 
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt import signpost as sp
 from models.demos.qwen3_6_a3b.tt.attention import precompute_rope
-from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, from_tt, to_tt, wide1d_enabled, wide_1d_decode_pc
 from models.demos.qwen3_6_a3b.tt.decoder import TtDecoderLayer
 from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN, _STATE_DT
+from models.demos.qwen3_6_a3b.tt.paged_kv import PagedKV
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
@@ -62,16 +64,44 @@ class TtModel(LightweightModule):
             dtype=lm_dtype,
             cache_file_name=f"{cp}/lm_head" if cp else None,
         )
+        # Tuned wide 1D mcast config for the lm_head. It has been on the ttnn AUTO config because it
+        # CANNOT be DRAM-sharded (its 248K-wide output OOMs L1-sharded, bank_manager fatal), which left
+        # the biggest single matmul in the step untuned. Measured (tests/bench_matmul_layout.py,
+        # [2048, 248320] bf4, traced): AUTO 1125.9 us -> 1035.7 us at (110 cores, in0_block_w=4),
+        # i.e. 58.8% -> 63.9% of DRAM peak. per_core_M=1 covers a full 32-row tile, so it is valid for
+        # every <=32-row call (decode B<=32, MTP verify K, and prefill's last-token slice) -- _lmh()
+        # gates on that and falls back to AUTO for the S-row eval path in _head_all. Not numerically
+        # neutral (in0_block_w changes the K accumulation order); accuracy-gated like any dtype change.
+        self._lm_head_pc = (
+            wide_1d_decode_pc(32, self.args.dim, self.args.vocab_size, 110, in0_block_w=4)
+            if wide1d_enabled("lm_head")
+            else None
+        )
         # On-device RoPE tables: cos/sin for every position, indexed by position with ttnn.embedding
         # during decode (no per-token host recompute). Row-major so they act as embedding weights.
         self.cos_table, self.sin_table = self._build_rope_tables()
         # Token selection is greedy (on-device argmax) by default. enable_sampling() swaps in the
         # on-device temperature/top-k/top-p sampler; None here means "greedy, zero added cost".
         self.sampling = None
+        # Paged KV cache. DEFAULT OFF: the flat [1, n_kv, max_seq, hd] cache is unchanged unless
+        # QWEN36_PAGED_KV=1, so demo.py / demo/server.py are byte-identical until this is flipped.
+        # Paging is a MEMORY change, not a speedup -- measured free at decode (tt/paged_kv.py) -- and it
+        # only reclaims anything if the pool is over-subscribed via QWEN36_KV_POOL_TOKENS. It is also
+        # what unblocks traced incremental prefill (PREFILL.md §4a) and vLLM continuous batching, which
+        # supplies its OWN page table and can simply overwrite `self.kv_pager.table`.
+        self.paged_kv = os.environ.get("QWEN36_PAGED_KV") == "1"
+        self.kv_pager = None
         # Captured decode trace (one at a time). Re-captured per request; the PRIOR trace is released
         # first (capture_decode_trace) so traces never accumulate — that accumulation, together with
         # per-request cache reallocation, was the leak that OOMed the server.
         self.trace_id = None
+
+    def _lmh(self, x):
+        """The lm_head matmul. Uses the tuned wide-1D config when the activation is <= 32 rows (one
+        tile row, what per_core_M=1 covers); otherwise the ttnn heuristic. See self._lm_head_pc."""
+        if self._lm_head_pc is not None and x.shape[-2] <= 32:
+            return ttnn.linear(x, self.lm_head_w, program_config=self._lm_head_pc)
+        return ttnn.linear(x, self.lm_head_w)  # heuristic: config off, or more rows than per_core_M=1
 
     def _build_rope_tables(self):
         """[max_seq_len, rotary_dim] cos/sin tables (default RoPE), as ROW_MAJOR embedding weights."""
@@ -97,8 +127,12 @@ class TtModel(LightweightModule):
             x = self.final_norm.forward(x)
             x = ttnn.reshape(x, [1, self.args.dim])
         with sp.region("head.lm_head"):
-            logits = ttnn.linear(x, self.lm_head_w)  # [1, vocab]
+            logits = self._lmh(x)  # [1, vocab]
         with sp.region("head.d2h"):
+            # ROW_MAJOR before the readback. A [1, vocab] TILE tensor is PHYSICALLY [32, vocab] =
+            # 15.9 MB at vocab=248320, so a tiled D2H moves 32x the bytes the caller actually uses.
+            # The relayout is an on-device op; measured worth ~14 ms of a T=512 prefill (PREFILL.md).
+            logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
             return from_tt(logits, self.mesh_device).reshape(1, 1, self.args.vocab_size)
 
     def _head_all(self, x, T, last_n=None):
@@ -112,7 +146,10 @@ class TtModel(LightweightModule):
             x = ttnn.slice(x, [0, 0, T - S, 0], [1, 1, T, self.args.dim])
         x = self.final_norm.forward(x)
         x = ttnn.reshape(x, [S, self.args.dim])
-        logits = ttnn.linear(x, self.lm_head_w)  # [S, vocab]
+        logits = self._lmh(x)  # [S, vocab]
+        # ROW_MAJOR before the readback: TILE pads S up to a multiple of 32, so a tiled D2H moves
+        # ceil(S/32)*32 rows of a 248k-wide tensor. Same fix as _head.
+        logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
         return from_tt(logits, self.mesh_device).reshape(S, self.args.vocab_size)
 
     def forward_prefill_all_logits(self, input_ids: torch.Tensor, last_n: int | None = None):
@@ -134,6 +171,59 @@ class TtModel(LightweightModule):
         for layer, cache in zip(self.layers, self.caches):
             x = layer.forward_prefill(x, cos, sin, cache)
         return self._head_all(x, T, last_n=last_n)
+
+    def _kv_advance(self, slot=0):
+        """Map any KV blocks the NEXT decode step will touch. Call from the Python decode loop, never
+        from inside a captured graph: it may issue a host->device write. It is a no-op on the ~63 of
+        every 64 steps that do not cross a block boundary, so the steady-state step stays host-free."""
+        if self.paged_kv and self.kv_pager is not None:
+            self.kv_pager.ensure(self.pos, slot)
+
+    def _kv_fill_table_at(self, P, M, slot=0):
+        """Fill table for an INCREMENTAL chunk writing M tokens at offset P.
+
+        `paged_fill_cache` has no position argument -- the offset is expressed by WHICH logical blocks
+        the table names, so hand it the sub-table starting at block P/block_size (the same trick
+        tt_transformers' _chunk_prefill_page_table uses). P is a multiple of QWEN36_PREFILL_CHUNK (>=128)
+        and the block size is 64, so P is always block-aligned."""
+        if not self.paged_kv or self.kv_pager is None:
+            return None
+        pg = self.kv_pager
+        assert P % pg.block_size == 0, f"incremental offset {P} must be a multiple of block {pg.block_size}"
+        pg.ensure(P + M - 1, slot)
+        b0 = P // pg.block_size
+        nb = -(-M // pg.block_size)
+        row = pg._host[slot : slot + 1, b0 : b0 + nb].contiguous()
+        return to_tt(row, self.mesh_device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT)
+
+    def _kv_read_table(self, slot=0):
+        """The page table chunked-SDPA READS through during incremental prefill.
+
+        Per-SLOT, unlike decode's: chunked prefill runs one sequence at a time, so the kernel treats row
+        0 of whatever table it is handed as that sequence's mapping. Passing the full [B, blocks] decode
+        table would silently make every slot read slot 0's pages. Returns the flat path's trivial
+        single-block table when not paging."""
+        if self.paged_kv and self.kv_pager is not None:
+            return self.kv_pager.fill_page_table_for(slot)
+        if not hasattr(self, "_inc_page_table"):  # trivial single-block page table (built once)
+            self._inc_page_table = to_tt(
+                torch.zeros(1, 32, dtype=torch.int32),
+                self.mesh_device,
+                dtype=ttnn.int32,
+                layout=ttnn.ROW_MAJOR_LAYOUT,
+            )
+        return self._inc_page_table
+
+    def _kv_fill_table(self, upto, slot=0):
+        """Reserve KV blocks covering positions [0, upto) and return the `[1, blocks]` table
+        `paged_fill_cache` wants -- or None on the flat path, where the callee then uses `fill_cache`.
+
+        Host-side, and deliberately NOT inside any captured graph: it can issue a
+        copy_host_to_device_tensor, which is illegal under trace capture (MEMORY.md §1)."""
+        if not self.paged_kv or self.kv_pager is None:
+            return None
+        self.kv_pager.ensure(max(0, upto - 1), slot)
+        return self.kv_pager.fill_page_table_for(slot)
 
     def _alloc_cache(self, layer):
         if layer.is_linear:
@@ -171,10 +261,25 @@ class TtModel(LightweightModule):
                     for _ in range(a.conv_kernel_size - 1)
                 ]
             return cache
+        if self.paged_kv:
+            if self.kv_pager is None:  # one pool + one shared page table for all attention layers
+                self.kv_pager = PagedKV(
+                    self.mesh_device,
+                    self.args.n_kv_heads,
+                    self.args.head_dim,
+                    # batch_size is set by alloc_batch_caches before it builds the pool; 1 for the
+                    # single-user path. The page table is trace-baked, so its row count is fixed here.
+                    max_seq=self.max_seq,
+                    batch=max(1, getattr(self, "batch_size", 1)),
+                    dtype=self.args.kv_cache_dtype,
+                )
+                logger.info(f"[qwen36] paged KV: {self.kv_pager}")
+            return self.kv_pager.alloc_layer_cache()
         # fixed-shape KV cache for an attention layer: [1, n_kv, max_seq, head_dim]
         shape = [1, self.args.n_kv_heads, self.max_seq, self.args.head_dim]
-        k = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
-        v = ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+        kvdt = self.args.kv_cache_dtype
+        k = ttnn.zeros(shape, dtype=kvdt, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+        v = ttnn.zeros(shape, dtype=kvdt, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
         return [k, v]
 
     def _reset_linear_state(self):
@@ -204,9 +309,13 @@ class TtModel(LightweightModule):
             return self.prefill_long(input_ids)
         return self._prefill_single(input_ids)
 
-    def _prefill_single(self, input_ids: torch.Tensor):
+    def _prefill_single(self, input_ids: torch.Tensor, slot: int = 0):
         """Single-shot prefill (bounded to short prompts: materializes the full [T,*] activations).
-        Allocates per-layer caches and sets self.pos."""
+        Allocates per-layer caches and sets self.pos.
+
+        `slot` selects which PAGED KV row this prompt's blocks come from (continuous batching); it is
+        ignored on the flat path, where the caller instead copies row-wise after the fact. See
+        prefill_into_slot."""
         T = input_ids.shape[1]
         self.max_seq = self.args.max_seq_len
         # Allocate per-layer caches ONCE and reuse them across prefills (the same _pf_caches_ready
@@ -223,8 +332,9 @@ class TtModel(LightweightModule):
             x = self._embed(input_ids, T)
         with prof.phase(self.mesh_device, "rope"), sp.region("rope"):
             cos, sin = precompute_rope(T, self.args.rotary_dim, self.args.rope_theta, self.mesh_device)
+        fpt = self._kv_fill_table(T, slot)
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_prefill(x, cos, sin, cache)
+            x = layer.forward_prefill(x, cos, sin, cache, fill_page_table=fpt)
         if self._keep_prefill_hidden:
             # The per-position POST-final-norm hidden, for prime_mtp. This is the only moment it
             # exists: _head slices to the last row BEFORE the norm (a T-fold lm_head + D2H saving),
@@ -237,7 +347,7 @@ class TtModel(LightweightModule):
         prof.report()
         return out
 
-    def prefill_long(self, input_ids: torch.Tensor, chunk: int | None = None):
+    def prefill_long(self, input_ids: torch.Tensor, chunk: int | None = None, slot: int = 0):
         """Streamed (chunked) prefill for long prompts — supports the model's full context (up to
         max_seq_len, e.g. 256K) with memory bounded by the chunk size, not the prompt length. Ingests
         the prompt in `chunk`-token blocks: the first block via _prefill_single (allocates caches), the
@@ -257,13 +367,13 @@ class TtModel(LightweightModule):
         assert M % 128 == 0, f"prefill chunk {M} must be a multiple of 128"
         assert T <= self.args.max_seq_len, f"prompt {T} exceeds max_seq_len {self.args.max_seq_len}"
         if T <= M:
-            return self._prefill_single(input_ids)
-        logits = self._prefill_single(input_ids[:, :M])  # first block: allocates caches, self.pos=M
+            return self._prefill_single(input_ids, slot)
+        logits = self._prefill_single(input_ids[:, :M], slot)  # first block: allocates caches, self.pos=M
         n_full = (T // M) * M  # tokens covered by whole M-token chunks
         for P in range(M, n_full, M):
-            logits = self.forward_incremental(input_ids[:, P : P + M])  # carries state; self.pos -> P+M
+            logits = self.forward_incremental(input_ids[:, P : P + M], slot=slot)  # state carries; pos -> P+M
         if T > n_full:  # ragged final block (T mod M tokens); forward_incremental pads it internally
-            logits = self.forward_incremental(input_ids[:, n_full:T], ragged=True)
+            logits = self.forward_incremental(input_ids[:, n_full:T], ragged=True, slot=slot)
         # _prefill_single stashed a hidden for the FIRST CHUNK only, and the later chunks' hiddens were
         # never materialised — priming off that would feed the head a truncated prompt while claiming
         # the whole one. Drop it: prime_mtp then no-ops and long prompts keep today's behaviour.
@@ -429,7 +539,7 @@ class TtModel(LightweightModule):
             self._prefill_hidden = self.final_norm.forward(real)
         return self._head(self._pf_out[B], T)  # head slices the REAL last token (T-1), not the bucket
 
-    def forward_incremental(self, input_ids: torch.Tensor, ragged: bool = False):
+    def forward_incremental(self, input_ids: torch.Tensor, ragged: bool = False, slot: int = 0):
         """Incremental (from-cache) prefill of M NEW tokens continuing from the existing caches
         (self.pos = current context length P), instead of re-prefilling the whole P+M context.
         Requires a prior forward()/forward_incremental() to have populated the caches. P and M must be
@@ -441,7 +551,10 @@ class TtModel(LightweightModule):
         the real length (valid_len) so it updates state over real tokens only, and chunked-SDPA uses
         q_chunk_size=128 (P is a multiple of the chunk => of 128, so P % q_chunk_size == 0 holds; the
         block width M_pad is also a multiple of 128). self.pos advances by the REAL M and the head
-        reads the real last token, so the padded KV rows (past self.pos) are never read."""
+        reads the real last token, so the padded KV rows (past self.pos) are never read.
+
+        `slot` selects the PAGED KV row (continuous batching); ignored on the flat path, which has one
+        cache per model. See _kv_read_table for why the read table must be per-slot."""
         M = input_ids.shape[1]
         P = self.pos
         if ragged:
@@ -458,15 +571,21 @@ class TtModel(LightweightModule):
                 input_ids = padded
         else:
             M_pad, valid, q_chunk = M, None, None  # full chunk: already aligned, unchanged path
-        if not hasattr(self, "_inc_page_table"):  # trivial single-block page table (built once)
-            self._inc_page_table = to_tt(
-                torch.zeros(1, 32, dtype=torch.int32), self.mesh_device, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT
-            )
+        inc_fpt = self._kv_fill_table_at(P, M_pad, slot)
+        read_pt = self._kv_read_table(slot)
         x = self._embed(input_ids, M_pad)
         cos, sin = precompute_rope(M_pad, self.args.rotary_dim, self.args.rope_theta, self.mesh_device, start_pos=P)
         for layer, cache in zip(self.layers, self.caches):
             x = layer.forward_prefill_incremental(
-                x, cos, sin, cache, self._inc_page_table, P, valid_len=valid, q_chunk=q_chunk
+                x,
+                cos,
+                sin,
+                cache,
+                read_pt,  # READ table for chunked SDPA over this slot's accumulated cache
+                P,
+                valid_len=valid,
+                q_chunk=q_chunk,
+                fill_page_table=inc_fpt,
             )
         self.pos = P + M  # advance by the REAL token count (not the padded width)
         return self._head(x, M)  # slice the real last token (index M-1)
@@ -623,8 +742,26 @@ class TtModel(LightweightModule):
         a = self.args
         self.batch_size = batch_size
         self.max_seq = a.max_seq_len
-        self._scratch_caches = [self._alloc_cache(layer) for layer in self.layers]
-        self._pf_caches_ready = True  # scratch is the prefill target; _prefill_single reuses + resets it
+        if self.paged_kv:
+            # ONE pool shared by every slot AND every attention layer, so the KV budget is set by
+            # concurrent demand (QWEN36_KV_POOL_TOKENS) instead of batch_size * max_seq. This is the
+            # case paging actually pays for -- see the note on blocks_per_seq in tt/paged_kv.py: within
+            # a single sequence paging is memory-neutral, ACROSS sequences it is the whole point.
+            if self.kv_pager is None:
+                self.kv_pager = PagedKV(
+                    self.mesh_device,
+                    a.n_kv_heads,
+                    a.head_dim,
+                    self.max_seq,
+                    batch=batch_size,
+                    dtype=a.kv_cache_dtype,
+                )
+                logger.info(f"[qwen36] paged KV (B={batch_size}): {self.kv_pager}")
+            elif self.kv_pager.batch < batch_size:
+                raise RuntimeError(
+                    f"KV pager was built for batch={self.kv_pager.batch} but alloc_batch_caches asked "
+                    f"for {batch_size}; the page table is a trace-baked address and cannot be regrown"
+                )
         z = lambda shape: ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
         self.caches = []
         for layer in self.layers:
@@ -640,23 +777,46 @@ class TtModel(LightweightModule):
                 if _CONV_ADDCHAIN:
                     c["conv_rows"] = [z([batch_size, a.lin_conv_dim]) for _ in range(a.conv_kernel_size - 1)]
                 self.caches.append(c)
+            elif self.paged_kv:
+                self.caches.append(self.kv_pager.alloc_layer_cache())  # a view onto the shared pool
             else:
+                # Flat per-slot KV. NOTE the dtype: it follows ModelArgs.kv_cache_dtype like every other
+                # cache allocation (_alloc_cache), NOT an unconditional bf16 -- otherwise QWEN36_KV_DTYPE
+                # would silently apply to single-user serving and not to continuous batching.
                 shape = [batch_size, a.n_kv_heads, self.max_seq, a.head_dim]
-                self.caches.append([z(shape), z(shape)])
+                mkz = lambda: ttnn.zeros(
+                    shape, dtype=a.kv_cache_dtype, layout=ttnn.TILE_LAYOUT, device=self.mesh_device
+                )
+                self.caches.append([mkz(), mkz()])
         self.slot_pos = [0] * batch_size
+        # Prefill scratch. The GDN layers genuinely need a [1,...] staging buffer (their state is
+        # [B,Vh,Dk,Dv] and _prefill_single writes a single row). The ATTENTION layers do not: paged
+        # prefill writes straight into the target slot's pages via its page table, and allocating a
+        # scratch there would duplicate the whole pool per layer. So the scratch aliases the real
+        # caches for attention and only stages GDN state.
+        self._scratch_caches = [
+            self._alloc_cache(layer) if (layer.is_linear or not self.paged_kv) else batch_cache
+            for layer, batch_cache in zip(self.layers, self.caches)
+        ]
+        self._pf_caches_ready = True  # scratch is the prefill target; _prefill_single reuses + resets it
 
     def prefill_into_slot(self, input_ids, slot):
         """Prefill ONE request (torch [1,T]) into batch row `slot`, reusing the validated B=1 prefill:
         run it into the [1,...] scratch, then copy K/V + GDN state into row `slot` of the [B,...] caches.
         Returns last-token host logits [1,1,vocab] (the plugin host-samples the first token). Positions
-        for this slot recorded in self.slot_pos[slot].
+        for this slot recorded in self.slot_pos[slot]. Long prompts go through the CHUNKED prefill
+        (prefill_long), so a slot is not limited to what a single-shot prefill can materialize -- which
+        is what makes the paged pool's "one request may use the whole pool" claim real.
 
         VERIFY-ON-DEVICE: the per-slot writes below. KV uses ttnn.fill_cache(dst[B,...], src[1,...], slot)
         (its native batch-index write). The GDN recurrent_state + conv_rows sliced writes are the ones to
         confirm/fix on-device (fill_cache may not accept the [B,Vh,Dk,Dv] / [B,conv_dim] shapes)."""
         batch = self.caches
         self.caches = self._scratch_caches  # _prefill_single writes here (+ resets scratch linear state)
-        logits = self._prefill_single(input_ids)  # fills scratch [1,...], sets self.pos = T
+        # Paged: the attention entries of `_scratch_caches` ARE the shared pool, and `slot` picks the
+        # page-table row, so K/V lands in this request's own pages with no post-hoc copy. Flat: the
+        # scratch is a [1,...] staging cache and the row copy below moves it.
+        logits = self.prefill_long(input_ids, slot=slot)  # dispatches to _prefill_single when T <= chunk
         T = self.pos
         if _CONV_ADDCHAIN:  # sync scratch conv_state -> scratch conv_rows [1,conv_dim] (as start_decode does)
             for layer, sc in zip(self.layers, self._scratch_caches):
@@ -664,8 +824,10 @@ class TtModel(LightweightModule):
                     layer.mixer.sync_conv_rows(sc)
         self.caches = batch
         for bl, sc in zip(self.caches, self._scratch_caches):
-            if isinstance(bl, list):  # attention KV: native fill_cache batch-index write
-                ttnn.fill_cache(bl[0], sc[0], slot)
+            if isinstance(bl, list):  # attention KV
+                if self.paged_kv:
+                    continue  # already written into slot `slot`'s pages by the prefill above
+                ttnn.fill_cache(bl[0], sc[0], slot)  # native fill_cache batch-index write
                 ttnn.fill_cache(bl[1], sc[1], slot)
             else:  # GDN recurrent + conv history — VERIFY these device ops on-device
                 ttnn.fill_cache(bl["recurrent_state"], sc["recurrent_state"], slot)
@@ -677,6 +839,14 @@ class TtModel(LightweightModule):
                         ttnn.fill_cache(dst, src, slot)
         self.slot_pos[slot] = T
         return logits
+
+    def release_slot(self, slot):
+        """Return a finished request's KV blocks to the pool. No-op on the flat path (a slot's rows are
+        simply overwritten by the next request). Call this when the serving layer retires a slot --
+        without it the pool leaks and a long-running server eventually raises "block pool exhausted"
+        even though only a few requests are live."""
+        if self.paged_kv and self.kv_pager is not None:
+            self.kv_pager.release(slot)
 
     def setup_batch_decode(self, first_token_ids):
         """Seed batched decode from the per-slot prefills (self.caches already [B,...] populated by
@@ -715,15 +885,24 @@ class TtModel(LightweightModule):
                     iota = torch.arange(V, dtype=torch.int32).view(1, 1, 1, V).expand(1, 1, B, V).contiguous()
                     self._samp_iota_b = to_tt(iota, self.mesh_device, dtype=ttnn.int32, layout=ttnn.TILE_LAYOUT)
 
-    def set_decode_state(self, token_ids, positions):
+    def set_decode_state(self, token_ids, positions, active_slots=None):
         """Overwrite the batched decode state (token + absolute position, per slot) from the plugin's
         per-step inputs, IN THIS MODEL'S SLOT ORDER. Makes batched decode fully plugin-driven: no
         reliance on internal position advancing, so a slot reused by a new request mid-stream gets that
         request's fresh position (not a stale advanced one), and vLLM's compaction is irrelevant.
-        token_ids / positions: length-B lists (dead slots pass anything)."""
+        token_ids / positions: length-B lists (dead slots pass anything). `active_slots` (paged KV
+        only) names the slots that actually hold a live request; without it every slot -- including dead
+        ones parked at position 0 -- would be handed a physical block that nothing ever releases."""
         mk = lambda t, dt: to_tt(t, self.mesh_device, dtype=dt, layout=ttnn.ROW_MAJOR_LAYOUT)
         tok = torch.as_tensor(list(token_ids), dtype=torch.int32).flatten()
         pos = torch.as_tensor(list(positions), dtype=torch.int32).flatten()
+        # Map any block THIS step will write, for every live slot. Host-side and outside any capture
+        # (it may issue a copy_host_to_device_tensor), which is exactly why it belongs here rather than
+        # in the traced graph -- same contract as the single-user _kv_advance.
+        if self.paged_kv and self.kv_pager is not None:
+            live = range(len(pos)) if active_slots is None else active_slots
+            for s_i in live:
+                self.kv_pager.ensure(int(pos[s_i]), int(s_i))
         ttnn.copy(mk(tok, ttnn.uint32), self.t_tok)  # in-place into the stable-address decode buffers
         ttnn.copy(mk(pos, ttnn.int32), self.t_curpos)
         ttnn.copy(mk(pos, ttnn.uint32), self.t_ropepos)
@@ -806,7 +985,17 @@ class TtModel(LightweightModule):
             x = ttnn.embedding(self.t_tok, self.embed_weight, layout=ttnn.TILE_LAYOUT)
             x = ttnn.reshape(x, [1, 1, B, self.args.dim])
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_decode(x, cos, sin, cache, self.t_curpos)
+            x = layer.forward_decode(
+                x,
+                cos,
+                sin,
+                cache,
+                self.t_curpos,
+                # The page table is a PERSISTENT buffer at a stable address, so baking it into the
+                # decode trace is safe; its CONTENTS are refreshed between replays by
+                # _kv_advance() (see MEMORY.md §1 -- addresses are baked, contents are not).
+                page_table=self.kv_pager.table if (self.paged_kv and self.kv_pager) else None,
+            )
         with sp.region("dec.final_norm"):
             x = self.final_norm.forward(x)
         return ttnn.reshape(x, [B, self.args.dim])
@@ -849,8 +1038,12 @@ class TtModel(LightweightModule):
         # self.max_seq is only set by a prefill; fall back so the head can be built up front
         max_seq = getattr(self, "max_seq", self.args.max_seq_len)
         shape = [1, self.args.n_kv_heads, max_seq, self.args.head_dim]
+        # Follows ModelArgs.kv_cache_dtype like every other KV allocation: the head reuses the SAME
+        # TtAttention (so Attention._to_cache_dtype already handles the write side), and at 262144 this
+        # single-layer cache is 0.52 GB -- worth halving alongside the backbone's, not left behind.
         self.mtp_kv = [
-            ttnn.zeros(shape, dtype=ttnn.bfloat16, layout=ttnn.TILE_LAYOUT, device=self.mesh_device) for _ in range(2)
+            ttnn.zeros(shape, dtype=self.args.kv_cache_dtype, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+            for _ in range(2)
         ]
         self._mtp_hidden = None  # backbone hidden that predicted the pending token
         self.mtp_stats = {"rounds": 0, "tokens": 0, "accepted": 0, "drafted": 0}
@@ -1132,7 +1325,7 @@ class TtModel(LightweightModule):
             x = layer.forward_verify(x, cos, sin, cache, self._m_pos_i32)
         x = self.final_norm.forward(x)
         ttnn.copy(x, self._m_vhidden)
-        logits = ttnn.linear(ttnn.reshape(x, [K, self.args.dim]), self.lm_head_w)  # [K, vocab]
+        logits = self._lmh(ttnn.reshape(x, [K, self.args.dim]))  # [K, vocab]
         am = ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1)
         ttnn.copy(ttnn.reshape(am, [K]), self._m_argmax)
         # The tail is decided by what this capture is FOR, not by the live sampling flag: a greedy
@@ -1211,7 +1404,7 @@ class TtModel(LightweightModule):
                 ttnn.embedding(pos_u, self.sin_table, layout=ttnn.TILE_LAYOUT), [1, 1, 1, self.args.rotary_dim]
             )
             out, pre = self.mtp.forward_decode(self._m_dhidden, self._m_dtok, cos, sin, self.mtp_kv, pos_i)
-            logits = ttnn.linear(ttnn.reshape(out, [1, dim]), self.lm_head_w)  # [1, vocab]
+            logits = self._lmh(ttnn.reshape(out, [1, dim]))  # [1, vocab]
             am = ttnn.reshape(ttnn.argmax(ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT), dim=-1), [1])
             drafts.append(am)
             if j < gamma - 1:  # feed back for the next step; the last step needs neither
@@ -1301,7 +1494,7 @@ class TtModel(LightweightModule):
         for layer, cache in zip(self.layers, self.caches):
             x = layer.forward_verify(x, cos, sin, cache, pos_i32)
         x = self.final_norm.forward(x)
-        logits = ttnn.linear(ttnn.reshape(x, [K, self.args.dim]), self.lm_head_w)  # [K, vocab]
+        logits = self._lmh(ttnn.reshape(x, [K, self.args.dim]))  # [K, vocab]
         return logits, x
 
     def commit_verify(self, n):
@@ -1433,11 +1626,7 @@ class TtModel(LightweightModule):
             out, pre = self.mtp.forward_decode(
                 h, self._pos_tensor([tok]), cos, sin, self.mtp_kv, self._pos_tensor([p], dtype=ttnn.int32)
             )
-            tok = int(
-                from_tt(ttnn.linear(ttnn.reshape(out, [1, self.args.dim]), self.lm_head_w), self.mesh_device)
-                .reshape(-1)
-                .argmax()
-            )
+            tok = int(from_tt(self._lmh(ttnn.reshape(out, [1, self.args.dim])), self.mesh_device).reshape(-1).argmax())
             drafts.append(tok)
             h = pre
         return drafts
@@ -1594,7 +1783,7 @@ class TtModel(LightweightModule):
         path (read_decode_output does an async cpu() so the D2H overlaps the next step's host work)."""
         x = self._decode_hidden()
         with sp.region("dec.lm_head"):
-            logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]  (all rows kept; no last-token slice)
+            logits = self._lmh(x)  # [B, vocab]  (all rows kept; no last-token slice)
         with sp.region("dec.pos_advance"):
             ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
             ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device
@@ -1619,7 +1808,7 @@ class TtModel(LightweightModule):
         the token from row 0. The seed is advanced on device so a captured trace still varies per step."""
         if self.sampling is None:  # greedy
             with sp.region("head.lm_head"):
-                logits = ttnn.linear(x, self.lm_head_w)  # device [1, vocab]
+                logits = self._lmh(x)  # device [1, vocab]
             with sp.region("head.argmax"):
                 logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
                 tok = ttnn.argmax(logits, dim=-1, keepdim=False)  # [1] uint32
@@ -1627,7 +1816,7 @@ class TtModel(LightweightModule):
             return
         V, CW, K, B, nc = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self.SAMP_USERS, self._samp_nc
         with sp.region("head.lm_head"):
-            logits = ttnn.linear(x, self.lm_head_w)  # [1, vocab]  (1-row: lm_head stays cheap)
+            logits = self._lmh(x)  # [1, vocab]  (1-row: lm_head stays cheap)
         logits = ttnn.reshape(logits, [1, 1, 1, V])
         with sp.region("head.samp.topk"):
             if self._presence_penalty > 0:  # discourage repeats: subtract penalty from already-seen tokens
@@ -1667,7 +1856,7 @@ class TtModel(LightweightModule):
         Bm = self.batch_size
         if self.sampling is None:  # greedy: per-row argmax over [B, vocab]
             with sp.region("head.lm_head"):
-                logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]
+                logits = self._lmh(x)  # [B, vocab]
             with sp.region("head.argmax"):
                 logits = ttnn.to_layout(logits, ttnn.ROW_MAJOR_LAYOUT)
                 tok = ttnn.argmax(logits, dim=-1, keepdim=False)  # [B]
@@ -1675,7 +1864,7 @@ class TtModel(LightweightModule):
             return
         V, CW, K, U, nc = self.args.vocab_size, self.SAMP_CHUNK, self.SAMP_K, self.SAMP_USERS, self._samp_nc
         with sp.region("head.lm_head"):
-            logits = ttnn.linear(x, self.lm_head_w)  # [B, vocab]
+            logits = self._lmh(x)  # [B, vocab]
         logits = ttnn.reshape(logits, [1, 1, Bm, V])
         if getattr(self, "_presence_on_batch", False):  # subtract per-slot presence mask * uniform penalty
             logits = ttnn.sub(logits, ttnn.multiply(self.t_presence_b, self._presence_penalty_batch))
@@ -1765,6 +1954,7 @@ class TtModel(LightweightModule):
         """Run one decode step eagerly (compiles kernels for trace capture). Returns the next token id
         (int) when read_from_device=True, else the on-DEVICE token tensor (cloned) for the vLLM async
         path to read later."""
+        self._kv_advance()  # map any block this step will write into (no-op unless a boundary is crossed)
         self._decode_graph()
         self.pos += 1
         if not read_from_device:
@@ -1876,6 +2066,7 @@ class TtModel(LightweightModule):
         read back only the single next-token id (no per-token input rebuild, no full-logit D2H).
         read_from_device=False returns the on-DEVICE token tensor (cloned so the next replay can't
         overwrite it before the vLLM async path reads it)."""
+        self._kv_advance()  # BEFORE the replay, and outside it: it may write the page table from host
         ttnn.execute_trace(self.mesh_device, self.trace_id, cq_id=0, blocking=False)
         self.pos += 1
         if not read_from_device:
@@ -1923,7 +2114,7 @@ class TtModel(LightweightModule):
         self.logits_trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         x = self._decode_hidden()
         with sp.region("dec.lm_head"):
-            self._traced_logits = ttnn.linear(x, self.lm_head_w)  # persistent output buffer (read after replay)
+            self._traced_logits = self._lmh(x)  # persistent output buffer (read after replay)
         with sp.region("dec.pos_advance"):
             ttnn.plus_one(self.t_curpos)  # advance position on device (for KV write + sdpa)
             ttnn.plus_one(self.t_ropepos)  # advance RoPE-table index on device

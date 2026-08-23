@@ -114,8 +114,69 @@ class ModelArgs:
         self.expert_down_weight_dtype = (
             ttnn.bfloat8_b if os.environ.get("QWEN36_EXPERT_DOWN_BF8") == "1" else self.expert_weight_dtype
         )
-        self.attn_weight_dtype = ttnn.bfloat8_b
-        self.linear_attn_weight_dtype = ttnn.bfloat8_b
+        # --- per-block weight precision, all env-overridable ---
+        # `ROOFLINE.md` §2.1 is what makes these worth touching: the gated-delta projections run at
+        # 74-87% of DRAM peak, i.e. they are NEAR-ROOFLINE, so their time is directly proportional to
+        # their byte count and halving the dtype nearly halves them. That is the opposite of the
+        # "decode is overhead-bound so precision is a small lever" reading in FUTURE_OPTIMIZATIONS
+        # Lever 4, which averaged over a step whose worst components sit at 3-6% of peak.
+        # Per-token weight bytes at the defaults (of a 2.60 GB total):
+        #   gated-delta projections  1075 MB   bf8 -> bf4 saves ~504 MB
+        #   attention projections     290 MB   bf8 -> bf4 saves ~136 MB
+        #   MoE router + shared       294 MB   bf16 -> bf8 saves ~138 MB, -> bf4 saves ~211 MB
+        # Gate any change on BOTH instruments, because MMLU alone does not cover the T==1 paths:
+        #   evaluation/run_mmlu_bench.py            (paired, prefill-scored)
+        #   tests/probe_teacher_forced_drift.py     (decode logit PCC, the T==1 half)
+        _DT = {"bf16": ttnn.bfloat16, "bf8": ttnn.bfloat8_b, "bf4": ttnn.bfloat4_b}
+
+        def _dt(var, default):
+            v = os.environ.get(var, default).lower()
+            assert v in _DT, f"{var}={v!r} must be one of {sorted(_DT)}"
+            return _DT[v]
+
+        # MEASURED 2026-08-22 (bench_decode 40L + paired MMLU-Redux n=200):
+        #   gdn  bf8 -> bf4   -0.45 ms/token   (0.316 -> 0.301 ms/layer x 30)
+        #   attn bf8 -> bf4   -0.09 ms/token   (0.254 -> 0.245 ms/layer x 10)
+        #   together: 25.49 -> 24.88 ms/token, 39.2 -> 40.2 tok/s/user (+2.6%), and ~0.68 GB less
+        #   device DRAM for the weights.
+        # Accuracy: 79.0% -> 80.5% on the same 200 questions (nominally UP; paired McNemar p=0.508, so
+        # no detectable change either way). That run was the MORE aggressive all-bf4 config -- it also
+        # had the shared expert at bf4 -- so it bounds the shipped config from above. Caveat worth
+        # keeping: 15 of 200 predictions changed, 5x the churn of the program-config work, so this is a
+        # materially bigger numerical perturbation even though the score is indistinguishable.
+        # NOT SHIPPED -- default stays bf8. bf4 breaks a correctness gate for +2.6%:
+        # `test_long_prefill.py::test_long_prefill_chunk_invariant` (chunked prefill == single-shot)
+        # FAILS at bf4 and PASSES at bf8, isolated by flipping only these two vars. MMLU-Redux was
+        # fine (79.0% -> 80.5%, paired McNemar p=0.508) and so was the decode side, which is exactly
+        # why the module gates matter: a 200-question eval cannot see a chunk-boundary invariant.
+        # Opt in with QWEN36_GDN_DTYPE=bf4 QWEN36_ATTN_DTYPE=bf4 if you want the 0.54 ms and the
+        # ~0.68 GB of device DRAM and can live with that gate red.
+        self.attn_weight_dtype = _dt("QWEN36_ATTN_DTYPE", "bf8")
+        self.linear_attn_weight_dtype = _dt("QWEN36_GDN_DTYPE", "bf8")
+        # The MoE router + shared expert. These are bf16 today NOT by design but because
+        # `mlp_weight_dtype` above is assigned and never read -- decoder.py passes
+        # `dtype=args.activation_dtype` to TtMoE, which is what sets the router/shared/gate precision.
+        # STAYS bf16, on measurement: bf16 -> bf8 here removes 138 MB/token of weight traffic and buys
+        # -0.04 ms, i.e. nothing. `moe.shared` runs at 21% of DRAM peak and `moe.router` at 3%, so bytes
+        # are not their binding constraint -- exactly the test that "it is 12% of the weight budget"
+        # fails to apply. Same reasoning as dropping lm_head from the wide-1D default set: no gain, so
+        # do not spend the numerical perturbation. Selectable for anyone chasing DRAM footprint rather
+        # than latency (bf8 saves ~138 MB/token of reads and ~0.3 GB of resident weights).
+        self.moe_shared_weight_dtype = _dt("QWEN36_SHARED_DTYPE", "bf16")
+        # KV cache precision. bf16 today; `tt_transformers` parameterises this and its sglang path
+        # DEFAULTS to bfloat8_b (generator_sglang.py:34), so bf16 makes us the outlier.
+        # MEASURED speed (tests/probe_paged_kv_perf.py, sdpa-decode per attention layer):
+        #     pos      bf16      bf8    speedup
+        #     8192    83.6us   62.5us    1.34x
+        #     32768  228.3    137.3      1.66x
+        #     131072 796.7    438.0      1.82x
+        # i.e. -0.21 / -0.91 / -3.6 ms per TOKEN across the 10 attention layers, tracking the byte
+        # ratio -- so it is bandwidth, and it grows with context. It also halves the cache (5.23 GB ->
+        # 2.78 GB at max_seq=262144).
+        # NOTE ON GATING IT: MMLU-Redux cannot see this. Single-shot prefill runs SDPA on the live q/k/v
+        # and only FILLS the cache, so a prefill-scored eval never READS it. The gate is
+        # tests/probe_kv_dtype_accuracy.py (teacher-forced decode, which does read it).
+        self.kv_cache_dtype = _dt("QWEN36_KV_DTYPE", "bf16")
         self.activation_dtype = ttnn.bfloat16
         # Decode MoE: dense (no host sync, traceable, measured faster at batch=1) is the default.
         # gather-top-k sparse path (a host readback per call) is opt-in via QWEN36_SPARSE_DECODE=1.

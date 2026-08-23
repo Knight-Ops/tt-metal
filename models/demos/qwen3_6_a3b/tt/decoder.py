@@ -54,7 +54,11 @@ class TtDecoderLayer(LightweightModule):
             args.num_experts_per_tok,
             expert_dtype=args.expert_weight_dtype,
             down_dtype=args.expert_down_weight_dtype,
-            dtype=args.activation_dtype,
+            # Router + shared-expert weight precision. NOT activation_dtype: TtMoE uses this `dtype`
+            # for gate_w / se_gate_up / se_down / se_router, so passing the activation dtype pinned
+            # them to bf16 -- 294 MB/token, 12% of the decode weight budget, at a precision the
+            # routed experts (bf4) never get. See ModelArgs.moe_shared_weight_dtype.
+            dtype=args.moe_shared_weight_dtype,
             sparse_decode=args.sparse_moe_decode,
             compute_kernel_config=args.compute_kernel_lofi,
             cache_path=cache_path,
@@ -64,7 +68,7 @@ class TtDecoderLayer(LightweightModule):
             se_inter=args.shared_expert_intermediate_size,
         )
 
-    def forward_prefill(self, x, cos, sin, cache):
+    def forward_prefill(self, x, cos, sin, cache, fill_page_table=None):
         """cache: for linear layers a dict (gated-delta state); for attn layers [k_cache, v_cache]."""
         with prof.phase(self.mesh_device, "norm"), sp.region("layer.input_norm"):
             h = self.input_norm.forward(x)
@@ -72,7 +76,7 @@ class TtDecoderLayer(LightweightModule):
             if self.is_linear:
                 h = self.mixer.forward(h, cache=cache)
             else:
-                h = self.mixer.forward_prefill(h, cos, sin, cache)
+                h = self.mixer.forward_prefill(h, cos, sin, cache, fill_page_table=fill_page_table)
         with prof.phase(self.mesh_device, "norm"), sp.region("layer.post_norm"):
             with sp.region("layer.residual1"):
                 x = ttnn.add(x, h)
@@ -99,7 +103,9 @@ class TtDecoderLayer(LightweightModule):
         # rejected needed a host routing readback, which a captured trace cannot do (see tt/moe.py).
         return ttnn.add(x, self.moe.forward(h, traced=True))
 
-    def forward_prefill_incremental(self, x, cos, sin, cache, page_table, P, valid_len=None, q_chunk=None):
+    def forward_prefill_incremental(
+        self, x, cos, sin, cache, page_table, P, valid_len=None, q_chunk=None, fill_page_table=None
+    ):
         """Incremental prefill of new tokens continuing from the cache (offset P). Gated-delta starts
         its recurrent state from the cached state (and conv from the cached conv tail); attention
         attends the new tokens over the accumulated KV cache. MoE is per-token (unchanged).
@@ -114,7 +120,9 @@ class TtDecoderLayer(LightweightModule):
             init = ttnn.reshape(cache["recurrent_state"], [m.num_v_heads * m.head_k_dim, m.head_v_dim])
             h = m.forward(h, cache=cache, init_state=init, valid_len=valid_len)
         else:
-            h = self.mixer.forward_prefill_incremental(h, cos, sin, cache, page_table, P, q_chunk=q_chunk)
+            h = self.mixer.forward_prefill_incremental(
+                h, cos, sin, cache, page_table, P, q_chunk=q_chunk, fill_page_table=fill_page_table
+            )
         x = ttnn.add(x, h)
         h = self.post_norm.forward(x)
         return ttnn.add(x, self.moe.forward(h))
@@ -141,7 +149,7 @@ class TtDecoderLayer(LightweightModule):
         if self.is_linear:
             self.mixer.commit_verify(cache, j)
 
-    def forward_decode(self, x, cos, sin, cache, current_pos):
+    def forward_decode(self, x, cos, sin, cache, current_pos, page_table=None):
         with sp.region("layer.input_norm"):
             h = self.input_norm.forward(x)
         with sp.region("layer.mixer"):
@@ -150,7 +158,7 @@ class TtDecoderLayer(LightweightModule):
                 # ttl kernel; B>1 runs the batched single-step recurrence (_forward_decode_batch).
                 h = self.mixer.forward(h, cache=cache, decode=True)
             else:
-                h = self.mixer.forward_decode(h, cos, sin, cache, current_pos)
+                h = self.mixer.forward_decode(h, cos, sin, cache, current_pos, page_table=page_table)
         with sp.region("layer.residual1"):
             x = ttnn.add(x, h)
         with sp.region("layer.post_norm"):

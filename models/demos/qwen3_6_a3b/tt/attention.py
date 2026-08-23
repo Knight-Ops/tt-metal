@@ -21,7 +21,7 @@ import torch
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt, wide1d_enabled, wide_1d_decode_pc
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 # DRAM-shard the DECODE output projection (o_proj / wo): K=n_heads*head_dim, N=hidden — the K-heavy
@@ -118,6 +118,18 @@ class TtAttention(LightweightModule):
             Kq, Nq = self.wq.shape[-2], self.wq.shape[-1]
             self._wq_dram, self._wqg_amc, self._wqg_omc, self._wqg_pc = build_dram_shard(self.wq, Kq, Nq)
             self._wgate_dram, _, _, _ = build_dram_shard(self.wgate, Kq, Nq)
+
+        # wk/wv were skipped by the DRAM-shard work as "too small" (FUTURE_OPTIMIZATIONS Lever 1b),
+        # which left them on the ttnn AUTO config -- and that is the worst-tuned matmul in the block.
+        # Measured (tests/bench_matmul_layout.py, [2048, 512] bf8, traced us/call):
+        #   AUTO 34.4  ->  DRAM-shard incl. reshards 17.8  ->  wide 1D mcast 12.7  at (8 cores, bw=16)
+        # i.e. 2.7x, and the wide-1D form needs no reshard and no duplicate weight copy. Decode only
+        # (per_core_M=1); prefill keeps the heuristic.
+        self._pc_kv = (
+            wide_1d_decode_pc(32, self.wk.shape[-2], self.wk.shape[-1], 8, in0_block_w=16)
+            if wide1d_enabled("wk")
+            else None
+        )
         self.q_norm = TtRMSNorm(mesh_device, W("q_norm"), eps, add_unit_offset=True)
         self.k_norm = TtRMSNorm(mesh_device, W("k_norm"), eps, add_unit_offset=True)
         # Bounded K/V chunking so flash-decode L1 use stays within budget at long context
@@ -155,8 +167,12 @@ class TtAttention(LightweightModule):
             else:
                 q = ttnn.linear(x, self.wq)
                 gate = ttnn.linear(x, self.wgate)
-            k = ttnn.linear(x, self.wk)
-            v = ttnn.linear(x, self.wv)
+            # S <= 32: one tile row, so the K-row verify path uses the same config as decode (see the
+            # note in moe.py _shared_and_router -- keeping the two paths on one config matters for
+            # spec-vs-plain token agreement, not just for speed).
+            kv_pc = self._pc_kv if (self._pc_kv is not None and S <= 32) else None
+            k = ttnn.linear(x, self.wk, program_config=kv_pc)
+            v = ttnn.linear(x, self.wv, program_config=kv_pc)
         with sp.region("attn.qk_norm"):
             q = self.q_norm.forward(ttnn.reshape(q, [1, S, self.n_heads, self.head_dim]))
             k = self.k_norm.forward(ttnn.reshape(k, [1, S, self.n_kv_heads, self.head_dim]))
@@ -166,6 +182,20 @@ class TtAttention(LightweightModule):
             k = apply_rope(ttnn.transpose(k, 1, 2), cos, sin, self.rotary_dim)  # [1, n_kv, S, hd]
             v = ttnn.transpose(v, 1, 2)  # [1, n_kv, S, hd]
         return q, k, v, gate
+
+    @staticmethod
+    def _to_cache_dtype(t, cache):
+        """Cast a K/V tensor to the cache's dtype before a *fill* (prefill) write.
+
+        The projections emit bf16 while the cache may be BFP8/BFP4 (ModelArgs.kv_cache_dtype,
+        QWEN36_KV_DTYPE), so the fill path needs an explicit cast: `ttnn.fill_cache` hard-requires a
+        match (`update_cache_device_operation.cpp:72: input_tensor.dtype() == cache_tensor.dtype()`),
+        and while `paged_fill_cache`'s check is a permissive disjunction (:34-35) its program factory
+        derives the CB format from the INPUT (`paged_fill_cache_program_factory.cpp:84`), so matching
+        the two is the only unambiguously safe call. A no-op at the bf16 default; ~1 MB at S=1024.
+
+        Deliberately NOT applied on the decode path -- see the note in _kv_update_input."""
+        return t if t.dtype == cache.dtype else ttnn.typecast(t, cache.dtype)
 
     def _out(self, attn, gate, S):
         with sp.region("attn.out"):
@@ -181,18 +211,28 @@ class TtAttention(LightweightModule):
         attn = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         return self._out(attn, gate, S)
 
-    def forward_prefill(self, x, cos, sin, kv_cache):
+    def forward_prefill(self, x, cos, sin, kv_cache, fill_page_table=None):
         """Causal prefill that also fills a fixed-shape KV cache (kv_cache=[k_cache,v_cache])."""
         S = x.shape[2]
         q, k, v, gate = self._qkv(x, cos, sin)
         with sp.region("attn.kv_write"):
-            ttnn.fill_cache(kv_cache[0], k, 0)
-            ttnn.fill_cache(kv_cache[1], v, 0)
+            k_w = self._to_cache_dtype(k, kv_cache[0])
+            v_w = self._to_cache_dtype(v, kv_cache[1])
+            if fill_page_table is None:
+                ttnn.fill_cache(kv_cache[0], k_w, 0)
+                ttnn.fill_cache(kv_cache[1], v_w, 0)
+            else:
+                # Paged: one call per user -- the kernel reads batch_idx_ptr[0] for all positions, so a
+                # batched prefill must loop (tt_transformers attention.py:1022). B==1 here.
+                ttnn.experimental.paged_fill_cache(kv_cache[0], k_w, fill_page_table, batch_idx=0)
+                ttnn.experimental.paged_fill_cache(kv_cache[1], v_w, fill_page_table, batch_idx=0)
         with sp.region("attn.sdpa"):
             attn = ttnn.transformer.scaled_dot_product_attention(q, k, v, is_causal=True, scale=self.scale)
         return self._out(attn, gate, S)
 
-    def forward_prefill_incremental(self, x, cos, sin, kv_cache, page_table, chunk_start, q_chunk=None):
+    def forward_prefill_incremental(
+        self, x, cos, sin, kv_cache, page_table, chunk_start, q_chunk=None, fill_page_table=None
+    ):
         """Incremental prefill: ingest the new tokens (x: [1,1,M,hidden]) at absolute offset
         chunk_start (P) and attend over the ACCUMULATED KV cache [0:P+M]. cos/sin are RoPE at offset P.
         The flat cache [1,n_kv,max_seq,head_dim] is used directly as a single-block paged cache
@@ -207,8 +247,17 @@ class TtAttention(LightweightModule):
         qc = q_chunk or M
         q, k, v, gate = self._qkv(x, cos, sin)
         with sp.region("attn.kv_write"):
-            ttnn.fill_cache(kv_cache[0], k, 0, update_idx=chunk_start)  # write new K/V at rows P..P+M-1
-            ttnn.fill_cache(kv_cache[1], v, 0, update_idx=chunk_start)
+            k_w = self._to_cache_dtype(k, kv_cache[0])
+            v_w = self._to_cache_dtype(v, kv_cache[1])
+            if fill_page_table is None:
+                ttnn.fill_cache(kv_cache[0], k_w, 0, update_idx=chunk_start)  # new K/V at rows P..P+M-1
+                ttnn.fill_cache(kv_cache[1], v_w, 0, update_idx=chunk_start)
+            else:
+                # Paged: `chunk_start` is expressed by the SLICE of the page table handed in, so this
+                # writes the new block(s) rather than seeking within a flat tensor. The caller passes the
+                # sub-table covering logical blocks [chunk_start/block, ...) -- see TtModel._kv_pager.
+                ttnn.experimental.paged_fill_cache(kv_cache[0], k_w, fill_page_table, batch_idx=0)
+                ttnn.experimental.paged_fill_cache(kv_cache[1], v_w, fill_page_table, batch_idx=0)
         # k_chunk_size=64 bounds chunked-SDPA L1 at long context (head_dim=256 is large); also lets the
         # offset P be a multiple of 64 (vs 128). q_chunk_size=qc (M for full chunks; 128 for ragged).
         pc = ttnn.SDPAProgramConfig(
@@ -253,30 +302,46 @@ class TtAttention(LightweightModule):
         pad = ttnn.TILE_SIZE - self.n_kv_heads
         if pad > 0:
             t = ttnn.pad(t, padding=[(0, 0), (0, 0), (0, pad), (0, 0)], value=0.0)  # [1,B,TILE_SIZE,hd]
+        # NOTE: no dtype cast here. The two cache-write families have OPPOSITE dtype contracts:
+        #   fill_cache / paged_fill_cache  -- require input.dtype == cache.dtype (prefill; see
+        #     update_cache_device_operation.cpp:72), hence _to_cache_dtype at those call sites;
+        #   paged_update_cache             -- requires the INPUT be fp32/bf16 and converts on the way in
+        #     (paged_update_cache_device_operation.cpp:295), while accepting a bf16/bf8/BFP4 cache
+        #     (:45-46). Casting the input to bf8 here FATALs.
         return ttnn.to_memory_config(t, self._kv_update_mc_for(B))
 
-    def forward_decode(self, x, cos, sin, kv_cache, current_pos):
+    def forward_decode(self, x, cos, sin, kv_cache, current_pos, page_table=None):
         """Single-token decode for B users (x: [1,1,B,hidden]), fully traceable. KV cache
         [B, n_kv, max_seq, head_dim] updated IN PLACE per user at its dynamic position via
         paged_update_cache with a tensor index — O(1) traffic. current_pos: int32 [B] (per-user
         positions); cos/sin: [1,1,B,rotary_dim] (per-user RoPE). B=1 is the single-user path unchanged."""
         B = x.shape[2]
         q, k, v, gate = self._qkv(x, cos, sin)  # k,v: [1, n_kv, B, head_dim]; q: [1, nh, B, head_dim]
+        # page_table None -> the flat [1, n_kv, max_seq, hd] cache (the default); a tensor -> a PAGED
+        # [num_blocks, n_kv, block, hd] cache. MEASURED free at decode: paged SDPA is 0.99-1.00x flat at
+        # every position and the write costs +0.3-0.8 us (tests/probe_paged_kv_perf.py, tt/paged_kv.py).
         with sp.region("attn.kv_write"):
             ttnn.experimental.paged_update_cache(
-                kv_cache[0], self._kv_update_input(k, B), update_idxs_tensor=current_pos, page_table=None
+                kv_cache[0], self._kv_update_input(k, B), update_idxs_tensor=current_pos, page_table=page_table
             )
             ttnn.experimental.paged_update_cache(
-                kv_cache[1], self._kv_update_input(v, B), update_idxs_tensor=current_pos, page_table=None
+                kv_cache[1], self._kv_update_input(v, B), update_idxs_tensor=current_pos, page_table=page_table
             )
         with sp.region("attn.sdpa"):
             q = ttnn.transpose(q, 1, 2)  # [1, B, nh, hd] for sdpa_decode (users along dim 1)
-            attn = ttnn.transformer.scaled_dot_product_attention_decode(
+            sdpa = (
+                ttnn.transformer.scaled_dot_product_attention_decode
+                if page_table is None
+                else ttnn.transformer.paged_scaled_dot_product_attention_decode
+            )
+            kw = {} if page_table is None else {"page_table_tensor": page_table}
+            attn = sdpa(
                 q,
                 kv_cache[0],
                 kv_cache[1],
                 cur_pos_tensor=current_pos,
                 scale=self.scale,
+                **kw,
                 program_config=self.sdpa_decode_pc,
             )  # [1, B, nh, hd]
         return self._out_decode(attn, gate, B)

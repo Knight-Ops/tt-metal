@@ -22,6 +22,7 @@ for the kernels.
 
 from __future__ import annotations
 
+import contextlib
 import os
 
 import torch
@@ -30,7 +31,7 @@ import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
 from models.demos.qwen3_6_a3b.tt import signpost as sp
-from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt
+from models.demos.qwen3_6_a3b.tt.common import as_weight, build_dram_shard, to_tt, wide1d_enabled, wide_1d_decode_pc
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNormGated
 from models.demos.qwen3_6_a3b.tt.ttl_delta import (
     _BATCH_SHARED_CONST,
@@ -83,6 +84,18 @@ _BATCH_PREP = os.environ.get("QWEN36_DELTA_BATCH_PREP", "1") != "0"
 # (measured, PCC-identical). Default on; QWEN36_GDN_L1=0 reverts to interleaved DRAM.
 _GDN_L1 = os.environ.get("QWEN36_GDN_L1", "1") != "0"
 _MC = ttnn.L1_MEMORY_CONFIG if _GDN_L1 else None
+
+
+@contextlib.contextmanager
+def _nullctx():
+    """No-op stand-in for prof.phase on the T==1 decode path.
+
+    The GDN forward is shared between prefill and decode, and `prof.phase` SYNCS THE DEVICE -- doing
+    that inside a decode step would break trace capture (see the note in moe.py forward()). The
+    prefill sub-phase timers below are therefore gated on T > 1 and fall back to this. Costs nothing
+    when QWEN36_PROFILE_PHASES is unset either way, since prof.phase is itself a no-op then."""
+    yield
+
 
 # DECODE conv as an add-chain over K-1 separate [1,conv_dim] history-row buffers instead of the
 # concat+multiply+row-sum+slice path. The two dim-0 (row) ops in the stacked path — concat([state,mixed])
@@ -224,10 +237,30 @@ _HIFI4 = ttnn.WormholeComputeKernelConfig(
 )
 
 
+# Express the q/k L2 norm as an RMS norm instead of a hand-rolled reduction chain. Identity:
+#     l2norm(x) = x / sqrt(sum(x^2) + eps)
+#               = x / (sqrt(K) * sqrt(mean(x^2) + eps/K))
+#               = rms_norm(x, epsilon=eps/K) * K**-0.5
+# so 5-6 ops (multiply, sum, add, rsqrt, multiply [, multiply]) collapse to 2, with any caller scale
+# folded into the single trailing multiply. Same substitution the upstream implementation uses
+# (models/experimental/gated_attention_gated_deltanet/tt/ttnn_delta_rule_ops.py:235).
+#
+# Worth doing because `delta.qknorm` is 24% of the gated-delta PREFILL block -- 2.65 ms/layer at
+# T=1024 against the recurrence's 2.10 (see the QWEN36_PROFILE_PHASES sub-phases). The recurrence is
+# no longer where gated-delta prefill spends its time; the glue around it is.
+# QWEN36_GDN_L2NORM_RMS=0 restores the reduction chain.
+_L2NORM_RMS = os.environ.get("QWEN36_GDN_L2NORM_RMS", "1") != "0"
+
+
 def _l2norm_scale_lastdim(x, scale=None, eps=1e-6, mc=None):
     """mc: memory config for the intermediates. Callers pass _MC only for DECODE (T==1), where the
     L1 residency is a measured win. Prefill must leave it None — at T=1711 the two calls here hold
     ~42 MB of L1 whose floor collides with the fused recurrence's CBs (see _conv_silu)."""
+    if _L2NORM_RMS:
+        K = x.shape[-1]
+        y = ttnn.rms_norm(x, epsilon=eps / K, memory_config=mc)
+        f = K**-0.5 if scale is None else scale * K**-0.5
+        return ttnn.multiply(y, f, memory_config=mc)
     sq = ttnn.sum(ttnn.multiply(x, x, memory_config=mc), dim=-1, keepdim=True, memory_config=mc)
     y = ttnn.multiply(x, ttnn.rsqrt(ttnn.add(sq, eps, memory_config=mc), memory_config=mc), memory_config=mc)
     return ttnn.multiply(y, scale, memory_config=mc) if scale is not None else y
@@ -287,6 +320,15 @@ class TtGatedDeltaNet(LightweightModule):
                 cache_file_name=cn("w_ba"),
             )
         self.w_out = as_weight(weights["out_proj"], mesh_device, dtype=dtype, cache_file_name=cn("w_out"))
+        # Tuned wide 1D mcast config for the T==1 fused input projection. It is deliberately NOT
+        # DRAM-sharded (measured only 1.14-1.17x for wide-N inputs, Lever 1), so it has been running on
+        # the ttnn AUTO config -- at 74% of DRAM peak, the best-tuned of the untuned matmuls, hence the
+        # smallest win here: 83.9 -> 78.1 us at (33 cores, in0_block_w=1). Program-config only.
+        self._pc_in_proj = None
+        if _FUSE_IN and wide1d_enabled("w_in_proj"):
+            self._pc_in_proj = wide_1d_decode_pc(
+                32, self.w_in_proj.shape[-2], self.w_in_proj.shape[-1], 33, in0_block_w=1
+            )
         self.norm = TtRMSNormGated(mesh_device, W("norm"), self.eps)
 
         cw = W("conv1d").reshape(self.conv_dim, self.conv_k)
@@ -1003,9 +1045,15 @@ class TtGatedDeltaNet(LightweightModule):
 
         # beta = sigmoid(b); g = -exp(A_log) * softplus(a + dt_bias). One fused input matmul (default)
         # produces qkv|z|b|a together; slice it. z/b/a don't depend on the conv, so slice them upfront.
-        with sp.region("delta.in_proj"):
+        with prof.phase(self.mesh_device, "delta.in_proj") if T > 1 else _nullctx(), sp.region("delta.in_proj"):
             if _FUSE_IN:
-                allp = ttnn.linear(x2, self.w_in_proj, memory_config=mc)  # [T, conv_dim+value_dim+2V]
+                allp = ttnn.linear(  # [T, conv_dim+value_dim+2V]
+                    x2,
+                    self.w_in_proj,
+                    memory_config=mc,
+                    # T <= 32: one tile row, so speculative verify shares decode's config (see moe.py).
+                    program_config=self._pc_in_proj if (self._pc_in_proj is not None and T <= 32) else None,
+                )
                 o0, o1, o2 = self._in_off
                 mixed = ttnn.slice(allp, [0, 0], [T, o0], memory_config=mc)  # -> conv input
                 z = ttnn.slice(allp, [0, o0], [T, o1], memory_config=mc)  # [T, value_dim]
@@ -1015,7 +1063,7 @@ class TtGatedDeltaNet(LightweightModule):
                 z = ttnn.linear(x2, self.w_z, memory_config=mc)  # [T, value_dim]
                 ba = ttnn.linear(x2, self.w_ba, memory_config=mc)  # [T, 2V]
 
-        with sp.region("delta.conv"):
+        with prof.phase(self.mesh_device, "delta.conv") if T > 1 else _nullctx(), sp.region("delta.conv"):
             conv_in = mixed  # pre-conv projection rows; verify rollback recomputes conv_state from these
             if _CONV_ADDCHAIN and (T == 1 or decode) and not verify and cache is not None and "conv_rows" in cache:
                 # decode fast path (B=1 or batched B>1): per-user add-chain over separate history rows
@@ -1059,9 +1107,13 @@ class TtGatedDeltaNet(LightweightModule):
             beta = ttnn.sigmoid(ttnn.slice(ba, [0, 0], [T, V], memory_config=mc), memory_config=mc)  # [T, V]
             a = ttnn.slice(ba, [0, V], [T, 2 * V], memory_config=mc)  # [T, V]
             g = ttnn.multiply(self.neg_expA, ttnn.softplus(ttnn.add(a, self.dt_bias)), memory_config=mc)  # [T, V]
-            g_exp = ttnn.exp(g, memory_config=mc)  # decay per step, [T, V]
+            # exp(g) is consumed ONLY by _recurrent_scan; both default recurrence paths (the native
+            # fused op and the in-tree chunked prep) take the LOG-space g. Computing it here was one
+            # dead [T, V] elementwise op per linear layer per forward (30 per prefill call). Built
+            # lazily in the scan branch below instead.
+            g_exp = None
 
-        with sp.region("delta.qknorm"):
+        with prof.phase(self.mesh_device, "delta.qknorm") if T > 1 else _nullctx(), sp.region("delta.qknorm"):
             # reshape to [T, Hk, Dk]; l2norm over Dk; scale q; repeat_interleave k,q heads to V
             Vh, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
             q = ttnn.reshape(q, [T, self.num_k_heads, Dk])
@@ -1073,7 +1125,7 @@ class TtGatedDeltaNet(LightweightModule):
                 q = ttnn.repeat_interleave(q, self.n_rep, dim=1)
                 k = ttnn.repeat_interleave(k, self.n_rep, dim=1)
 
-        with sp.region("delta.recurrence"):
+        with prof.phase(self.mesh_device, "delta.recurrence") if T > 1 else _nullctx(), sp.region("delta.recurrence"):
             if _FUSED_PREFILL and T > 1:
                 # --- fused chunked prefill (parallel over the sequence) ---
                 core, S_final = self._forward_prefill_chunked(q, k, v, g, beta, pool=pool, init_state=init_state)
@@ -1085,9 +1137,10 @@ class TtGatedDeltaNet(LightweightModule):
                     else:
                         cache["recurrent_state"] = S_final
             else:
+                g_exp = ttnn.exp(g, memory_config=mc)  # decay per step, [T, V] -- scan-only
                 core = self._recurrent_scan(q, k, v, g_exp, beta, cache, T, Vh, Dk, Dv)
 
-        with sp.region("delta.norm_out"):
+        with prof.phase(self.mesh_device, "delta.norm_out") if T > 1 else _nullctx(), sp.region("delta.norm_out"):
             core = ttnn.transpose(core, 1, 2, memory_config=mc)  # [1, T, V, Dv]
             core = ttnn.reshape(core, [1, 1, T * Vh, Dv])
             z_r = ttnn.reshape(z, [1, 1, T * Vh, Dv])

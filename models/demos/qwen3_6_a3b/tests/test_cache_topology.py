@@ -24,6 +24,7 @@ import ttnn
 from models.demos.qwen3_6_a3b.tt.gated_delta import _CONV_ADDCHAIN
 from models.demos.qwen3_6_a3b.tt.model import TtModel
 from models.demos.qwen3_6_a3b.tt.model_config import ModelArgs
+from models.demos.qwen3_6_a3b.tt.paged_kv import block_size_default
 
 
 class _StubLayer:
@@ -33,12 +34,18 @@ class _StubLayer:
         self.is_linear = is_linear
 
 
-def _allocator(mesh_device, args, max_seq):
-    """A TtModel carrying only the three attributes ``_alloc_cache`` reads — no layers, no weights."""
+def _allocator(mesh_device, args, max_seq, paged=False):
+    """A TtModel carrying only the attributes ``_alloc_cache`` reads — no layers, no weights.
+
+    Keep this in sync with `_alloc_cache`: it grew `paged_kv`/`kv_pager` when paged KV landed, and
+    because the stub bypasses `__init__` entirely a missing attribute shows up as an AttributeError in
+    THIS test rather than anywhere near the real cause."""
     m = TtModel.__new__(TtModel)
     m.mesh_device = mesh_device
     m.args = args
     m.max_seq = max_seq
+    m.paged_kv = paged
+    m.kv_pager = None
     return m
 
 
@@ -126,12 +133,45 @@ def test_gdn_state_is_sequence_length_independent(mesh_device):
     assert [s[2] for s in kv_a] == [256, 256] and [s[2] for s in kv_b] == [512, 512], (kv_a, kv_b)
 
 
+def test_paged_cache_topology(mesh_device):
+    """Paged: every attention layer draws block-shaped tensors from ONE pool, and what it costs is the
+    pool's TOKEN BUDGET, not max_seq per layer. This is the whole difference from the flat arrangement,
+    and the thing a continuous-batching deploy sizes against."""
+    max_seq = 256
+    args = _args_or_skip(mesh_device, max_seq)
+    m = _allocator(mesh_device, args, max_seq, paged=True)
+    block = block_size_default()
+
+    caches = []
+    try:
+        for idx in range(args.n_layers):
+            if args.is_linear_layer(idx):
+                continue
+            c = m._alloc_cache(_StubLayer(False))
+            caches.append(c)
+            assert isinstance(c, list) and len(c) == 2
+            for t in c:
+                # [num_blocks, n_kv, block, head_dim] -- NOT [1, n_kv, max_seq, head_dim]
+                assert list(t.shape) == [m.kv_pager.num_blocks, args.n_kv_heads, block, args.head_dim]
+        # one pool, one page table, shared by every attention layer
+        assert m.kv_pager is not None
+        assert m.kv_pager.num_blocks * block >= max_seq, "pool must reach the default budget (max_seq)"
+        # the constraint the kernel enforces (paged_update_cache_device_operation.cpp:194): a slot may
+        # not address more logical blocks than the pool physically has
+        assert m.kv_pager.blocks_per_seq <= m.kv_pager.num_blocks
+    finally:
+        for c in caches:
+            _free(c)
+
+
 def test_kv_bytes_per_token(mesh_device):
     """Pin the per-token KV cost, and that it is 4x below the dense-equivalent. This is the number
     capacity planning depends on, so a config or dtype change should have to update it here."""
     args = _args_or_skip(mesh_device, 256)
     n_full = args.layer_types.count("full_attention")
-    per_layer = 2 * args.n_kv_heads * args.head_dim * 2  # K+V, bfloat16
+    # K+V at bfloat16. QWEN36_KV_DTYPE=bf8 halves this (1.0625 B/elem -> ~10.9 KiB/token); the bf16
+    # figure is pinned here because it is the default and what capacity planning quotes.
+    per_layer = 2 * args.n_kv_heads * args.head_dim * 2
     per_token = n_full * per_layer
     dense = args.n_layers * per_layer
 

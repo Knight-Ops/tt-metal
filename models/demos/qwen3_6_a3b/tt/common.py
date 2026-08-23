@@ -9,6 +9,52 @@ from loguru import logger
 
 import ttnn
 
+# Use the tuned wide 1D mcast_in0 program configs on the decode (M<=32) matmuls that otherwise run on
+# the ttnn AUTO config: MoE gate_w / se_gate_up / se_down, attention wk / wv, the fused gated-delta
+# w_in_proj, and lm_head. Measured per-matmul in tests/bench_matmul_layout.py (variant D vs column A);
+# see wide_1d_decode_pc below and FUTURE_OPTIMIZATIONS.md "Lever 1 AMENDED". Program-config only, so
+# it cannot change numerics. QWEN36_WIDE1D_DECODE=0 reverts every site for an A/B.
+WIDE1D_DECODE = os.environ.get("QWEN36_WIDE1D_DECODE", "1") != "0"
+# These configs are NOT numerically neutral: in0_block_w is the K-block size, so it changes the
+# matmul's accumulation ORDER, and at bf16/bf8 that shifts the low bits.
+#
+# `gate_w` is therefore DEFAULT-OFF, and it is the only site that is. It is worth ~0.70 ms/token (the
+# largest single win in the set, AUTO 29.7 -> 12.1 us x 40 layers), but the router matmul feeds a
+# `topk`, so a low-bit shift can flip which expert is 8th -- a DISCRETE change in which experts fire,
+# not just a rounding difference. Measured, bisected per site with QWEN36_WIDE1D_SITES against
+# tests/test_moe_sparse.py::test_moe_gather_decode (gate 0.99):
+#     off              PASS
+#     se_gate_up       PASS
+#     se_down          PASS
+#     se_gate_up,se_down PASS
+#     gate_w           FAIL, PCC 0.9857   <- on its own
+#     all              FAIL, PCC 0.9852
+# Re-enable it with QWEN36_WIDE1D_SITES=all once there is an MMLU-Redux baseline to judge it against
+# (evaluation/published_scores.json is still all null), which is this project's rule for anything that
+# changes what the model computes. A cheaper alternative first: sweep gate_w's in0_block_w for a value
+# that keeps most of the speed with an accumulation order closer to the ttnn heuristic's.
+# `lm_head` is also omitted, for the opposite reason to gate_w: it is worth EXACTLY ZERO. Isolated it
+# is 1125.9 -> 1035.7 us (-90 us); in the real 40-layer step it is 1.225 -> 1.226 ms, and the full-model
+# delta is fully accounted for by the other three sites. So enabling it buys nothing and still perturbs
+# the low bits of the largest matmul in the step -- strictly the wrong trade. (It stays selectable, and
+# the 2026-08-22 accuracy measurements were taken WITH it on, so they bound a slightly larger
+# perturbation than what now ships.) See FUTURE_OPTIMIZATIONS "Lever 1 AMENDED".
+_WIDE1D_DEFAULT_SITES = "se_gate_up,se_down,wk,w_in_proj"
+_WIDE1D_SITES = os.environ.get("QWEN36_WIDE1D_SITES", _WIDE1D_DEFAULT_SITES)
+
+
+def wide1d_enabled(site: str) -> bool:
+    """Is the tuned wide-1D decode config enabled for `site`?
+
+    Sites: gate_w, se_gate_up, se_down, wk, w_in_proj, lm_head. `QWEN36_WIDE1D_SITES` takes a
+    comma-separated subset, or "all"/"none"; the default omits `gate_w` (see above).
+    `QWEN36_WIDE1D_DECODE=0` disables every site, for a single-knob A/B.
+    """
+    if not WIDE1D_DECODE or _WIDE1D_SITES == "none":
+        return False
+    return _WIDE1D_SITES == "all" or site in {t.strip() for t in _WIDE1D_SITES.split(",")}
+
+
 DRAM = ttnn.DRAM_MEMORY_CONFIG
 L1 = ttnn.L1_MEMORY_CONFIG
 
@@ -121,6 +167,58 @@ def build_dram_shard(w, K, N, nb=8):
         in0_block_w=sk // 32, per_core_M=1, per_core_N=sn // 32, fused_activation=None
     )
     return w_dram, smc(32, sk, ttnn.BufferType.L1), smc(32, sn, ttnn.BufferType.L1), pc
+
+
+def wide_1d_decode_pc(m, k, n, num_cores, grid_w=11, in0_block_w=None, fp32_acc=False, fused_activation=None):
+    """1D (``mcast_in0``) matmul program config for a skinny (M <= 32) decode matmul on an
+    **INTERLEAVED** weight — the alternative to ``build_dram_shard``'s DRAM-width-sharded form.
+
+    Why this exists as a second option. ``build_dram_shard`` width-shards the weight across the 8 DRAM
+    banks and needs the activation resharded in and the output resharded out on every call (~8 us the
+    pair), plus a SECOND copy of every weight it is applied to (the interleaved original stays alive
+    for prefill — ~510 MB across the model). A tuned 1D mcast config on the plain interleaved weight
+    needs neither. Two independent single-P150 implementations measure the interleaved form as the
+    faster one on exactly this class of matmul:
+
+      * ``models/demos/blackhole/qwen36/tt/model_config.py:179-230`` (same architecture, measured):
+        gate/up 11x4 42.8us vs 43.9 at 8x4; down 11x3 +28% vs 8x2; gdn_qkvz 11x4 +22% vs 8x5;
+        attn_wo and gdn_out 11x3 +25% vs 8x4. Mechanism: for a fixed core budget a WIDE-SHORT grid
+        shortens the in0 multicast column, so shape the grid width-first up to ``grid_w`` (11 on a
+        P150 — a harvested part exposes 11 worker columns, not 13).
+      * MuseGlimmer's decode ``down_proj``: grid 11x10 (all 110 cores), per_core_M=1, per_core_N=2,
+        interleaved weight, and ``in0_block_w=4`` with the note that four K tiles "nearly halves this
+        projection's device time" by fixing DRAM-reader under-utilization on Blackhole.
+
+    ``in0_block_w`` only has to DIVIDE ``k_tiles`` (mcast_in0 streams the full K on every core), so the
+    largest legal divisor is usually much bigger than ``k_tiles // grid_x``. Default: the largest
+    divisor <= 8. It is an L1 bound as well as a legality bound — it sizes the in0 circular buffer,
+    which competes with any resident L1 output for the same 1536 KB — so a value that wins in a
+    standalone sweep can still overflow in the full model. Validate at 40 layers, never per-op.
+
+    Returns just the program config; the caller passes the activation as ordinary L1/DRAM interleaved
+    (no reshard) and reads the output back the same way.
+    """
+    cols = min(grid_w, num_cores)
+    rows = max(1, -(-num_cores // cols))
+    m_tiles, k_tiles, n_tiles = -(-m // 32), -(-k // 32), -(-n // 32)
+    if in0_block_w is None:
+        in0_block_w = next((d for d in range(8, 0, -1) if k_tiles % d == 0), 1)
+    assert k_tiles % in0_block_w == 0, f"in0_block_w={in0_block_w} must divide k_tiles={k_tiles}"
+    per_core_n = max(1, -(-n_tiles // (cols * rows)))
+    cap = 4 if fp32_acc else 8  # fp32 dest-acc halves the DST subblock budget on Blackhole
+    sub_w = max(i for i in range(1, cap + 1) if per_core_n % i == 0)
+    sub_h = max(i for i in range(1, cap + 1) if m_tiles % i == 0 and i * sub_w <= cap)
+    return ttnn.MatmulMultiCoreReuseMultiCast1DProgramConfig(
+        compute_with_storage_grid_size=(cols, rows),
+        in0_block_w=in0_block_w,
+        out_subblock_h=sub_h,
+        out_subblock_w=sub_w,
+        per_core_M=m_tiles,
+        per_core_N=per_core_n,
+        fuse_batch=True,
+        fused_activation=fused_activation,
+        mcast_in0=True,
+    )
 
 
 def as_weight(source, mesh_device, dtype=ttnn.bfloat16, cache_file_name=None):

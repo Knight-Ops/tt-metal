@@ -4,7 +4,8 @@
 #
 # CI entrypoint for the qwen3_6_a3b module PCC gates. Runs on a SINGLE Blackhole and needs NO
 # checkpoint: these are the checkpoint-free module tests (random / per-module weights). The
-# checkpoint-required tests (test_model/test_trace/test_long_prefill/test_ragged_prefill) and the
+# checkpoint-required tests (test_model/test_trace/test_long_prefill/test_ragged_prefill, and the
+# script-style test_batched_decode/test_paged_cb_kv, which are `main()` entry points run by hand) and the
 # reference-venv cross-validation (test_reference_smoke) are intentionally excluded — see
 # pcc_thresholds.json. test_cache_topology reads only the checkpoint's config.json (no weights) and
 # skips cleanly if it is absent.

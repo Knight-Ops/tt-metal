@@ -77,7 +77,7 @@ class TtMtpHead(LightweightModule):
             args.num_experts_per_tok,
             expert_dtype=args.expert_weight_dtype,
             down_dtype=args.expert_down_weight_dtype,
-            dtype=args.activation_dtype,
+            dtype=args.moe_shared_weight_dtype,  # see decoder.py: this sets router/shared precision
             sparse_decode=args.sparse_moe_decode,
             compute_kernel_config=args.compute_kernel_lofi,
             cache_path=cache_path,
