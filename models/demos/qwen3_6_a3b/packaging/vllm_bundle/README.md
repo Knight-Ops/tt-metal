@@ -76,13 +76,57 @@ fork/plugin on the serve host (present here per `tt-kernel doctor`); **`tt-api` 
 
 Both are set in `vllm_metadata.json`'s `launch` and are tunable per deploy without code changes:
 
-- **Concurrency (slots)** = `--max-num-seqs N` in `launch.command` (shipped bundle sets `1`). Max requests decoded
-  concurrently. `N == 1` routes to the fast single-user V1 path (no batching); `N > 1` uses the batched
-  continuous-batching path.
-- **Per-slot context** = `QWEN36_MAX_SEQ` in the launch env (code default `8192`; shipped bundle sets
-  `131072`). Bounds the **contiguous** KV each slot reserves, capped by vLLM's `--max-model-len`.
-  ⚠️ It is only applied when `--max-num-seqs > 1`, so at the shipped `1` it has **no effect** and KV
-  is sized from `--max-model-len` alone (262144 if that flag is unset).
+- **Concurrency (slots)** = `--max-num-seqs N` in `launch.command` (shipped bundle sets `1`). Max requests
+  decoded concurrently. `N == 1` routes to the fast single-user V1 path (no batching); `N > 1` uses the
+  batched continuous-batching path.
+
+  ⚠️ **Leave this at 1 unless you expect ~6+ concurrent requests.** MEASURED 2026-08-23,
+  `tests/bench_batched_decode.py`, 40 layers traced:
+
+  | B | step ms | per-user tok/s | aggregate tok/s | vs B=1 |
+  |--:|--:|--:|--:|--:|
+  | 1 | 25.27 | **39.6** | 39.6 | 1.00x |
+  | 2 | 137.17 | 7.3 | 14.6 | **0.37x** |
+  | 4 | 140.64 | 7.1 | 28.4 | **0.72x** |
+
+  At B=2 and B=4 the batched path is worse than single-user on **both** axes -- 5.6x the per-token
+  latency AND less aggregate throughput. The cause is structural, not tuning: at `B > 1` the MoE
+  switches from the sparse-gather path (top-8 experts, 566 MB/step) to **dense-256** (453 MB/layer x 40
+  = ~18 GB/step), and the decode graph runs at POOL width regardless of how many slots hold a live
+  request. Note B=2 -> B=4 costs almost nothing (137 -> 141 ms): it is one large fixed cost that
+  amortizes over users, which is why aggregate keeps climbing (28.4 at B=4, ~157 at B=32) and only
+  passes single-user around **B ~ 6**. So idle slots are NOT free -- configuring 4 and using 1 gives you
+  7 tok/s, not 40.
+
+  (Caveat on the numbers: this bench drives the scan-based batched GDN via `setup_decode_batch`, not
+  `decode_step_traced_batch` with `QWEN36_GDN_BATCH_FUSED=1`, which is 11-28% faster per B. The dense-MoE
+  step cost dominates and is identical either way, so the shape of the conclusion holds.)
+- **KV budget** — as of 2026-08-23 the batched path (`--max-num-seqs > 1`) uses **paged KV by default**
+  (`QWEN36_PAGED_KV`, set automatically). The budget is then an AGGREGATE token count,
+  `QWEN36_KV_POOL_TOKENS`, shared by every slot and every attention layer, defaulting to
+  `max_num_seqs × QWEN36_CB_TOKENS_PER_SLOT` (8192) — deliberately the same number of tokens the old
+  contiguous arrangement pinned. There is **no per-slot context cap** any more: one request may use the
+  whole pool, or all of them may share it.
+  Set `QWEN36_PAGED_KV=0` to get the old contiguous arrangement back, in which case
+  `QWEN36_MAX_SEQ` (code default `8192`; shipped bundle sets `262144`) is again the per-slot reservation.
+  ⚠️ Either way this applies only when `--max-num-seqs > 1`; at the shipped `1` the single-user V1 path
+  runs unchanged, with a flat cache sized from `--max-model-len` (262144 if that flag is unset).
+- **KV precision** = `QWEN36_KV_DTYPE`. **The bundle ships `bf8`** (the model-wide default is `bf16`).
+  At this bundle's `QWEN36_MAX_SEQ=262144` it is the single largest decode lever: SDPA re-reads the whole
+  cache every step, so BFP8 is worth **−3.58 ms/token at 128K** (1.82× on sdpa-decode, i.e. 96.5% of the
+  1.88× byte-ratio ideal) and **halves the cache** (2.66 GiB vs 5.00 GiB for a full 262144-token
+  sequence). 128K is the longest position MEASURED (`tests/probe_paged_kv_perf.py`); the term is linear
+  in position, so 256K should be roughly twice that -- treat it as extrapolation, not a measurement.
+  Set `bf16` to
+  revert. It is worth ~nothing below ~8K, which is why it is not the model-wide default — see
+  FUTURE_OPTIMIZATIONS.md "Lever 6".
+  Accuracy is measured, not assumed: teacher-forced decode logit PCC 0.995 mean / 0.996 median over 48
+  steps, **stable** (no accumulation), 44/48 argmax agreement with every flip on a near-tie — on par with
+  the conv add-chain this repo already ships on (EXPERIMENTS.md "BFP8 KV cache").
+  ⚠️ One thing to know if you enable MTP here: `bf8` turns four `test_mtp_spec_decode.py` **exact-parity**
+  assertions red. That is a test property, not a serving risk — greedy speculative decode still emits the
+  backbone's argmax, so both the spec and non-spec streams are valid; what fails is the assertion that
+  they are token-identical, and the divergence passes that file's own near-tie criterion.
 - **Slot margin** = `QWEN36_CB_SLOT_MARGIN` in the launch env (shipped bundle sets `0`). Spare
   slots that absorb the transient where finished requests' replacements are prefilled before the next
   decode's reconcile frees them.
@@ -103,35 +147,50 @@ under bursty/benchmark load.
 
 **Memory model** (measured from the config: 10 of 40 layers are full-attention, GQA with 2 KV heads):
 
-    weights    ≈ 21 GB                        (bf4 experts + attention/router/embed/lm_head)
-    KV cache   = pool × context × 20 KB       (20 KB per token per slot, bf16, k+v)
-    GDN state  = pool × ~30 MB                (context-INDEPENDENT — 3/4 of the layers are gated-delta)
-    prefill scratch = context × 20 KB         (ONE [1,…]-wide cache, context-sized, pool-independent)
+    weights    ≈ 21 GB                          (bf4 experts + attention/router/embed/lm_head)
+    KV pool    = QWEN36_KV_POOL_TOKENS × 20 KB   (20 KB per token, bf16 k+v; 10.9 KB at QWEN36_KV_DTYPE=bf8)
+    GDN state  = pool_slots × ~30 MB             (context-INDEPENDENT — 3/4 of the layers are gated-delta)
+    prefill scratch = GDN only, ~30 MB           (paged: the attention scratch ALIASES the pool)
 
-The card is ~33 GB. After ~21 GB of weights, **~12 GB is left for KV + scratch + activations**. The
-prefill scratch is a fixed context-sized overhead (2.5 GB @ 128K) regardless of pool. Per-slot KV cost:
-**~2.5 GB @ 128K, ~1.3 GB @ 64K, ~0.6 GB @ 32K.**
+The card is ~33 GB. After ~21 GB of weights, **~12 GB is left for KV + activations** — call it ~10 GB of
+pool once activations are covered, which is **~500K tokens at bf16 or ~900K at bf8**, shared however the
+traffic wants them.
 
-Collision-free sizing (`pool = 2 × max_num_seqs`):
+What paging changed, stated honestly — it does not create bytes, it removes two worst-case reservations:
 
-| context | GB/slot | scratch | max pool that fits | collision-free `--max-num-seqs` (margin = N) |
-|--------|--------|--------|-----|-----|
-| 128K | ~2.5 | 2.5 | **1** | 1 — single-stream only (V1 path, no CB) |
-| 96K  | ~1.9 | 1.9 | 3 | 1 |
-| 64K  | ~1.3 | 1.3 | 6 | 3 |
-| 48K  | ~1.0 | 1.0 | 8 | **4** (the shipped default: 48K / seqs 4 / margin 4) |
-| 32K  | ~0.6 | 0.6 | 12 | 6 |
+1. **The context-sized prefill scratch is gone.** The contiguous path stages each prompt in a separate
+   `[1, n_kv, max_seq, hd]` cache and row-copies it into the slot — a fixed **2.5 GB at 128K**, paid
+   whatever the pool size. Paged prefill writes straight into the target slot's pages, so that scratch
+   aliases the pool and only GDN state is staged.
+2. **Per-slot reservation is gone.** Contiguously, *every* slot reserves the full `QWEN36_MAX_SEQ` even
+   to serve a 200-token prompt, so capacity had to be sized for worst-case context on every slot. The
+   pool is sized for the aggregate the traffic actually occupies, which for realistic mixed-length
+   traffic is the predicted **~3–10× more effective capacity** (the ratio of max to average context).
 
-Push concurrency higher by accepting a smaller margin (fine for staggered traffic): e.g. `64K / seqs 4 /
-margin 2` (pool 6) serves 4-way with only rare bursty-load corruption.
+**What ships today, concretely.** `QWEN36_MAX_SEQ=262144` + `QWEN36_KV_DTYPE=bf8` + paged: one
+full-length 262144-token sequence is **2.66 GiB** of KV, so weights (~20.3 GiB) + a pool holding one full
+sequence ≈ 23 GiB of the ~31.7 GiB usable. Comfortable at `--max-num-seqs 1`. Four *simultaneously*
+full-length requests would need 10.6 GiB of pool and land right on the edge — the adapter's pool floor
+guarantees any ONE request can reach the advertised context, and beyond that the failure mode is
+"block pool exhausted", not corruption. At bf16 the same sequence is 5.00 GiB, which is why bf8 and 256K
+were enabled together.
 
-⚠️ **Single-P150 reality: 128K + multi-slot batching does NOT fit** — at 128K the weights + one slot's
-KV + scratch already ≈ 26 GB, and pool ≥ 3 OOMs. 128K is single-stream only. For collision-free
-continuous batching, keep `QWEN36_MAX_SEQ` ≤ 48K at 4-way.
+So the old table's ceiling — "128K is single-stream only; keep context ≤ 48K at 4-way" — was a statement
+about *reservations*, not about bytes in use. Under paging a 4-way deploy can advertise 128K and serve
+it, as long as the concurrent requests do not *simultaneously* need more than the pool; when they do,
+the pool raises "block pool exhausted" rather than corrupting anything. Sizing rule:
 
-⚠️ **Contiguous KV**: every slot reserves the FULL `QWEN36_MAX_SEQ` up front (even for short prompts),
-so the table is worst-case. Real **paged KV** (V2 follow-on) would allocate only the blocks used →
-size for *average* context, ~3–10× more effective capacity. Highest-value remaining optimization.
+    QWEN36_KV_POOL_TOKENS ≈ (expected concurrent tokens) × 1.2      # ~20 KB/token bf16, ~11 KB bf8
+
+⚠️ The **collision-safety margin discussion above still applies unchanged** — it is about slot *identity*
+(a finished request leaving our slot map one decode step late), not about KV bytes, so paging does not
+address it. `QWEN36_CB_SLOT_MARGIN` still wants to be `max_num_seqs` for guaranteed safety; what paging
+makes cheaper is precisely that margin, since a spare slot now costs ~30 MB of GDN state instead of a
+full context's worth of KV.
+
+⚠️ Slots are released back to the pool when the adapter retires a request (`model.release_slot`), on both
+the normal-completion and the over-capacity-eviction paths. Without that the pool leaks one sequence per
+completed request; `tests/test_paged_cb_kv.py` asserts the accounting closes.
 
 ## Status (verified on the P150, 2026-07-18)
 
@@ -158,8 +217,12 @@ supports) but loses logprobs, `min_p`, `frequency_penalty`, and guided/structure
 
 ## Remaining assumptions to keep an eye on
 
-- **`allocate_kv_cache` returns `[]`** — vLLM's paged manager is bypassed (caches model-bound); OK at
-  B=1. Real paged KV is V2.
+- **`allocate_kv_cache` returns `[]`** — vLLM's paged manager is bypassed because the caches are
+  MODEL-owned, and that stays true now that the model pages its own KV: our pool, free list and device
+  page table live in `tt/paged_kv.py`, and vLLM's block ids are used only as stable request keys. The two
+  page tables never have to agree. This is forced by the architecture, not a shortcut — 30 of 40 layers
+  carry GDN recurrent+conv state with no `AttentionSpec`, and `model_runner._validate_kv_cache_groups`
+  rejects any non-AttentionSpec group, so there is no spec we could hand vLLM for this model.
 - **`decode_forward` ignores `start_pos`/`page_table`** — the model tracks positions internally;
   correct only for B=1 continuing from its own prefill.
 - **launch env** — `MESH_DEVICE=P150`, `--block-size 64` confirmed working on this host.

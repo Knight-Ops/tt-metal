@@ -25,7 +25,15 @@ standing harness is `tests/bench_prefill.py`).
 | v0.77.0 defaults (GDN fused op off, bf16 MoE activations) | 672.3 ms / 381 tok/s | 1277.3 ms / 401 tok/s | 2489.4 ms / 411 tok/s |
 | + `ttnn.transformer.chunk_gated_delta_rule` **default on** | 450.3 ms / 568 tok/s | 837.3 ms / 611 tok/s | 1607.4 ms / 637 tok/s |
 | + BFP8 MoE matmul in0 & `in0_block_w=8` **default on** | **336.5 ms / 761 tok/s** | **614.3 ms / 833 tok/s** | **1162.4 ms / 881 tok/s** |
-| **total speedup** | **2.00x** | **2.08x** | **2.14x** |
+| + last-token D2H in ROW_MAJOR & dead `exp` removed (2026-08-22) | **327.9 ms / 781 tok/s** | **607.5 ms / 843 tok/s** | **1154.0 ms / 887 tok/s** |
+| **total speedup** | **2.05x** | **2.10x** | **2.16x** |
+
+> The 2026-08-22 row is `scratchpad/bench_prefill_eager.py` (best-of-3 after 2 warm-ups, eager, warm
+> cache), NOT paired against the row above it — that row was measured on 2026-08-20 with the same
+> defaults. What makes the attribution credible anyway is that the saving is **the same ~8.5 ms at all
+> three lengths** (−8.6 / −6.8 / −8.4 ms), which is the signature of a FIXED per-call cost, i.e.
+> exactly the one-shot logits readback §4.3 predicted — not a per-token effect. §4.3 estimated ~14 ms
+> at T=512 from the 15.9 MB transfer size; the real figure is ~7-9 ms.
 
 > **Read prefill tok/s at a FIXED length.** `tests/benchmark.py` reports `T / TTFT` per prompt and then
 > takes an unweighted MEAN over prompts of 24-220 tokens, where that ratio measures fixed per-call cost
@@ -74,6 +82,104 @@ says which levers can work.
   measured — ~12% of DRAM peak. It is op-count/occupancy-bound, which is exactly why one fused op
   bought 1.5x and why byte-shaving there is pointless.
 
+### 1.2 Where gated-delta PREFILL time goes — and why the glue is NOT the lever either (2026-08-22)
+
+`tt/gated_delta.py` had no per-stage phase timers (the MoE did), so nobody knew. Added them
+(`QWEN36_PROFILE_PHASES=1`, gated on `T > 1` so they never sync inside a decode step). T=1024,
+40 layers, current tree — synced ms, so read the SHARES:
+
+| stage | ms/layer | x30 | share of `delta` |
+|---|--:|--:|--:|
+| `delta.qknorm` | 2.65 | 79.4 | **24%** |
+| `delta.conv` | 2.64 | 79.3 | **24%** |
+| `delta.norm_out` | 2.14 | 64.2 | 19% |
+| `delta.recurrence` | 2.10 | 63.1 | **19%** |
+| `delta.in_proj` | 0.61 | 18.2 | 6% |
+| `delta` (total) | 11.01 | 330.3 | 100% |
+
+**The recurrence is now only 19% of gated-delta prefill.** Every prior optimisation here targeted it --
+the ttl `_chunk_state` kernel, the batched chunk-prep, and finally
+`ttnn.transformer.chunk_gated_delta_rule` (1.49-1.55x). It worked, and it worked itself out of the top
+spot: the GLUE is now 73%.
+
+**But the glue is not worth much, and this is the number that matters.** `delta.qknorm` was 6 ops per
+call (`multiply, sum, add, rsqrt, multiply [, multiply]`) x2 for q and k. Replaced with a 2-op identity
+(`QWEN36_GDN_L2NORM_RMS`, default on):
+
+    l2norm(x) = x / sqrt(sum(x^2) + eps) = rms_norm(x, epsilon=eps/K) * K**-0.5
+
+with the caller's scale folded into the trailing multiply. PCC-clean at both settings. Paired A/B,
+eager, T=1024: **1154.0 -> 1146.3 ms, 887 -> 893 tok/s. +0.7%.**
+
+Eliminating two thirds of the ops in a stage the phase timer calls **24% of `delta`** bought **0.7% of
+the call.** So the phase timers substantially over-count `delta`: each timer SYNCS, which serialises
+work that otherwise overlaps with the MoE matmuls around it. Back-solving, gated-delta's real
+wall-clock share is ~6-7%, not the 13% the synced accounting suggests -- the same "isolated stage
+timings over-count because ops pipeline" lesson recorded four times in `EXPERIMENTS.md`, now with a
+prefill instance.
+
+**Implication for the remaining prefill plan.** Scaling that result, the other two glue stages
+(`conv` 24%, `norm_out` 19%) are worth perhaps ~1.5% between them. So:
+
+    MoE          ~67% of the call   -- 2.5x available, BLOCKED on 12 GB (see 2.0)
+    gated-delta  ~6-7%              -- ~2% total available, mostly spent
+    attention    ~2%
+    head         0.1%               -- was 15.5 ms, now 1.72 ms after the ROW_MAJOR D2H fix
+
+**There is no second lever in prefill.** The MoE reformulation is the only thing with real value left,
+and it is a memory problem rather than a compute one. Stop tuning the glue.
+
+### 2.0 The FLAT reformulation: 2.5x, measured, and blocked by 12 GB (2026-08-22)
+
+The dense MoE computes `[E, tc, H] @ [E, H, 2I]`, which forces the E-fold `ttnn.repeat` and an E-fold
+output that must then be `sum`ed. Merging the expert axis into the channel axis removes both:
+
+    flat:  hgu = x[tc, H] @ Wgu[H, 2*E*I]      in0 is multicast, never materialised E times
+           gate, up = two CONTIGUOUS slices;  h = silu(gate) * up * w
+           y   = h[tc, E*I] @ Wdn[E*I, H]      the sum over E IS this matmul's K reduction
+
+Measured at real dims (`tests/probe_flat_moe.py`, traced, BFP4 weights, BFP8 in0), **ms per 256 tokens**
+so the chunk sizes are comparable:
+
+| tc | batched (current) | flat | flat + `minimal_matmul(fuse_swiglu)` | batched N-split=4 |
+|--:|--:|--:|--:|--:|
+| 256 | **4.74** | 6.61 | 8.23 | 9.86 |
+| 512 | **L1 FAIL** | 3.50 | 4.35 | 7.77 |
+| 1024 | L1 FAIL | 2.88 | **2.50** | 6.90 |
+| 2048 | L1 FAIL | 2.60 | **1.91** | — |
+
+PCC vs the batched form is 0.9994-0.9996 at tc=256, which also confirms the one layout claim the design
+rests on: **`down_sp` `[E, I, H]` -> `[E*I, H]` is a free view** in TILE layout, no relayout needed.
+
+**The win is 2.48x, and it is NOT about bytes.** My own prediction here -- "2.3x fewer bytes, therefore
+~1.75x" -- was wrong twice: at the tc the model actually uses, the flat form is 1.4x **SLOWER**. What it
+really does is remove the L1 wall that pins `_DENSE_TMAX` at 256, after which the 453 MB/layer expert
+weight read amortises over 4-8x more tokens. `minimal_matmul` also flips from slower to faster at
+tc >= 1024, matching tt_transformers' own "only above a length cutoff" rule.
+
+**BLOCKER: it needs a second copy of the gate_up weight, and there is no room.** `[H, 2*E*I]` is
+H-major where the sparse decode layout `[1, E, H, 2I]` is E-major, so the flat weight is a genuine
+retile, not a view: **302 MB/layer x 40 = 12.1 GB**, against ~9.6 GB free (22.7 of 32.3 GB used,
+`MEMORY.md` §5). The down side is free; only gate_up is affected. Decode cannot share the flat layout
+because `ttnn.sparse_matmul` needs the `[1, E, K, N]` form to gather 8 of 256 experts.
+
+**Two memory-neutral escapes were measured and both fail:**
+1. **Hybrid** (batched gate_up + flat down; both weights are then free views): **15.6 ms at tc=256, 3.3x
+   SLOWER**, and it still L1-fails at tc=512. The `[E, tc, I] -> [tc, E*I]` permute of `h` is brutal,
+   and the L1 wall is not confined to the down projection as `_dense_experts`' docstring suggests.
+2. **N-splitting the batched matmuls** (smaller per-core output block, same weight layout): lifts the L1
+   wall -- it runs at tc=512 and 1024 -- but is never faster, because `per_core_N == Nt` means each of
+   the `ns` chunks RE-READS the whole `xe` in0 (143 MB x 4 at tc=256).
+
+**So the 2.5x is available but priced in device memory.** Three ways forward, in order of appeal:
+- **A second card, or any card with >= 44 GB.** The flat weight fits trivially and needs no other change.
+- **Trade decode for prefill:** store ONLY the flat layout and rebuild decode's expert path as 16
+  tile-aligned column slices (expert `e`'s gate is `[e*I, (e+1)*I)`, its up is `[E*I + e*I, ...)`) feeding
+  one dense `[1, 2048] @ [2048, 8192]`. Rough estimate +93 us/layer = **+3.7 ms/token (~15% decode
+  regression)** to buy ~1.5x prefill. Unattractive at a 39 tok/s decode, plausible if prefill is the
+  product bottleneck. Measure before believing the estimate.
+- **Leave it.** Prefill's non-MoE half (GDN glue, ~20%) has no such blocker and is untouched.
+
 ### 2.1 Two structural MoE fixes were built and measured. Both are SLOWER. {#dead-ends}
 
 Recorded so they are not re-attempted; details in `tt/moe.py`'s module docstring.
@@ -119,6 +225,12 @@ left is narrowing the bytes it moves, which is §3.8.
 5. **Eager incremental (from-cache) prefill** (`forward_incremental`; §4) — ingest only the new tokens
    continuing from cache (gated-delta state-in + attention `chunked_scaled_dot_product_attention` over
    the cache); for multi-turn, O(M) instead of re-prefilling O(P+M). Validated PCC ≥ 0.999.
+   **2026-08-23: `slot` is now threaded through `prefill_long`/`forward_incremental`**, so a continuous-
+   batching slot's prompt goes through the chunked path instead of being limited to what a single-shot
+   prefill can materialize. The subtlety that made this necessary rather than cosmetic: chunked-SDPA's
+   READ page table must be **per-slot** (`_kv_read_table`). It was previously handed the full `[B, blocks]`
+   decode table, and the kernel treats row 0 as *the* sequence's mapping — so every slot past 0 would
+   have silently read slot 0's pages. Flat-path behaviour is unchanged (one cache, trivial table).
 6. **MoE large-T chunking** (`_DENSE_TMAX=256`) — the tuned matmul holds each core's full `[T,N]` output
    in L1, overflowing past T≈320; chunk over T in ≤256 blocks (same fast config per chunk). Restores
    arbitrary length; validated T=256/384/512/768.
@@ -211,10 +323,11 @@ left is narrowing the bytes it moves, which is §3.8.
 2. **Gated-delta glue, now ~20% of prefill.** Occupancy-bound, not bandwidth-bound (~12% of DRAM
    peak), so the lever is fewer/larger ops: `delta.conv`, `in_proj`, `norm_out`. Same shape of win the
    fused op just delivered for the recurrence.
-3. **`head` costs 15.5 ms of a ~614 ms prefill** for one token's logits. `_head` already slices to the
-   last position before the 248k-vocab matmul, and decode's identical matmul is 1.23 ms, so the extra
-   ~14 ms is the D2H: `[1, 248320]` in TILE layout is physically `[32, 248320]` = 15.9 MB over PCIe.
-   `ttnn.to_layout(logits, ROW_MAJOR)` before `from_tt` should move 0.5 MB instead. Untested.
+3. **~~`head` costs 15.5 ms~~ — DONE (2026-08-22).** `[1, 248320]` in TILE layout is physically
+   `[32, 248320]` = 15.9 MB over PCIe for 0.5 MB of logits. `ttnn.to_layout(logits, ROW_MAJOR)` before
+   `from_tt` in `_head` (and `_head_all`, which the `evaluation/` path uses, where TILE also pads S up
+   to a multiple of 32). **Measured ~8.5 ms per call at every length** — see the §1 note. One line, no
+   flag, no accuracy question.
 4. **Bigger token chunks are NOT a lever** — measured 2.63 -> 2.50 -> 2.43 ms/token at T=256 -> 512 ->
    1024 (v0.77 defaults). Fixed per-call cost is already amortized by T=256; per-token cost is real
    work. Note `_DENSE_TMAX=256` chunking means a SMALLER chunk is strictly worse (each chunk re-reads

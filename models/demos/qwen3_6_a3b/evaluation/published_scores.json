@@ -1,23 +1,61 @@
 {
-  "_comment": "Reference/target accuracy for Qwen3.6-35B-A3B and the recorded single-P150 sweep. Fill 'reference' from the official Qwen model card (do not guess); 'measured' rows are populated by run_mmlu_bench.py runs so the BFP4 accuracy cost is tracked over time.",
+  "_comment": "Reference/target accuracy for Qwen3.6-35B-A3B and the recorded single-P150 sweep. Fill 'reference' from the official Qwen model card (do not guess); 'measured' rows are populated by run_mmlu_bench.py runs so the BFP4 accuracy cost is tracked over time. NOTE: at 200 samples the standard error is ~2.9 points, so differences below ~3 points between rows are NOT resolvable -- treat them as 'no detectable change', not as a win or a regression.",
   "model": "Qwen3.6-35B-A3B",
   "reference": {
-    "source": "https://huggingface.co/Qwen (official model card — fill in verified numbers)",
+    "source": "https://huggingface.co/Qwen (official model card \u2014 fill in verified numbers)",
     "mmlu_redux": null,
     "mmlu_pro": null,
     "gpqa_diamond": null
   },
   "measured": {
-    "_note": "One entry per (expert_dtype, lmhead_dtype, n_layers) config. Append after each run.",
-    "example": {
+    "_note": "One entry per config. The FIRST baseline this repo ever recorded is 'perf_flags_off' -- every earlier accuracy claim in the docs (79.0% / 79.5%) was from an unrecorded run. Decode tok/s is NOT measured here (see the harness docstring); use bench_decode.py.",
+    "perf_flags_off": {
+      "config": "pristine baseline: the 2026-08-22 perf flags all reverted",
+      "flags": "QWEN36_WIDE1D_DECODE=0 QWEN36_MOE_ROUTER_FAST=0 QWEN36_MOE_CONST_SPARSITY=0",
+      "date": "2026-08-22",
       "expert_weight_dtype": "DataType.BFLOAT4_B",
       "lmhead_dtype": "DataType.BFLOAT4_B",
       "n_layers": 40,
       "dataset": "MMLU-Redux",
-      "num_samples": null,
-      "overall_accuracy": null,
-      "avg_ttft_ms": null,
+      "num_samples": 200,
+      "seed": 42,
+      "overall_accuracy": 79.0,
+      "avg_ttft_ms": 1003.5,
+      "avg_prefill_tps": 158.6,
       "avg_decode_tps": null
-    }
+    },
+    "perf_flags_default": {
+      "config": "shipping defaults after the 2026-08-22 decode work (39.2 tok/s/user)",
+      "flags": "defaults (WIDE1D_DECODE=1, MOE_ROUTER_FAST=1, MOE_CONST_SPARSITY=1)",
+      "date": "2026-08-22",
+      "expert_weight_dtype": "DataType.BFLOAT4_B",
+      "lmhead_dtype": "DataType.BFLOAT4_B",
+      "n_layers": 40,
+      "dataset": "MMLU-Redux",
+      "num_samples": 200,
+      "seed": 42,
+      "overall_accuracy": 78.5,
+      "avg_ttft_ms": 979.5,
+      "avg_prefill_tps": 162.5,
+      "avg_decode_tps": null
+    },
+    "_paired_analysis": {
+      "_note": "Per-question pairing of the two rows above (same seed, same 200 questions). The aggregate accuracy difference is not readable on its own at n=200; this is.",
+      "identical_predicted_letter": "197/200",
+      "both_right": 156,
+      "baseline_only_right": 2,
+      "new_only_right": 1,
+      "both_wrong": 41,
+      "discordant_pairs": 3,
+      "mcnemar_exact_two_sided_p": 1.0,
+      "flipped_subjects": [
+        "high_school_chemistry",
+        "college_computer_science",
+        "electrical_engineering"
+      ],
+      "standard_error_points_at_n200": 2.9,
+      "conclusion": "No detectable difference. NOT a demonstration of no effect -- it bounds the effect below what 200 samples resolve."
+    },
+    "_decode_path_note": "MMLU is scored on PREFILL last-token logits, so it does NOT exercise the T==1-gated decode optimisations (se_gate_up/se_down/wk/w_in_proj/const_sparsity). Those are gated by tests/probe_teacher_forced_drift.py: 40L/96 steps, logit PCC mean 0.997283, median half-trend +1.3e-04 (stable), argmax 92/96, all flips on near-ties. Compare the shipped conv add-chain's 0.996."
   }
 }

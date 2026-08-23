@@ -20,13 +20,20 @@ contract prepare_inputs_decode/ttnn_decode_forward/process_output_decode and let
 self-contained decode loop (`start_decode` → `decode_forward_logits` → `set_decode_tokens`).
 So V1 **overrides** prefill_forward/decode_forward to drive that loop directly, avoiding a
 model-internals refactor. Trace is OFF in V1 (eager decode) for simplicity; continuous
-batching, paged KV, and traced decode are V2 (see packaging/VLLM_CONTINUOUS_BATCHING.md).
+batching and traced decode are V2 (see packaging/VLLM_CONTINUOUS_BATCHING.md).
+
+PAGED KV (2026-08-23): wired, and ON by default for `--max-num-seqs > 1`. One block pool
+shared across slots and across the 10 attention layers, so the KV budget follows concurrent
+demand (`QWEN36_KV_POOL_TOKENS`) rather than `max_num_seqs x max_model_len` — which is what
+removes the per-slot context cap the contiguous arrangement needed. It stays MODEL-owned
+(see allocate_kv_cache); `QWEN36_PAGED_KV=0` restores the contiguous path. Gated by
+`tests/test_paged_cb_kv.py`.
 
 ⚠️  VERIFY-ON-DEVICE (this is a hardware-unverified draft — every item below is an assumption
     about the plugin contract that must be confirmed against a running P150 + TT vLLM plugin):
-      1. allocate_kv_cache: V1 bypasses vLLM's paged manager (caches are model-bound). The
-         plugin MAY require a non-empty kv_cache of a specific shape — if so, allocate a dummy
-         of `kv_cache_shape` or bring paged KV forward from V2.
+      1. allocate_kv_cache: RESOLVED — the plugin accepts an empty kv_cache (confirmed
+         on-device 2026-07-18), and it stays empty now that the model pages its own KV, since
+         the caches are model-bound by necessity (no AttentionSpec exists for the 30 GDN layers).
       2. decode_forward ignores `start_pos`/`page_table` (the model tracks positions
          internally). Valid ONLY for B=1 single-sequence continuing from its own prefill.
       3. prefill_forward returns logits `[B,1,vocab]`. If the runner unpacks `(logits,
@@ -185,14 +192,53 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         cls._max_batch_size = int(max_batch_size)
         max_seq_len = int(max_seq_len)
         if cls._max_batch_size > 1:
-            # Contiguous per-slot KV can't hold the full 262K context × B slots on a 32 GB P150 (OOM).
-            # Cap per-slot context to QWEN36_MAX_SEQ (default 8192) for the batched build; real paged KV
-            # (V2 follow-on) removes this. Requests longer than the cap will overflow their slot.
-            cap = int(os.environ.get("QWEN36_MAX_SEQ", "8192"))
-            max_seq_len = min(max_seq_len, cap)
-            logger.warning(
-                f"[qwen36-vllm][cb] B={cls._max_batch_size}: capping per-slot context to {max_seq_len} tokens (contiguous KV)"
-            )
+            # KV for B slots. Two arrangements, chosen by QWEN36_PAGED_KV (default ON for B>1):
+            #
+            #  PAGED (default). One block pool shared by all slots and all 10 attention layers, handed
+            #  out 64 tokens at a time as each sequence grows (tt/paged_kv.py). The footprint is set by
+            #  the AGGREGATE budget QWEN36_KV_POOL_TOKENS, not by B x max_model_len, so no per-slot cap
+            #  is needed: one request may use the whole pool, or B requests may share it. The default
+            #  budget below is deliberately the same number of tokens the contiguous arrangement used to
+            #  pin (B x 8192), so enabling paging changes flexibility, not memory -- see the
+            #  "blocks_per_seq" note in tt/paged_kv.py for why that distinction matters.
+            #
+            #  CONTIGUOUS (QWEN36_PAGED_KV=0). B slots x max_seq each, so the full 262K context x B
+            #  slots does not fit a 32 GB P150 and the per-slot cap is mandatory.
+            paged = os.environ.get("QWEN36_PAGED_KV", "1") != "0"
+            os.environ["QWEN36_PAGED_KV"] = "1" if paged else "0"
+            if paged:
+                per_slot = int(os.environ.get("QWEN36_CB_TOKENS_PER_SLOT", "8192"))
+                # FLOOR: the pool must hold at least ONE max-length request. The pool IS the
+                # per-sequence cap (tt/paged_kv.py: blocks_per_seq == num_blocks), so a pool below
+                # max_model_len makes the server advertise a context it cannot actually serve -- a long
+                # prompt would fail with "block pool exhausted" rather than being merely slow. At the
+                # shipped 262144 / bf8 that floor is 2.66 GiB, which is what makes "any one request may
+                # use the whole pool" a real guarantee instead of a slogan.
+                pool = int(
+                    os.environ.get(
+                        "QWEN36_KV_POOL_TOKENS",
+                        str(max(cls._max_batch_size * per_slot, max_seq_len)),
+                    )
+                )
+                if pool < max_seq_len:
+                    logger.warning(
+                        f"[qwen36-vllm][cb] QWEN36_KV_POOL_TOKENS={pool} is below max_model_len="
+                        f"{max_seq_len}: requests longer than {pool} tokens will fail with "
+                        f"'block pool exhausted'. Raise the pool or lower --max-model-len."
+                    )
+                os.environ["QWEN36_KV_POOL_TOKENS"] = str(pool)
+                logger.info(
+                    f"[qwen36-vllm][cb] B={cls._max_batch_size}: paged KV, pool={pool} tokens shared "
+                    f"across slots (any single request may use up to the whole pool); "
+                    f"~{pool * 10880 / 2**30:.2f} GiB at bf8, ~{pool * 20480 / 2**30:.2f} GiB at bf16"
+                )
+            else:
+                cap = int(os.environ.get("QWEN36_MAX_SEQ", "8192"))
+                max_seq_len = min(max_seq_len, cap)
+                logger.warning(
+                    f"[qwen36-vllm][cb] B={cls._max_batch_size}: QWEN36_PAGED_KV=0, capping per-slot "
+                    f"context to {max_seq_len} tokens (contiguous KV)"
+                )
         ckpt = _resolve_weights(hf_config)
         os.environ.setdefault("QWEN36_EXPERT_DTYPE", "bf4")  # only bf4 (~17.5 GB) fits a 32 GB P150
         os.environ.setdefault("TT_CACHE_PATH", os.path.join(ckpt, "tt_weight_cache"))
@@ -212,10 +258,18 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
 
     # ── KV cache ────────────────────────────────────────────────────────────────
     def allocate_kv_cache(self, *args, **kwargs):
-        """V1: attention KV and GDN state are model-bound (allocated at model build); vLLM's
-        paged manager is bypassed for single-sequence serving. Returns an empty structure.
-        VERIFY: if the plugin requires a non-empty kv_cache of `kv_cache_shape`, allocate a
-        dummy here or bring paged KV forward from V2 (gap #D)."""
+        """Attention KV and GDN state are MODEL-owned, so vLLM's paged manager stays bypassed and this
+        returns an empty structure.
+
+        This is true even now that the model pages its KV (QWEN36_PAGED_KV): the pool, the free list and
+        the device page table all live in `tt/paged_kv.py`, and vLLM's block ids are used only as STABLE
+        REQUEST KEYS (`page_table[i][0]`) to map a request to one of our slots. The two page tables are
+        never required to agree -- ours indexes our pool. The reason it has to work this way is the
+        hybrid architecture: 30 of 40 layers carry GDN recurrent+conv state that has no AttentionSpec,
+        and `model_runner._validate_kv_cache_groups` rejects any non-AttentionSpec group, so we cannot
+        hand vLLM a spec for this model at all (see the DESIGN note at the top of this file).
+
+        CONFIRMED on-device 2026-07-18: the plugin accepts an empty kv_cache here."""
         return []
 
     # ── prefill (model-owned) ─────────────────────────────────────────────────────
@@ -279,6 +333,7 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                         if victim is not None:
                             model._cb_ever_decoded.discard(victim)
                             slot = model._cb_slot_of_key.pop(victim)
+                            model.release_slot(slot)  # the evicted request's blocks return to the pool
                             logger.warning(f"[qwen36-vllm][cb] over capacity: evicting key={victim} for key={key}")
                         else:
                             # Truly over pool (burst of finishes > margin). Never clobber a SIBLING just
@@ -394,9 +449,14 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
             # not in _cb_ever_decoded, so it's protected from being freed before its first step.
             ever = getattr(model, "_cb_ever_decoded", set())
             for k in [k for k in list(model._cb_slot_of_key) if k in ever and k not in active]:
-                model._cb_slot_of_key.pop(k, None)
+                freed = model._cb_slot_of_key.pop(k, None)
                 ever.discard(k)
                 model._cb_seed_base.pop(k, None)  # forget the finished request's RNG base
+                # Hand the request's KV blocks back to the shared pool. Without this the pool leaks one
+                # sequence's worth of blocks per completed request and a long-running server eventually
+                # raises "block pool exhausted" with only a few requests live. No-op when not paged.
+                if freed is not None:
+                    model.release_slot(freed)
             model._cb_last_active = set(active)
             model._cb_ever_decoded = ever | active
             if not getattr(model, "_cb_setup_done", False):
@@ -416,7 +476,13 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                 )
             model.reset_presence_slots(reset_slots)  # clear presence for slots that got a new request
             model.set_sampling_params_batch(topk_slot, topp_slot, temp_slot, seed_slot)  # per-request
-            model.set_decode_state(tok_by_slot, pos_by_slot)  # plugin-driven per-slot token + position
+            # active_slots: paged KV maps blocks only for live slots, so a dead slot parked at position
+            # 0 never takes a block the pool can't get back (it has no request to retire and release it).
+            model.set_decode_state(
+                tok_by_slot,
+                pos_by_slot,  # plugin-driven per-slot token + position
+                active_slots=sorted({model._cb_slot_of_key[k] for k in active if k in model._cb_slot_of_key}),
+            )
             # Trace-on-first-step: the batched device-select decode graph reads the stable-address
             # [B,...] caches + t_tok/t_curpos + sampling buffers, so it's captured once and replayed;
             # new prefills write the SAME buffers in place, so the trace stays valid. Returns [B] tokens

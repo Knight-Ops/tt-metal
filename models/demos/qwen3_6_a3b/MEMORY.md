@@ -159,6 +159,42 @@ tracing the prefill is only worth ~1.01-1.02x now that the fused GDN op is the e
 matters most for the eval path (`evaluation/run_mmlu_bench.py`, which pre-captures one bucket) rather
 than for serving.
 
+### ⚠ Re-opened 2026-08-22: multi-bucket traced prefill HANGS on this tree
+
+The two-pass fix above is still in place and still correct about the aliasing mechanism, but the
+"multi-bucket prefill traces work" conclusion does **not** reproduce today. It no longer returns
+garbage — it **hangs the device** (Tensix idle, host thread blocked, 0% CPU; recovery needs
+`tt-smi -r`).
+
+Reproduced twice, at two scales:
+
+| harness | shape | result |
+|---|---|---|
+| `tests/bench_prefill.py --seqs 256,512,1024` | 40 layers | hangs inside/just after `setup_prefill_traces`, before printing |
+| `scratchpad/probe_prefill_trace.py`, `BUCKETS=256,512,1024` | 4 layers | capture completes in 2-4 s; traced T=256 replays fine (PCC 0.990 vs eager); the traced **T=512 replay hangs** |
+| same probe, `BUCKETS=256` | 4 layers | **PASSES** (PCC 0.990909) |
+
+**It is not the router rewrite.** The 4-layer repro is identical with `QWEN36_MOE_ROUTER_FAST=1`
+(PCC 0.990908 then hang) and `=0` (PCC 0.990026 then hang) — same stage, same symptom.
+
+Two things stop this from being a root cause, and both are worth knowing before someone re-derives it:
+
+1. **The probe interleaves an eager `forward()` with live traces** (it calls `forward()` right after
+   each `forward_prefill_traced()` to compute the PCC). That allocates device buffers while a trace is
+   alive, which is checklist item 4 above — so the probe may be *causing* its own hang. A clean repro
+   must compute the reference BEFORE any capture. `bench_prefill.py` does not interleave and hung too,
+   but at a different stage, so the two may not be the same bug.
+2. **The §2 validation was run with `QWEN36_GDN_FUSED_OP=0`** (the doc says to, so eager and traced use
+   the same recurrence). With the fused op on — today's default — eager and traced take *different*
+   recurrence paths, which is also why the PCC above reads 0.990 rather than 1.000.
+
+**Practical impact is small and bounded.** Eager prefill is the production path (`demo/server.py`
+prefers `forward()`; `QWEN36_SERVER_PREFILL_TRACE=0`), tracing the prefill is worth only ~1.02x
+(`PREFILL.md` §4), and the one consumer that does capture — `evaluation/run_mmlu_bench.py` — captures
+a **single** bucket, which passes. So: **do not use multi-bucket traced prefill, and do not benchmark
+prefill with `tests/bench_prefill.py` until this is understood** (use `scratchpad/bench_prefill_eager.py`
+or add an eager-only flag to the harness).
+
 ### If you need a stronger guarantee
 
 Pinning the prefill graph's intermediates (extending `build_trace_pool` to the MoE and attention) makes
@@ -182,6 +218,15 @@ Before capturing anything, ask:
 5. **If a fresh allocation was zeroing something for you, who zeroes it now?** Reusing a buffer means
    resetting it explicitly. `t_presence` needed this; missing it would leak one request's repetition
    penalty into the next.
+6. **If the graph reads an INDEX buffer, is that index rewritten in place?** Added 2026-08-23 for paged
+   KV: the decode graph reads the page table, so the table is allocated once and grown in place with
+   `copy_host_to_device_tensor` (`PagedKV.ensure`). Reallocating it per request would invalidate the
+   trace exactly the way `start_decode` used to. Two corollaries worth stating, because they are what
+   make it safe rather than merely conventional:
+   - `ensure()` is a **no-op on ~63 of every 64 steps** (it only acts when a sequence crosses a block
+     boundary), so the steady-state step still copies nothing from host.
+   - It must be called from the Python loop, never inside the graph — `_kv_advance` / `set_decode_state`
+     do it before the replay. A host write under capture is the illegal-op class from §1.
 
 ### Symptoms that should make you suspect this class of bug
 

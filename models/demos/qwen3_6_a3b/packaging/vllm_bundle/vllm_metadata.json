@@ -32,7 +32,8 @@
         "HF_MODEL": "Qwen/Qwen3.6-35B-A3B",
         "QWEN36_EXPERT_DTYPE": "bf4",
         "VLLM_RPC_TIMEOUT": "100000",
-        "QWEN36_MAX_SEQ": "131072",
+        "QWEN36_MAX_SEQ": "262144",
+        "QWEN36_KV_DTYPE": "bf8",
         "QWEN36_CB_SLOT_MARGIN": "0"
       }
     },
@@ -65,7 +66,8 @@
         "HF_MODEL": "Qwen/Qwen3.6-35B-A3B",
         "QWEN36_EXPERT_DTYPE": "bf4",
         "VLLM_RPC_TIMEOUT": "100000",
-        "QWEN36_MAX_SEQ": "131072",
+        "QWEN36_MAX_SEQ": "262144",
+        "QWEN36_KV_DTYPE": "bf8",
         "QWEN36_CB_SLOT_MARGIN": "0"
       }
     }

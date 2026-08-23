@@ -22,8 +22,17 @@ Tenstorrent vLLM plugin with **true continuous batching**, packaged as a `tt-ker
   batched GDN state `[B,…]` + kernels (`decode_step_batch_tt`, PCC>0.999 @B=4, benched
   B=32→~157 tok/s), batched attention KV `[B,…]`, dense MoE for B>1, and the
   logits-returning contract (`decode_forward_logits`→`[B,vocab]`, `set_decode_tokens`,
-  `_reset_linear_state`). Gaps: **paged KV**, **per-slot (vs synchronized) batching**,
-  **batched prefill**, and the **scheduler bridge**.
+  `_reset_linear_state`). Gaps: **per-slot (vs synchronized) batching**, **batched prefill**,
+  and the **scheduler bridge**.
+- **UPDATE 2026-08-23: paged KV is no longer a gap.** `tt/paged_kv.py` + `alloc_batch_caches`
+  give every slot pages out of ONE pool shared across slots and across the 10 attention
+  layers, so the KV budget follows concurrent demand (`QWEN36_KV_POOL_TOKENS`) instead of
+  `batch_size x max_seq` — which is what removes the per-slot context cap V2 otherwise needs.
+  The adapter turns it on by default for `B>1`. Gated by `tests/test_paged_cb_kv.py` (paged
+  and flat produce identical token streams across slots with different prompt lengths, and
+  the pool accounting closes). Note it stays MODEL-owned: `allocate_kv_cache` still returns
+  `[]` and vLLM block ids are used only as stable request keys — see the §"larger,
+  deferrable" item below, which is the thing that is still true.
 
 ## Where the code lives (this is NOT confinable to `packaging/`)
 

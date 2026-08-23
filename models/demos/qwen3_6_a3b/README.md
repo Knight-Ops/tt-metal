@@ -208,6 +208,12 @@ crossover to ~1.7K tokens. `tests/test_cache_topology.py` pins all of this.
 | `QWEN36_CKPT` | `~/models/qwen36` | checkpoint dir |
 | `QWEN36_LAYERS` | 40 | number of decoder layers to build |
 | `QWEN36_MAX_SEQ` | 32768 | KV/state cache length, i.e. the hard prompt+generation limit. At 20 KiB/token (see Memory above) 32K is ~0.67 GB of KV; the checkpoint's native 262144 is ~5.4 GB |
+| `QWEN36_KV_DTYPE` | `bf16` | attention KV cache precision (`bf16`/`bf8`/`bf4`). `bf8` HALVES the cache (20 -> 10.9 KiB/token) and makes sdpa-decode markedly cheaper as context grows -- measured per attention layer: 83.2 -> 62.4 us at 8K (1.33x), 227.7 -> 137.4 at 32K (1.66x), 796.7 -> 438.8 at 128K (1.82x), i.e. -0.21 / -0.90 / -3.58 ms per token across the 10 attention layers. Accuracy: teacher-forced decode logit PCC mean 0.995 / median 0.996 over 48 steps, **stable, no accumulation**, 44/48 argmax agreement with every flip on a near-tie -- on par with the shipped conv add-chain's own 0.996 gate (EXPERIMENTS.md). Note MMLU **cannot** gate this: prefill-scored evals never read the KV cache |
+| `QWEN36_PAGED_KV` | 0 | paged KV: one block pool + a device page table instead of a flat `[1, n_kv, max_seq, hd]` cache per layer. **Memory-neutral for a single user** (`blocks_per_seq == num_blocks` is forced by the kernel, so one sequence cannot be over-subscribed -- see tt/paged_kv.py); the win is ACROSS sequences, which is why the vLLM adapter defaults it ON for `B>1`. Free at decode (paged sdpa-decode is 0.99-1.00x flat at every position; the write costs +0.3-0.8 us) |
+| `QWEN36_KV_READ_GRAN` | 128 | tokens of k-range `sdpa_decode` rounds its READ up to. Paged KV must map every block in that rounded range, not just up to `cur_pos`, or the kernel dereferences an unmapped page-table entry and attends over junk — **must equal `Attention._sdpa_pc`'s `k_chunk_size`**; they are one contract, not two knobs. See EXPERIMENTS.md "The bug this shipped with" |
+| `QWEN36_KV_BLOCK` | 64 | tokens per KV block. 64 is what `blackhole/qwen36` and `tt_transformers` ship and what the probe measured the page-table indirection as free at |
+| `QWEN36_KV_POOL_TOKENS` | `batch x max_seq` | AGGREGATE pool budget in tokens, shared by all slots and all attention layers. The default preserves the flat footprint; lowering it is what actually reclaims memory, and it also becomes the per-sequence cap |
+| `QWEN36_CB_TOKENS_PER_SLOT` | 8192 | vLLM adapter only: the per-slot budget it multiplies by `max_num_seqs` to size the pool when `QWEN36_KV_POOL_TOKENS` is unset |
 | `QWEN36_MAX_NEW_DEFAULT` | 8192 | `server.py`: generation cap for a request that sends no `max_tokens`. Deliberately independent of `QWEN36_MAX_SEQ` so widening the context does not lengthen runaway generations |
 | `QWEN36_SERVER_HOST` | `0.0.0.0` | server bind host (`server.py`) |
 | `QWEN36_SERVER_PORT` | 8000 | server port (`server.py`) |
@@ -223,6 +229,13 @@ crossover to ~1.7K tokens. `tests/test_cache_topology.py` pins all of this.
 | `QWEN36_MTP_GAMMA` | 2 | draft depth (measured optimum; ≥4 is measured *worse*, see MTP.md) |
 | `QWEN36_MTP_ACCEPT` | `exact` | acceptance rule for sampled requests: `exact` (distribution-preserving, 1.14×), `relaxed` (typical acceptance, 1.25×, mean TV 0.090), `lenient` (tunable via `QWEN36_MTP_LENIENCE`, 1.21× at mean TV 0.054), `greedy` (parity testing only — biases sampled output toward the argmax) |
 | `QWEN36_TRACE_REGION` | 200 (400 with MTP) | trace region, MiB |
+| `QWEN36_MOE_ROUTER_FAST` | 1 | decode router as `topk(logits)` + `softmax(top_k)` (instead of `softmax(E)` + topk + sum + divide) **and** a cached constant `sparsity` for the gather path (`sparse_matmul` indexed mode never reads that operand). Mathematically identical; measured 35.0 → **37.4 tok/s/user** (−1.89 ms/token). `0` reverts, for an A/B |
+| `QWEN36_GDN_L2NORM_RMS` | 1 | q/k L2 norm as `rms_norm(x, eps/K) * K**-0.5` (2 ops) instead of a 6-op reduction chain. Measured eager prefill T=1024: 887 → **893 tok/s**. `0` restores the chain |
+| `QWEN36_GDN_DTYPE` | `bf8` | gated-delta projection precision (`bf16`/`bf8`/`bf4`). `bf4` is −0.45 ms/token and ~0.5 GB less DRAM, and paired MMLU is clean (79.0→80.5%, p=0.508) — but it **fails `test_long_prefill_chunk_invariant`**, so it is not the default. See FUTURE_OPTIMIZATIONS "Lever 4 MEASURED" |
+| `QWEN36_ATTN_DTYPE` | `bf8` | attention projection precision. `bf4` is −0.09 ms/token, same caveat as above |
+| `QWEN36_SHARED_DTYPE` | `bf16` | MoE router + shared-expert weight precision. Was hardcoded to the activation dtype because `mlp_weight_dtype` was assigned and never read. `bf8` removes 138 MB/token of weight traffic and buys **−0.04 ms, i.e. nothing** (`moe.shared` runs at 21% of DRAM peak, `moe.router` at 3%) — so the default does not spend the perturbation. Useful only for DRAM footprint |
+| `QWEN36_WIDE1D_DECODE` | 1 | tuned wide 1D `mcast_in0` program configs on the decode matmuls that otherwise ran on the ttnn AUTO heuristic (`se_gate_up`, `se_down`, attention `wk`/`wv`, gated-delta `w_in_proj`). Measured 37.4 → **39.2 tok/s/user**. `0` reverts every site. `lm_head` has a tuned config too but is NOT in the default site list — see the row below |
+| `QWEN36_WIDE1D_SITES` | `se_gate_up,se_down,wk,w_in_proj` | per-site subset of the above, or `all`/`none`. **`lm_head` is omitted by default**: its tuned config measured **0.00 ms** at 40 layers (the isolated 1125.9 -> 1035.7 us win did not survive; it pipeline-overlaps), so the default does not spend an accumulation-order change for nothing. **`gate_w` is also omitted**: it is worth a further −0.70 ms/token but its matmul feeds a `topk`, so its accumulation-order change can flip which expert is 8th (PCC 0.9857 vs a 0.99 gate). Needs an MMLU baseline first — see FUTURE_OPTIMIZATIONS.md |
 | `QWEN36_SPARSE_IN0BW_GU` | 32 | MoE `gate_up` sparse-matmul `in0_block_w` (its Kt=64 is not constrained by `down`'s Kt=16) |
 | `QWEN36_GDN_VERIFY_CONV_STACK` | 1 | stacked-matmul verify conv (verify 52.5→44.0 ms, PCC 0.9997→0.99998); `0` reverts to the slice loop |
 | `QWEN36_GDN_COMMIT_COPY` | 1 | full-accept conv commit as one copy (round −2.6 ms) |
@@ -251,9 +264,12 @@ Full 40-layer decode on a single P150 (text-only, BFP4 experts), measured progre
 | + fused gate+up MoE sparse_matmul | 9.11 |
 | **+ decode-opt levers** (8-of-256 MoE gather, fused Gated-DeltaNet decode kernel, conv add-chain, DRAM-sharded projections, MoE `in0_block_w`) | **~30** |
 | + per-matmul MoE `in0_block_w` (`gate_up`=32) | 34.9 |
+| **+ router rewrite** (`QWEN36_MOE_ROUTER_FAST`: topk-on-logits + constant gather sparsity) | **37.4** |
+| **+ wide-1D decode matmul configs** (`QWEN36_WIDE1D_DECODE`) | **39.2** |
 | **+ speculative decode (MTP, gamma=2, greedy)** | **43.5** |
 
-Speculative decode is measured at **43.5 tok/s/user greedy** (1.25× over 34.9, gamma=2, round 52.1 ms). Acceptance is prompt-dependent and break-even is ~1.9
+Speculative decode is measured at **43.5 tok/s/user greedy** (1.25× over the then-current 34.9,
+gamma=2, round 52.1 ms; not yet re-measured on top of the 37.4 baseline). Acceptance is prompt-dependent and break-even is ~1.9
 tokens/round, so the server measures both rates live and disengages if speculation is losing. For
 *sampled* requests it is **distribution-exact at 1.11–1.19×**;
 `QWEN36_MTP_ACCEPT=relaxed` gets 1.22× by giving up exactness and `=lenient` 1.18× at half the
