@@ -101,30 +101,35 @@ runtime:
   #   for decode_step_tt (the DEFAULT decode kernel), chunk_state_tt, decode_step_batch_tt and
   #   decode_step_chain_tt.
   # Shipped as a local wheel so the image does not depend on PyPI resolution at build time; pinned
-  # to the version the host env actually runs with this metal tree.
-  # NOTE: this is a REPACKAGED tt-lang wheel, with one line removed from its METADATA:
-  #     Requires-Dist: ttnn==0.74.0; sys_platform == "linux" and (...)
-  # tt-lang hard-pins ttnn 0.74.0, and runtime.wheels is installed LAST ("so they win over anything
-  # resolved above"), so the stock wheel REPLACED the editable ttnn 0.77.1 that
-  # `uv pip install -e /opt/tt-metal` had just put in place. The build log shows both:
-  # `ttnn==0.77.1.` then `+ ttnn==0.74.0`. A 0.74 ttnn against a 0.77 metal tree and firmware
-  # bundle 19.14.0 fails device init on every worker core:
+  # to the version the host env actually runs with this metal tree. It is the STOCK PyPI wheel --
+  # reproduce it byte-for-byte with:
+  #     pip download tt-lang==1.1.6 --no-deps -d /home/carl/projects/wheels
+  #     # sha256 a2049ae0746cf0c3e018b0f4f97363dd8466ce686c62fe9d44c2cfe4cf5cf078
+  #
+  # `wheels_no_deps: true` is REQUIRED, not tuning. tt-lang hard-pins `ttnn==0.74.0`, and
+  # runtime.wheels installs LAST ("so they win over anything resolved above"), so with deps resolved
+  # the stock wheel REPLACED the editable ttnn 0.77.1 that `uv pip install -e /opt/tt-metal` had just
+  # put in place. The build log shows both: `ttnn==0.77.1.` then `+ ttnn==0.74.0`. A 0.74 ttnn
+  # against a 0.77 metal tree and firmware bundle 19.14.0 fails device init on every worker core:
   #     Device 0: Timeout (10000 ms) waiting for physical cores to finish: 13-6, 11-7, ... (all ~120)
   #     Device 0 init: failed to initialize FW! Try resetting the board.
   # (Not a wedged board: the host opened the same card fine immediately before and after, and
   # tt-smi -ls works from inside the container.)
   #
-  # Dropping the pin is safe HERE because ttnn is supplied by the metal tree, which is exactly the
+  # Skipping the pin is safe HERE because ttnn is supplied by the metal tree, which is exactly the
   # combination this box runs and every measurement in PREFILL.md was taken on: tt-lang 1.1.6
-  # against ttnn 0.77.1.dev. The pin exists for standalone installs that have no metal tree.
+  # against ttnn 0.77.1.dev. The pin exists for standalone installs that have no metal tree. And
+  # --no-deps costs nothing else: tt-lang's remaining requirements (pydantic, torch, numpy, greenlet,
+  # PyYAML, typing_extensions, ml_dtypes) are all already in the image -- VERIFIED by importing every
+  # one of them inside tt-model/qwen3.6-a3b-blackhole:ce05cee4d0ee before switching to this.
   #
-  # Regenerate with:  python -m wheel unpack <stock.whl>
-  #                   # delete the 'Requires-Dist: ttnn==' line from */METADATA
-  #                   python -m wheel pack tt_lang-1.1.6 -d wheels-patched
-  # The proper fixes are upstream: tt-lang relaxing the pin, or tt-model supporting --no-deps for
-  # runtime.wheels.
+  # HISTORY: this used to point at a REPACKAGED wheel with the `Requires-Dist: ttnn==` line deleted
+  # from its METADATA, which worked but is not something a published manifest can reproduce. The
+  # proper fix landed in tt-model instead (runtime.wheels_no_deps, launchers.py); tt-lang relaxing
+  # the pin upstream would make even that unnecessary.
   wheels:
-    - /home/carl/projects/hangdbg/wheels-patched/tt_lang-1.1.6-cp312-cp312-manylinux_2_38_x86_64.whl
+    - /home/carl/projects/wheels/tt_lang-1.1.6-cp312-cp312-manylinux_2_38_x86_64.whl
+  wheels_no_deps: true
 
 serve:
   port: 8000
