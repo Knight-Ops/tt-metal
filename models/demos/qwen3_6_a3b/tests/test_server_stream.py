@@ -148,3 +148,67 @@ def test_guard_requires_consecutive_windows():
 
 def test_guard_counts_a_loss_exactly_at_the_margin():
     assert _guard(1.15, 0, 1.15) == 1
+
+
+# ── warmup trace-capture ORDER ───────────────────────────────────────────────
+#
+# Qwen36Engine.warmup() must capture the SAMPLING decode trace before the GREEDY one. Each warm
+# generate captures a trace and releases the previous one, and capturing the LARGER graph (sampling
+# adds chunked topk + ttnn.sampling + the presence mask) into the hole left by releasing the smaller
+# one leaves the trace region in a state that a later large eager prefill collides with -- which
+# HANGS the device inside that prefill and needs a `tt-smi -r`.
+#
+# It shipped that way and wedged the server on a REPEATED PROMPT: the first prefill of a shape was
+# fine, the second hung. It stayed hidden because a growing chat transcript gives every turn a
+# different prompt length; QWEN36_PREFIX_REUSE made it reachable by keeping shapes constant.
+# Measured both ways in tests/probe_prefix_reuse_hang.py. A device test cannot guard this (the
+# failure is a hang, not an exception), so the ORDER itself is asserted here, on a stub.
+
+
+class _OrderRecordingEngine:
+    """Enough of Qwen36Engine for warmup() to run, recording the order of its warm generates."""
+
+    def __init__(self):
+        self.generates = []
+        self.use_mtp = False
+        self.mtp_mode = "0"
+        self.mtp_gamma = 2
+        self.plain_ms_per_token = None
+        self.prefix_reuse = True  # so warmup's checkpoint-ring pre-allocation is exercised too
+        self.model = SimpleNamespace(
+            enable_sampling=lambda *a, **k: None,
+            alloc_state_checkpoints=lambda: self.generates.append("ring"),
+            prewarm_prefill_shapes=lambda *a, **k: self.generates.append("shapes"),
+        )
+        self.tokenizer = SimpleNamespace(encode=lambda *a, **k: torch.zeros(1, 1, dtype=torch.long))
+
+    def generate(self, ids, max_new, **sampling):
+        self.generates.append(float(sampling.get("temperature", 0.0)))
+        return "", 0, 0.0, 0.0, "stop"
+
+    @property
+    def temps(self):
+        return [g for g in self.generates if not isinstance(g, str)]
+
+
+def test_warmup_captures_the_sampling_trace_before_the_greedy_one():
+    eng = _OrderRecordingEngine()
+    srv.Qwen36Engine.warmup(eng)
+    assert eng.generates[0] == "ring", (
+        "the checkpoint ring must be pre-allocated before any warm generate captures a trace -- "
+        "allocating it later drops 180 MiB into the hole a capture's freed transients left"
+    )
+    assert eng.generates[1] == "shapes", (
+        "every per-shape prefill constant must be built before any warm generate captures a trace. "
+        "GatedDelta._conv_stack_const caches five READ-ONLY selection matrices per block width and "
+        "builds them on first use; first use after warmup happens with the decode trace resident, so "
+        "they are allocated under an active trace, get stomped by a replay, and -- being read-only -- "
+        "are never repaired. Measured: the turn that next reuses that width wedges the device "
+        "(40 layers, 6/6 at turn 5). See TtModel.prewarm_prefill_shapes."
+    )
+    assert len(eng.temps) == 2, f"expected two warm generates, got {eng.generates}"
+    assert eng.temps[0] > 0, (
+        "warmup must run the SAMPLING generate first: capturing the larger sampling trace after "
+        "releasing the smaller greedy one hangs the device on a later repeated prefill"
+    )
+    assert eng.temps[1] == 0, "the second warm generate is the greedy tail"

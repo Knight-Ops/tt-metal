@@ -87,6 +87,7 @@ class PagedKV:
         block_size=None,
         pool_tokens=None,
         dtype=ttnn.bfloat16,
+        nslots=None,
     ):
         self.mesh_device = mesh_device
         self.n_kv_heads, self.head_dim = n_kv_heads, head_dim
@@ -94,6 +95,15 @@ class PagedKV:
         self.block_size = block_size or block_size_default()
         self.read_granularity = read_granularity_default()
         self.batch = batch
+        # HOST mapping rows, which may EXCEED the device table's row count. `batch` is how many
+        # sequences DECODE runs at once -- the device table's shape, and therefore an address the
+        # decode trace bakes. `nslots` is how many independent block mappings the pool tracks. They
+        # are equal for continuous batching, where slot b decodes from device row b. They differ for
+        # the single-sequence server holding several PARKED conversations: one row decodes, the rest
+        # are host-side mappings whose blocks stay allocated so a later turn can resume on them (see
+        # activate()). Keeping the device table at `batch` rows is what makes parking free -- its
+        # shape does not change with the number of conversations, so no trace is invalidated.
+        self.nslots = max(int(nslots or batch), batch)
         self.max_seq = max_seq
         # Pool budget, in tokens, across ALL slots. Defaults to batch*max_seq so enabling paging alone
         # changes nothing about footprint -- see the module docstring. Lower it to actually reclaim.
@@ -124,15 +134,20 @@ class PagedKV:
         self.max_reachable = self.num_blocks * self.block_size
 
         assert self.max_reachable >= 1
-        self._host = torch.full((batch, self.blocks_per_seq), UNMAPPED, dtype=torch.int32)
+        self._host = torch.full((self.nslots, self.blocks_per_seq), UNMAPPED, dtype=torch.int32)
         # High-water mark: how many logical blocks of each slot are mapped. The mapping is always a
         # contiguous prefix (`ensure` fills 0..need-1), so this is exact, and it keeps `ensure` O(new
         # blocks) instead of O(all blocks mapped so far). That matters at long context: chunked prefill
         # calls ensure() once per chunk, so a rescan-from-zero made a 256K prompt O(n^2) -- 1.05M torch
         # scalar indexes across 512 chunks, measured 1-5 s of pure Python.
-        self._mapped = [0] * batch
+        self._mapped = [0] * self.nslots
         self._free = list(range(self.num_blocks))  # simple free list; no eviction (see `ensure`)
-        self._table = ttnn.from_torch(self._host, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device)
+        # Which host row each device row currently shows. Identity for continuous batching; with
+        # parked conversations there is one device row and `activate` decides what it shows.
+        self._shown = list(range(batch))
+        self._table = ttnn.from_torch(
+            self._host[:batch].contiguous(), dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT, device=mesh_device
+        )
 
     # ---- geometry -------------------------------------------------------------------------------
     def cache_shape(self):
@@ -186,15 +201,47 @@ class PagedKV:
             self._host[slot, i] = self._free.pop(0)
             self._mapped[slot] = i + 1
             changed = True
-        if changed:  # in place, at a stable address -- see the trace-safety note above
-            ttnn.copy_host_to_device_tensor(
-                ttnn.from_torch(self._host, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT), self._table
-            )
+        if changed and slot in self._shown:  # in place, at a stable address -- trace-safety note above
+            self._sync_device()
         return changed
 
+    def _sync_device(self):
+        """Push the shown host rows into the device table, in place at its baked address."""
+        rows = self._host[self._shown].contiguous()
+        ttnn.copy_host_to_device_tensor(
+            ttnn.from_torch(rows, dtype=ttnn.int32, layout=ttnn.ROW_MAJOR_LAYOUT), self._table
+        )
+
+    def activate(self, slot=0, row=0):
+        """Show host mapping `slot` in device table `row`, so decode/SDPA read THAT slot's blocks.
+
+        This is how a parked conversation is resumed without reallocating anything: its blocks were
+        never freed, only its mapping was off screen. Only the table's CONTENTS change, and the
+        buffer keeps its address, which is exactly the pattern `ensure` already relies on
+        (MEMORY.md §1: a trace bakes addresses, not contents). Cheap enough to call unconditionally
+        -- it is a no-op when the slot is already shown.
+
+        MUST NOT be called from inside a captured graph: it issues a host->device write."""
+        if not 0 <= slot < self.nslots:
+            raise IndexError(f"conversation slot {slot} out of range (nslots={self.nslots})")
+        if self._shown[row] == slot:
+            return False
+        self._shown[row] = slot
+        self._sync_device()
+        return True
+
+    def mapped_tokens(self, slot=0):
+        """How many positions of `slot` are currently addressable."""
+        return self._mapped[slot] * self.block_size
+
+    def slot_usage(self):
+        """(blocks used per slot, blocks free) -- for logging an eviction decision."""
+        return list(self._mapped), len(self._free)
+
     def release(self, slot=0):
-        """Return a slot's blocks to the pool (end of request). Does NOT touch the device table: the
-        next `ensure` rewrites the entries it needs, and a stale entry is never read past `cur_pos`."""
+        """Return a slot's blocks to the pool (end of request, or when a parked conversation is aged
+        out). Does NOT touch the device table: the next `ensure` rewrites the entries it needs, and a
+        stale entry is never read past `cur_pos`."""
         row = self._host[slot]
         self._free.extend(int(b) for b in row[: self._mapped[slot]].tolist())
         row.fill_(UNMAPPED)
@@ -215,5 +262,6 @@ class PagedKV:
         return (
             f"PagedKV(block={self.block_size}, pool={self.num_blocks} blocks = "
             f"{self.num_blocks * self.block_size} tokens, used={used}, "
+            f"rows={self.batch}, slots={self.nslots}, "
             f"per-layer {self.bytes_per_layer() / 2**20:.0f} MB)"
         )

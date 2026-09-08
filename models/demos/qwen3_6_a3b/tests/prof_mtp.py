@@ -48,6 +48,9 @@ CKPT = os.environ.get("QWEN36_CKPT", os.path.expanduser("~/models/qwen36"))
 PROMPT = "Explain why a mixture-of-experts layer is hard to batch on an accelerator."
 
 
+_PROMPT_TOKENS = 0  # --prompt-tokens: repeat PROMPT up to about this many tokens
+
+
 def _build(mesh, n_layers, max_seq):
     args = ModelArgs(mesh, ckpt_dir=CKPT, max_seq_len=max_seq)
     loader = CheckpointLoader(CKPT)
@@ -62,6 +65,13 @@ def _build(mesh, n_layers, max_seq):
         )
         ids = enc["input_ids"] if hasattr(enc, "keys") else enc
         ids = (ids if torch.is_tensor(ids) else torch.tensor(ids)).reshape(1, -1).to(torch.int64)
+        if _PROMPT_TOKENS > ids.shape[1]:
+            # Context length is the whole point for anything KV-bound: the default ~30-token prompt
+            # measures fixed per-call cost, not the cache re-reads a verify actually pays in service.
+            body = tok(PROMPT + " ", return_tensors="pt")["input_ids"].reshape(-1)
+            reps = -(-(_PROMPT_TOKENS - ids.shape[1]) // max(len(body), 1))
+            pad = body.repeat(reps)[: _PROMPT_TOKENS - ids.shape[1]].reshape(1, -1).to(torch.int64)
+            ids = torch.cat([ids[:, :1], pad, ids[:, 1:]], dim=1)
     except Exception:
         torch.manual_seed(0)
         ids = torch.randint(0, args.vocab_size, (1, 24))
@@ -351,9 +361,18 @@ def main():
     ap.add_argument("--components", action="store_true")
     ap.add_argument("--gdnbreak", action="store_true")
     ap.add_argument("--K", type=int, default=3)
+    ap.add_argument(
+        "--prompt-tokens",
+        type=int,
+        default=0,
+        help="lengthen the prompt to about this many tokens; the verify's SDPA cost scales with context, "
+        "so the default short prompt is the weakest possible test of it",
+    )
     a = ap.parse_args()
     n_layers = int(os.environ.get("QWEN36_LAYERS", "4"))
     max_seq = int(os.environ.get("QWEN36_MAX_SEQ", "512"))
+    global _PROMPT_TOKENS
+    _PROMPT_TOKENS = a.prompt_tokens
     mesh = ttnn.open_mesh_device(ttnn.MeshShape(1, 1), trace_region_size=250_000_000)
     try:
         if a.gdnbreak:

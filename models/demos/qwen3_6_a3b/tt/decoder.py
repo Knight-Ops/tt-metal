@@ -3,6 +3,10 @@
 """tt-nn decoder layer for Qwen3.6-35B-A3B (hybrid: linear_attention or full_attention + MoE)."""
 from __future__ import annotations
 
+import os
+
+from loguru import logger
+
 import ttnn
 from models.common.lightweightmodule import LightweightModule
 from models.demos.qwen3_6_a3b.tt import prefill_profiler as prof
@@ -11,6 +15,10 @@ from models.demos.qwen3_6_a3b.tt.attention import TtAttention
 from models.demos.qwen3_6_a3b.tt.gated_delta import TtGatedDeltaNet
 from models.demos.qwen3_6_a3b.tt.moe import TtMoE
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
+
+# Diagnostic: see model.py's _LAYER_SYNC. Read here too rather than imported, because
+# model.py imports this module.
+_LAYER_SYNC = os.environ.get("QWEN36_PREFILL_LAYER_SYNC") == "1"
 
 
 class TtDecoderLayer(LightweightModule):
@@ -68,13 +76,18 @@ class TtDecoderLayer(LightweightModule):
             se_inter=args.shared_expert_intermediate_size,
         )
 
-    def forward_prefill(self, x, cos, sin, cache, fill_page_table=None):
-        """cache: for linear layers a dict (gated-delta state); for attn layers [k_cache, v_cache]."""
+    def forward_prefill(self, x, cos, sin, cache, fill_page_table=None, valid_len=None):
+        """cache: for linear layers a dict (gated-delta state); for attn layers [k_cache, v_cache].
+
+        valid_len: the block is `valid_len` real tokens right-padded to a bucketed width, so the
+        gated-delta recurrence must treat the pad rows as no-ops (see TtGatedDeltaNet.forward).
+        Attention needs no mask -- pad rows only corrupt their OWN outputs, which nothing reads, and
+        the K/V they write sit past self.pos where every later read is already bounded."""
         with prof.phase(self.mesh_device, "norm"), sp.region("layer.input_norm"):
             h = self.input_norm.forward(x)
         with prof.phase(self.mesh_device, "delta" if self.is_linear else "attn"), sp.region("layer.mixer"):
             if self.is_linear:
-                h = self.mixer.forward(h, cache=cache)
+                h = self.mixer.forward(h, cache=cache, valid_len=valid_len)
             else:
                 h = self.mixer.forward_prefill(h, cos, sin, cache, fill_page_table=fill_page_table)
         with prof.phase(self.mesh_device, "norm"), sp.region("layer.post_norm"):
@@ -104,7 +117,18 @@ class TtDecoderLayer(LightweightModule):
         return ttnn.add(x, self.moe.forward(h, traced=True))
 
     def forward_prefill_incremental(
-        self, x, cos, sin, cache, page_table, P, valid_len=None, q_chunk=None, fill_page_table=None
+        self,
+        x,
+        cos,
+        sin,
+        cache,
+        page_table,
+        P,
+        valid_len=None,
+        q_chunk=None,
+        fill_page_table=None,
+        snap_at=None,
+        snap_dst=None,
     ):
         """Incremental prefill of new tokens continuing from the cache (offset P). Gated-delta starts
         its recurrent state from the cached state (and conv from the cached conv tail); attention
@@ -114,20 +138,37 @@ class TtDecoderLayer(LightweightModule):
         (state stays correct); attention runs the full padded block (causal + the caller reads only the
         real last token, and decode never reads the padded KV rows past self.pos). q_chunk: chunked-SDPA
         q_chunk_size override for the ragged block (so P stays a multiple of it)."""
+
+        def _sync(what):
+            if _LAYER_SYNC:
+                ttnn.synchronize_device(self.mesh_device)
+                logger.info(f"[inc]   layer{self.layer_idx} {what} ok")
+
         h = self.input_norm.forward(x)
+        _sync("input_norm")
         if self.is_linear:
             m = self.mixer
             init = ttnn.reshape(cache["recurrent_state"], [m.num_v_heads * m.head_k_dim, m.head_v_dim])
-            h = m.forward(h, cache=cache, init_state=init, valid_len=valid_len)
+            _sync("init_state reshape")
+            # snap_at (in-block checkpoint): export the gated-delta state as it stands `snap_at` rows
+            # into this block, so the next turn can resume there without this block being split in
+            # two. Only the linear layers carry state; attention's KV is position-indexed and needs
+            # no rewind. See GatedDelta.supports_inblock_snapshot.
+            h = m.forward(h, cache=cache, init_state=init, valid_len=valid_len, snap_at=snap_at, snap_dst=snap_dst)
+            _sync("gated_delta")
         else:
             h = self.mixer.forward_prefill_incremental(
                 h, cos, sin, cache, page_table, P, q_chunk=q_chunk, fill_page_table=fill_page_table
             )
+            _sync("attention")
         x = ttnn.add(x, h)
         h = self.post_norm.forward(x)
-        return ttnn.add(x, self.moe.forward(h))
+        _sync("post_norm")
+        out = ttnn.add(x, self.moe.forward(h))
+        _sync("moe")
+        return out
 
-    def forward_verify(self, x, cos, sin, cache, positions):
+    def forward_verify(self, x, cos, sin, cache, positions, pos_hint=None):
         """Speculative VERIFY of K tokens of ONE sequence. x: [1,1,K,hidden]; positions: a DEVICE int32
         [K] tensor of absolute positions (contiguous). Unlike forward_decode's B rows (independent
         users) these are K consecutive timesteps, so every sub-block runs its sequence-aware verify
@@ -140,7 +181,7 @@ class TtDecoderLayer(LightweightModule):
         if self.is_linear:
             h = self.mixer.forward(h, cache=cache, verify=True)
         else:
-            h = self.mixer.forward_verify(h, cos, sin, cache, positions)
+            h = self.mixer.forward_verify(h, cos, sin, cache, positions, pos_hint=pos_hint)
         x = ttnn.add(x, h)
         return ttnn.add(x, self.moe.forward_verify(self.post_norm.forward(x)))
 

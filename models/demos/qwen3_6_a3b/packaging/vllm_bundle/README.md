@@ -1,13 +1,21 @@
 # Qwen3.6-35B-A3B — vLLM bundle (Milestone V1: single-sequence)
 
-A `tt-kernel --backend vllm` bundle that serves Qwen3.6-35B-A3B through the Tenstorrent
-vLLM plugin. **This is V1: single-sequence (B=1)** — it stands up the whole vLLM/OpenAI
+> **Packaging moved.** `tt-kernel --backend vllm` no longer exists (`tt-kernel` is a deprecated
+> alias for `tt-model`, and `push` now publishes v5.1 **container** packages). The live recipe is
+> [`../../tt-model.yaml`](../../tt-model.yaml):
+> `tt-model package --container models/demos/qwen3_6_a3b/tt-model.yaml`.
+> This folder is still what SHIPS — `tt-model.yaml` lists it as `runtime.extra_models_dir`, so
+> `vllm_metadata.json` and `generator_vllm.py` go into the image from here. What changed is how the
+> artifact is built and published, not what the plugin loads.
+
+This folder is the Tenstorrent vLLM plugin's per-model contract for Qwen3.6-35B-A3B. **This is V1: single-sequence (B=1)** — it stands up the whole vLLM/OpenAI
 serving path and de-risks the plugin integration. It does **not** yet do continuous
 batching (that's V2 — see [../VLLM_CONTINUOUS_BATCHING.md](../VLLM_CONTINUOUS_BATCHING.md)).
 
 ## Contents
-- `vllm_metadata.json` — legacy in-repo descriptor. The v4 `../qwen36_v4_manifest.json` is the
-  source of truth now; tt-kernel renders this file from it on pull.
+- `vllm_metadata.json` — the plugin's `EXTRA_MODELS_DIR` contract: HF arch name -> `main_class`.
+  This file is what ships and what the plugin reads; the v4 manifest that used to render it is
+  deprecated (see `../qwen36_v4_manifest.json`).
 - `generator_vllm.py` — `Qwen36ForCausalLM(Generator)`: model-owned GDN state, bespoke prefill/decode driving this model's own `forward`/`start_decode`/`decode_forward_logits`/`set_decode_tokens` loop.
 - `server_example_tt.py` — thin launcher → vLLM OpenAI API server (TT plugin auto-registers).
 
@@ -109,8 +117,19 @@ Both are set in `vllm_metadata.json`'s `launch` and are tunable per deploy witho
   whole pool, or all of them may share it.
   Set `QWEN36_PAGED_KV=0` to get the old contiguous arrangement back, in which case
   `QWEN36_MAX_SEQ` (code default `8192`; shipped bundle sets `262144`) is again the per-slot reservation.
-  ⚠️ Either way this applies only when `--max-num-seqs > 1`; at the shipped `1` the single-user V1 path
-  runs unchanged, with a flat cache sized from `--max-model-len` (262144 if that flag is unset).
+  As of 2026-09-08 the shipped `--max-num-seqs 1` path pages its KV too, because that is what parked
+  conversations need (next bullet). Its pool defaults to `--max-model-len`, i.e. exactly the tokens
+  the flat cache reserved, so this is memory-neutral. `QWEN36_PAGED_KV=0` still restores the flat
+  cache, at the cost of dropping to one conversation.
+- **Parked conversations** = `QWEN36_CONV_SLOTS` (default `4`, `1` = the old behaviour). At
+  `--max-num-seqs 1` the engine keeps up to 4 conversations' KV blocks and gated-delta checkpoints
+  resident, so a client that interleaves prompt streams keeps its prefix. This is not a nicety: real
+  chat UIs run short auto-title / auto-tag completions between your turns, and with one slot every
+  one of them wiped the conversation's cached prefix — MEASURED in this container as `reused 0 (0%)`
+  on *every* request, forever. With 4 slots the same traffic reuses 96-99% and TTFT goes
+  **7.66 s → 0.32 s**. Slots are matched by longest common prefix (the plugin gives us no
+  conversation id) and aged out least-recently-used, including under KV-pool pressure. See
+  `PREFILL.md` §0.95.
 - **KV precision** = `QWEN36_KV_DTYPE`. **The bundle ships `bf8`** (the model-wide default is `bf16`).
   At this bundle's `QWEN36_MAX_SEQ=262144` it is the single largest decode lever: SDPA re-reads the whole
   cache every step, so BFP8 is worth **−3.58 ms/token at 128K** (1.82× on sdpa-decode, i.e. 96.5% of the

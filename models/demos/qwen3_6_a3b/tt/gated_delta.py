@@ -56,6 +56,23 @@ _FUSED_PREFILL = os.environ.get("QWEN36_FUSED_PREFILL", "1") == "1"
 # coherence). QWEN36_DELTA_BF16_PREP=1 enables (perf experiments only).
 _PREP_DT = ttnn.bfloat16 if os.environ.get("QWEN36_DELTA_BF16_PREP") == "1" else ttnn.float32
 _CHUNK = 64  # chunk_size, matches reference torch_chunk_gated_delta_rule default
+# Ragged (right-padded) incremental blocks: process the PADDED width and MASK the pad rows out of the
+# recurrent state, instead of slicing the block down to `valid_len`.
+#
+# This is a SHAPE-SPACE fix, not a numerics one. Slicing makes every op downstream of it (this module
+# and the whole MoE) run at T = valid_len = prompt_len mod chunk -- a different value every turn -- so
+# each turn compiles ~90 new device programs. The program cache grows without bound and the device
+# HANGS past roughly 700-850 entries: measured at 40 layers with DRAM 10.6 GB free, L1 1% used and the
+# trace region 90% free, so it is not a memory limit. Masking keeps the width at the padded value, of
+# which there are only four (128/256/384/512), so the cache saturates. See IMPLEMENTATION_GUIDE.md.
+#
+# Correctness rests on the same identity the bucketed traced path already uses: beta=0 makes a row
+# contribute nothing to the state (kbeta = vbeta = 0) and g=0 (log space) makes it decay nothing, so a
+# masked row is a no-op in the recurrence. The conv is handled separately -- its carried state must
+# still come from the last REAL rows, see _conv_silu's `state_at`.
+# QWEN36_GDN_RAGGED_MASK=0 restores the slicing path (they are PCC-gated against each other in
+# tests/test_ragged_mask.py).
+_RAGGED_MASK = os.environ.get("QWEN36_GDN_RAGGED_MASK", "1") != "0"
 # Route the chunked PREFILL recurrence through tt-metal's native fused op
 # ``ttnn.transformer.chunk_gated_delta_rule`` (new in v0.77.0) instead of the in-tree chunk prep +
 # ttl/ttnn chunk-state loop. Measured on a single P150 at real GDN dims (32 v-heads, Dk=Dv=128):
@@ -449,9 +466,15 @@ class TtGatedDeltaNet(LightweightModule):
             self._conv_stack_cache[T] = c
         return c
 
-    def _conv_silu(self, mixed, conv_state=None, need_state=True):
+    def _conv_silu(self, mixed, conv_state=None, need_state=True, state_at=None, snap_at=None, snap_dst=None):
         """mixed: [T, conv_dim]. Causal depthwise conv (kernel K) + silu. Returns
         (out[T,conv_dim], new_conv_state[K-1,conv_dim]); new_conv_state is None when need_state=False.
+
+        `state_at` (ragged mask path): take the carried state from the rows ending at this position
+        instead of at the end of the block. A masked ragged block is `valid_len` real rows followed by
+        right-padding, and the conv window the NEXT block continues from is the last K-1 REAL rows --
+        the padding must not enter it. The slice is a fixed [K-1, conv_dim] shape at a varying offset,
+        so it costs no new op shapes.
 
         `need_state=False` is for the speculative-verify path, which DISCARDS it — `commit_verify`
         recomputes the conv tail from the accepted prefix instead. Skipping it is free money: that one
@@ -500,13 +523,33 @@ class TtGatedDeltaNet(LightweightModule):
                 xj = ttnn.slice(xpad, [j, 0], [j + T, self.conv_dim])
                 term = ttnn.multiply(xj, self.conv_taps[j])
                 acc = term if acc is None else ttnn.add(acc, term)
-        new_state = ttnn.slice(xpad, [T, 0], [T + self.conv_k - 1, self.conv_dim]) if need_state else None
+        # xpad is [conv_state (K-1) ; mixed (T)], so mixed row i is xpad row i + K - 1 and the K-1
+        # rows ending at real position `end` are xpad[end : end + K - 1]. end == T is the whole block.
+        end = T if state_at is None else int(state_at)
+        new_state = ttnn.slice(xpad, [end, 0], [end + self.conv_k - 1, self.conv_dim]) if need_state else None
         assert not (need_state and xpad is None)
+        if snap_at is not None and snap_dst is not None:
+            # In-block checkpoint: the same fixed [K-1, conv_dim] slice, taken at an INTERIOR row.
+            # Costs one extra sub-tile row slice per layer and introduces no new op shape.
+            ttnn.copy(
+                ttnn.slice(xpad, [int(snap_at), 0], [int(snap_at) + self.conv_k - 1, self.conv_dim]),
+                snap_dst,
+            )
         # Same T==1 gate as the concat above: at prefill T this is [T, conv_dim] (28 MB at T=1711),
         # and because ttnn defaults memory_config to the INPUT's config, an L1 result here silently
         # propagates to the q/k/v slices and everything downstream of them — pinning ~700 KB/core and
         # clashing with the fused-recurrence CBs (which occupy 1.07 MB of the 1.5 MB L1 on their cores).
         return ttnn.silu(acc, memory_config=(_MC if T == 1 else None)), new_state
+
+    def _valid_col(self, T: int, valid_len: int, dtype):
+        """[T, 1] column: 1 for the first ``valid_len`` rows, 0 for the right-padding.
+
+        Built per call. Its SHAPE depends only on T (one of a handful of padded widths), never on
+        ``valid_len``, so the varying value cannot introduce new op shapes -- which is the whole point
+        of the mask path."""
+        m = torch.zeros(T, 1)
+        m[:valid_len] = 1.0
+        return to_tt(m, self.mesh_device, dtype=dtype)
 
     def sync_conv_rows(self, cache):
         """Populate the decode add-chain's K-1 separate history-row buffers from the [K-1, conv_dim]
@@ -703,7 +746,7 @@ class TtGatedDeltaNet(LightweightModule):
         )
         return self._fused_op_consts
 
-    def _forward_prefill_fused_op(self, q, k, v, g, beta, init_state=None):
+    def _forward_prefill_fused_op(self, q, k, v, g, beta, init_state=None, snap_at=None, snap_dst=None):
         """Chunked delta-rule prefill via ttnn.transformer.chunk_gated_delta_rule. Same signature and
         return contract as _forward_prefill_chunked: q,k,v [T,Vh,D]; g,beta [T,Vh] (g = log decay) ->
         (core [1,Vh,T,Dv] bf16, S_final [Vh*Dk,Dv] bf16).
@@ -718,6 +761,25 @@ class TtGatedDeltaNet(LightweightModule):
           reason the existing path's padding is (beta=0 -> no state update, g=0 -> no decay)."""
         Vh, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
         T = q.shape[0]
+        if snap_at is not None and snap_dst is not None and 0 < int(snap_at) < T:
+            # IN-BLOCK CHECKPOINT. The recurrence is exactly splittable: this op takes an
+            # initial_state and returns the final one, so running [0,snap_at) then [snap_at,T) seeded
+            # with its result is identical to one pass -- MEASURED core PCC 1.000000 and final-state
+            # PCC 1.000000 (hangdbg/splitprobe.py). The point is that only the RECURRENCE splits:
+            # attention, MoE and the norms still run once over the whole block, so the caller gets a
+            # resumable checkpoint at an interior 128 boundary without paying a second block's MoE
+            # sweep (127 ms, see PREFILL.md 0.9).
+            j = int(snap_at)
+            sl = lambda t, a, b: ttnn.slice(t, [a, 0, 0], [b, t.shape[1], t.shape[2]])
+            sl2 = lambda t, a, b: ttnn.slice(t, [a, 0], [b, t.shape[1]])
+            o1, s_mid = self._forward_prefill_fused_op(
+                sl(q, 0, j), sl(k, 0, j), sl(v, 0, j), sl2(g, 0, j), sl2(beta, 0, j), init_state=init_state
+            )
+            ttnn.copy(ttnn.reshape(s_mid, [1, Vh, Dk, Dv]), snap_dst)
+            o2, s_end = self._forward_prefill_fused_op(
+                sl(q, j, T), sl(k, j, T), sl(v, j, T), sl2(g, j, T), sl2(beta, j, T), init_state=s_mid
+            )
+            return ttnn.concat([o1, o2], dim=2), s_end
         C = _FUSED_OP_CHUNK
         pad = (C - T % C) % C
         Tp = T + pad
@@ -770,7 +832,7 @@ class TtGatedDeltaNet(LightweightModule):
             S = ttnn.typecast(S, _STATE_DT)
         return core, S
 
-    def _forward_prefill_chunked(self, q, k, v, g, beta, pool=None, init_state=None):
+    def _forward_prefill_chunked(self, q, k, v, g, beta, pool=None, init_state=None, snap_at=None, snap_dst=None):
         """Chunked delta-rule prefill. q,k,v:[T,Vh,D]; g,beta:[T,Vh] (g=log decay). Returns
         (core [1,Vh,T,Dv], S_final [Vh*Dk,Dv]). Pads T to a multiple of chunk_size and carries the
         per-head recurrent state [Vh*Dk,Dv] (head-major) across chunks.
@@ -795,7 +857,12 @@ class TtGatedDeltaNet(LightweightModule):
         # at T=512), whereas the fused op is worth ~1.6x on the eager path. Eager+fused therefore
         # BEATS traced-unfused outright, so the traced prefill path is redundant when this is on.
         if _GDN_FUSED_OP and pool is None and min(self.head_k_dim, self.head_v_dim) >= _FUSED_OP_MIN_HEAD_DIM:
-            return self._forward_prefill_fused_op(q, k, v, g, beta, init_state=init_state)
+            return self._forward_prefill_fused_op(
+                q, k, v, g, beta, init_state=init_state, snap_at=snap_at, snap_dst=snap_dst
+            )
+        # In-block checkpoints are implemented on the fused path only; supports_inblock_snapshot says
+        # so, and the planner falls back to a separate snapshot block when it is False.
+        assert snap_at is None or snap_dst is None, "in-block snapshot requires the fused recurrence"
         C = _CHUNK
         Vh, Dk, Dv = self.num_v_heads, self.head_k_dim, self.head_v_dim
         T = q.shape[0]
@@ -1006,7 +1073,28 @@ class TtGatedDeltaNet(LightweightModule):
             "valid": valid,
         }
 
-    def forward(self, x, cache=None, pool=None, init_state=None, valid_len=None, decode=False, verify=False):
+    @property
+    def supports_inblock_snapshot(self):
+        """Whether forward(snap_at=...) can export the carried state at an interior position.
+
+        Only the fused recurrence can: it takes an initial_state and returns the final one, so it
+        splits exactly. The hand-written chunked loop would need its per-chunk carry surfaced, which
+        is not implemented -- QWEN36_GDN_FUSED_OP=0 therefore falls back to a separate snapshot
+        block."""
+        return bool(_GDN_FUSED_OP) and min(self.head_k_dim, self.head_v_dim) >= _FUSED_OP_MIN_HEAD_DIM
+
+    def forward(
+        self,
+        x,
+        cache=None,
+        pool=None,
+        init_state=None,
+        valid_len=None,
+        decode=False,
+        verify=False,
+        snap_at=None,
+        snap_dst=None,
+    ):
         """x: [1,1,T,hidden]. If cache (dict with conv_state/recurrent_state) given, continues from it.
 
         verify=True marks a speculative VERIFY of T=K tokens of ONE sequence (see _forward_verify_seq):
@@ -1028,7 +1116,11 @@ class TtGatedDeltaNet(LightweightModule):
         T_full = x.shape[2]
         hidden = x.shape[3]
         ragged = valid_len is not None and valid_len < T_full
-        if ragged:
+        # Mask the padding out of the state (default) or slice the block down to the real rows (the
+        # old path, QWEN36_GDN_RAGGED_MASK=0). Masking keeps every downstream op at the PADDED width,
+        # which is what bounds the program-cache growth -- see _RAGGED_MASK.
+        mask_ragged = ragged and _RAGGED_MASK
+        if ragged and not mask_ragged:
             x = ttnn.slice(x, [0, 0, 0, 0], [1, 1, valid_len, hidden])  # keep only the real tokens
         T = x.shape[2]
         x2 = ttnn.reshape(x, [T, hidden])
@@ -1073,7 +1165,14 @@ class TtGatedDeltaNet(LightweightModule):
             else:
                 conv_state = cache.get("conv_state") if cache else None
                 # verify discards new_conv_state (commit_verify rebuilds the tail from conv_in)
-                mixed, new_conv_state = self._conv_silu(mixed, conv_state, need_state=not verify)
+                mixed, new_conv_state = self._conv_silu(
+                    mixed,
+                    conv_state,
+                    need_state=not verify,
+                    state_at=valid_len if mask_ragged else None,
+                    snap_at=snap_at,
+                    snap_dst=(snap_dst or {}).get("conv_state"),
+                )
                 if verify:
                     pass  # leave conv_state alone; commit_verify() applies the accepted prefix
                 elif cache is not None:
@@ -1107,6 +1206,12 @@ class TtGatedDeltaNet(LightweightModule):
             beta = ttnn.sigmoid(ttnn.slice(ba, [0, 0], [T, V], memory_config=mc), memory_config=mc)  # [T, V]
             a = ttnn.slice(ba, [0, V], [T, 2 * V], memory_config=mc)  # [T, V]
             g = ttnn.multiply(self.neg_expA, ttnn.softplus(ttnn.add(a, self.dt_bias)), memory_config=mc)  # [T, V]
+            if mask_ragged:
+                # beta=0 -> the row contributes nothing (kbeta = vbeta = 0); g=0 (log space) -> it
+                # decays nothing. Same identity the bucketed traced path applies via pool["valid"].
+                vm = self._valid_col(T, valid_len, beta.dtype)
+                beta = ttnn.multiply(beta, vm, memory_config=mc)
+                g = ttnn.multiply(g, vm, memory_config=mc)
             # exp(g) is consumed ONLY by _recurrent_scan; both default recurrence paths (the native
             # fused op and the in-tree chunked prep) take the LOG-space g. Computing it here was one
             # dead [T, V] elementwise op per linear layer per forward (30 per prefill call). Built
@@ -1128,7 +1233,17 @@ class TtGatedDeltaNet(LightweightModule):
         with prof.phase(self.mesh_device, "delta.recurrence") if T > 1 else _nullctx(), sp.region("delta.recurrence"):
             if _FUSED_PREFILL and T > 1:
                 # --- fused chunked prefill (parallel over the sequence) ---
-                core, S_final = self._forward_prefill_chunked(q, k, v, g, beta, pool=pool, init_state=init_state)
+                core, S_final = self._forward_prefill_chunked(
+                    q,
+                    k,
+                    v,
+                    g,
+                    beta,
+                    pool=pool,
+                    init_state=init_state,
+                    snap_at=snap_at,
+                    snap_dst=(snap_dst or {}).get("recurrent_state"),
+                )
                 if cache is not None:
                     state_buf = cache.get("recurrent_state")
                     S_final = ttnn.reshape(S_final, [1, Vh, Dk, Dv])  # decode reads state as [1,Vh,Dk,Dv]
@@ -1148,7 +1263,8 @@ class TtGatedDeltaNet(LightweightModule):
             core = ttnn.reshape(core, [T, self.value_dim])
             y = ttnn.linear(core, self.w_out, memory_config=mc)
             y = ttnn.reshape(y, [1, 1, T, hidden])
-        if ragged:  # restore the padded width (pad rows are unused downstream; head reads the real last)
+        if ragged and not mask_ragged:  # slicing path: restore the padded width (pad rows unused
+            # downstream; the head reads the real last token). The mask path never narrowed y.
             y = ttnn.pad(y, [(0, 0), (0, 0), (0, T_full - T), (0, 0)], value=0.0)
         return y
 

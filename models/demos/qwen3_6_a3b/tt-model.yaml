@@ -1,0 +1,203 @@
+# Container (v5.1) package for Qwen3.6-35B-A3B on Blackhole.
+#
+# `tt-model package --container models/demos/qwen3_6_a3b/tt-model.yaml` builds ONE OCI image with
+# Ubuntu + stock vLLM + the Tenstorrent vLLM plugin + this model's code baked in, so a consumer needs
+# only Docker and a P150a. Weights stay a pointer.
+#
+# This REPLACES packaging/stage_vllm_bundle.py + qwen36_v4_manifest.json, which targeted
+# `tt-kernel push --backend vllm` -- an interface that no longer exists (`push` is container-only now,
+# and `tt-kernel` is a deprecated alias for `tt-model`).
+schema: "5.1"
+
+repo: Adartras/qwen3.6-a3b-blackhole
+name: qwen3.6-a3b-blackhole
+
+# A POINTER, pinned: the consumer gets the weights this was validated against, not whatever the
+# default branch moves to.
+weights:
+  repo: Qwen/Qwen3.6-35B-A3B
+  revision: 995ad96eacd98c81ed38be0c5b274b04031597b0
+
+# Stock vLLM + the standalone plugin, NOT the tenstorrent/vllm fork. Upstream's platform-plugin API
+# means a hardware backend no longer needs a fork, and this is the only kind that has run on
+# hardware. Verified that stock vLLM really is enough: every symbol the adapter imports from
+# `vllm.model_executor.models.qwen3_5` (Qwen3_5MoeProcessingInfo, Qwen3VLDummyInputsBuilder,
+# Qwen3VLMultiModalProcessor) is present in upstream v0.25.1 through v0.28.0.
+kind: vllm-plugin
+arch: blackhole
+
+image:
+  registry: hf
+
+source:
+  tt_metal: /home/carl/projects/tt-metal-v077
+  # EXACTLY what ships. Narrow on purpose: the model directory as a whole is 83 MB, almost all of it
+  # `generated/` (49 MB of watcher/inspector/profiler output) and `demo/generated/` (30 MB) -- run
+  # artifacts, not source. The old stage script globbed those in.
+  #
+  # The import closure is small and was measured, not guessed: 23 modules under this package plus
+  # exactly two upstream imports, `models.common.lightweightmodule` and
+  # `models.tt_transformers.tt.generator`. The latter pulls in models.common.{llama_models,
+  # model_capabilities, sampling, warmup} and models.tt_transformers.tt.common, so both trees ship
+  # whole rather than file-by-file.
+  code:
+    - models/common
+    - models/tt_transformers
+    - models/demos/qwen3_6_a3b/__init__.py
+    - models/demos/qwen3_6_a3b/tt
+    - models/demos/qwen3_6_a3b/reference
+    # The whole packaging/ dir, because extra_models_dir must be its PARENT (below).
+    - models/demos/qwen3_6_a3b/packaging
+  # 24.04, not 22.04. tt-lang (below) publishes ONLY a manylinux_2_38 wheel, i.e. glibc >= 2.38,
+  # and 22.04 is glibc 2.35 -- the wheel is simply not installable there. `ubuntu` drives both the
+  # builder base (ghcr.io/.../tt-metalium/ubuntu-{ubuntu}-dev-amd64) and the runtime stage, and
+  # 24.04 is glibc 2.39. Costs nothing here: the cross-Ubuntu argument for building on 22.04 is
+  # about v5 wheel portability to the consumer's host, and a container has no consumer host to be
+  # portable to -- the image is the wall.
+  ubuntu: "24.04"
+  python: "3.12"
+
+runtime:
+  # 0.26.0, NOT the latest. The image asserts at build time that the torch vLLM resolves is the
+  # one tt-metal pins -- ttnn's extension modules are built against it, and a mismatch breaks at
+  # import or at device open. tt-metal pins torch 2.11.0
+  # (tt_metal/python_env/requirements-dev.txt), and vLLM's own pin is:
+  #     0.28.0 / 0.27.0 -> torch 2.13.0   (mismatch: build fails the check)
+  #     0.26.0 / 0.25.1 -> torch 2.11.0   (agrees)
+  # 0.26.0 is the newest that agrees, and it still carries every qwen3_5 symbol the adapter
+  # imports. Re-check this pairing before bumping either side.
+  #
+  # FALLBACK, if the plugin turns out not to work against 0.26.0: use 0.24.0. The plugin carries no
+  # vLLM version guard, and its last commit is 2026-06-03 -- BEFORE every release above (0.24.0
+  # shipped 2026-06-30), so it was written against upstream main circa 0.24.0. That is also the
+  # version tt-model's own container example pins. 0.24.0 satisfies all three constraints at once:
+  # torch 2.11.0, all four qwen3_5 symbols present, and closest to the plugin's development point.
+  # Switching is cheap -- the tt-metal build layer is cached, so only the engine layers rebuild.
+  vllm: {version: "0.26.0"}
+  # The STANDALONE plugin, not the copy vendored in the tenstorrent/vllm fork.
+  #
+  # MEASURED: the fork's plugins/vllm-tt-plugin (last touched 2026-06-03) does NOT implement the
+  # EXTRA_MODELS_DIR contract at all -- its register_tt_models() is a hardcoded table of
+  # TT<Arch> -> adapter paths. Booting the image against it failed with
+  #   "No TT model architecture is registered for model: 'Qwen/Qwen3.6-35B-A3B'.
+  #    Available TT architectures: ['TTDeepseekV3ForCausalLM', ... 'TTQwen3VLForConditionalGeneration']"
+  # i.e. the builtins only; our bundle was never looked at. Standalone main DOES implement it
+  # (platform.py::_iter_extra_model_bundles / _register_models_from_extra_dir), and its docstring is
+  # the contract this manifest relies on: "Any distribution tool (e.g. tt-kernel) can drop a bundle
+  # folder here and have it registered with no source edit to this plugin."
+  #
+  # `package` resolves this floating ref to a commit and records it in the wire manifest, so the
+  # published package pins a sha even though the author wrote `main`.
+  plugin: {repo: https://github.com/tenstorrent/vllm-tt-plugin, ref: main}
+  # The plugin scans this directory's CHILDREN for vllm_metadata.json, i.e. it looks for
+  # <extra_models_dir>/<child>/vllm_metadata.json. So this must be the PARENT of vllm_bundle/, not
+  # vllm_bundle/ itself -- pointing it at vllm_bundle/ still passes validate_semantics but finds
+  # ZERO bundles, and only the image's own verify step would catch it, at the end of a ~2.5 h build.
+  extra_models_dir: models/demos/qwen3_6_a3b/packaging
+  # tt-lang, which provides the `ttl` module. NOT optional and NOT discoverable from the model's
+  # `models.*` import graph, which is why the old stage script's closure analysis missed it and the
+  # first image build failed its own verify with `ModuleNotFoundError: No module named 'ttl'`:
+  #   tt/ttl_delta.py does a bare `import ttl`, and tt/gated_delta.py imports it unconditionally
+  #   for decode_step_tt (the DEFAULT decode kernel), chunk_state_tt, decode_step_batch_tt and
+  #   decode_step_chain_tt.
+  # Shipped as a local wheel so the image does not depend on PyPI resolution at build time; pinned
+  # to the version the host env actually runs with this metal tree.
+  # NOTE: this is a REPACKAGED tt-lang wheel, with one line removed from its METADATA:
+  #     Requires-Dist: ttnn==0.74.0; sys_platform == "linux" and (...)
+  # tt-lang hard-pins ttnn 0.74.0, and runtime.wheels is installed LAST ("so they win over anything
+  # resolved above"), so the stock wheel REPLACED the editable ttnn 0.77.1 that
+  # `uv pip install -e /opt/tt-metal` had just put in place. The build log shows both:
+  # `ttnn==0.77.1.` then `+ ttnn==0.74.0`. A 0.74 ttnn against a 0.77 metal tree and firmware
+  # bundle 19.14.0 fails device init on every worker core:
+  #     Device 0: Timeout (10000 ms) waiting for physical cores to finish: 13-6, 11-7, ... (all ~120)
+  #     Device 0 init: failed to initialize FW! Try resetting the board.
+  # (Not a wedged board: the host opened the same card fine immediately before and after, and
+  # tt-smi -ls works from inside the container.)
+  #
+  # Dropping the pin is safe HERE because ttnn is supplied by the metal tree, which is exactly the
+  # combination this box runs and every measurement in PREFILL.md was taken on: tt-lang 1.1.6
+  # against ttnn 0.77.1.dev. The pin exists for standalone installs that have no metal tree.
+  #
+  # Regenerate with:  python -m wheel unpack <stock.whl>
+  #                   # delete the 'Requires-Dist: ttnn==' line from */METADATA
+  #                   python -m wheel pack tt_lang-1.1.6 -d wheels-patched
+  # The proper fixes are upstream: tt-lang relaxing the pin, or tt-model supporting --no-deps for
+  # runtime.wheels.
+  wheels:
+    - /home/carl/projects/hangdbg/wheels-patched/tt_lang-1.1.6-cp312-cp312-manylinux_2_38_x86_64.whl
+
+serve:
+  port: 8000
+  hardware: p150
+  mesh_device: P150
+  # One sequence: this is a single-card 35B MoE and the adapter's continuous batching is not the
+  # shipped configuration. block_size 64 is required -- the TT backend rejects vLLM's default.
+  max_num_seqs: 1
+  block_size: 64
+  max_model_len: 262144
+  capabilities:
+    tool_parser: qwen3_coder
+    reasoning_parser: qwen3
+  additional_config:
+    tt:
+      sample_on_device_mode: decode_only
+      # 200 MiB. The decode trace is ~19 MiB; the headroom is what the prefill buckets and the
+      # re-captures need, and it is the value every measurement in PREFILL.md was taken at.
+      trace_region_size: 209715200
+  env:
+    # MESH_DEVICE is deliberately absent -- tt-model derives it from mesh_device above.
+    HF_MODEL: Qwen/Qwen3.6-35B-A3B
+    QWEN36_EXPERT_DTYPE: bf4
+    QWEN36_KV_DTYPE: bf8
+    QWEN36_MAX_SEQ: "262144"
+    QWEN36_CB_SLOT_MARGIN: "0"
+    QWEN36_GDN_FUSED_OP: "1"
+    VLLM_RPC_TIMEOUT: "100000"
+    # Nothing here configures prefix reuse, the padding ladder, the shape pre-warm or the
+    # program-cache valve: those are all code defaults now (see tt/model.py). An env var that
+    # restates a default is one more thing that can drift out of sync with it.
+  args:
+    - --trust-remote-code
+    - --override-generation-config
+    - '{"temperature": 0.6, "top_p": 0.95, "top_k": 20}'
+
+# Run INSIDE the finished image, on top of the launcher's own checks. These two are the real gate:
+# they prove the narrow source.code allowlist above is complete, because the image's only `models`
+# package IS that allowlist (the Dockerfile excludes models/ from the metal copy).
+#
+# Deliberately NOT verifying the adapter here: tt-model already does it properly. Because
+# runtime.extra_models_dir is set, its own verify.sh emits RESOLVE_EXTRA_MODELS, which does what the
+# plugin does -- finds each bundle, appends its folder to sys.path, and resolves the main_class
+# string. A naive `import generator_vllm` line here would FAIL instead, since each verify entry runs
+# as its own `python -c` with only PYTHONPATH=/opt/tt-metal, and extra_models_dir is not on it.
+verify:
+  - "import models.demos.qwen3_6_a3b.tt.model as m; assert m.TtModel"
+  - "import models.tt_transformers.tt.generator as g; assert g.Generator"
+
+card:
+  description: >
+    Qwen3.6-35B-A3B (hybrid Gated-DeltaNet + full attention, 256-expert MoE, 8 active) served on a
+    single Tenstorrent Blackhole P150a through vLLM. Multi-turn prefix reuse keeps time-to-first-token
+    roughly flat as a conversation grows, instead of re-prefilling the whole transcript each turn.
+  quickstart: |
+    ### Serve
+
+    ```bash
+    tt-model serve Adartras/qwen3.6-a3b-blackhole
+    ```
+
+    Then point any OpenAI-compatible client at the port it prints (`tt-model serve` picks one from
+    20000 upward; a bare `docker run` binds 8000).
+
+    ### What to expect on one P150a
+
+    - decode ~37 tok/s, prefill ~600-880 tok/s
+    - multi-turn TTFT ~0.3 s steady on a growing chat, 96-99% of each prompt reused
+    - up to 4 conversations stay warm at once, so a client that interleaves prompt streams
+      (a chat UI's auto-title requests alongside your conversation) keeps its prefix. Slots age
+      out least-recently-used; `QWEN36_CONV_SLOTS=1` restores single-conversation behaviour
+    - 256K context ceiling (`QWEN36_MAX_SEQ`), bf4 experts, bf8 KV. KV is paged, one pool shared
+      by the conversation slots, so this costs the same memory as a single flat cache
+
+    Reasoning ("thinking") blocks are parsed out via `--reasoning-parser qwen3`, and tool calls via
+    `--tool-call-parser qwen3_coder`.

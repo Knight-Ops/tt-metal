@@ -69,6 +69,9 @@ _SE_DRAM_SHARD = os.environ.get("QWEN36_MOE_SE_DRAM_SHARD", "0") == "1"
 # Max tokens per dense-expert matmul chunk. The tuned batched-matmul program config holds each
 # expert's full [tc, N] output in L1 (per_core_M = tc/32); tc=256 (per_core_M=8) is proven to fit,
 # tc~384 overflows. Prefill chunks T into <=256 blocks so any sequence length stays L1-bounded.
+# Diagnostic: see model.py's _LAYER_SYNC (read here too; model.py imports this module).
+_LAYER_SYNC = os.environ.get("QWEN36_PREFILL_LAYER_SYNC") == "1"
+
 _DENSE_TMAX = 256
 
 # Dtype of the dense-prefill expert matmul INPUTS: the broadcast activation `xe` and the down
@@ -761,6 +764,13 @@ class TtMoE(LightweightModule):
             # The fast (BFP8, block 8) pair is validated at the full chunk size only; a short tail
             # chunk is a different L1 shape, and fit is not monotonic in tc, so it uses the safe pair.
             cdt, cbw = (dt, bw) if tc == _DENSE_TMAX else (ttnn.bfloat16, 1)
+
+            def _msync(what):
+                if _LAYER_SYNC:
+                    ttnn.synchronize_device(self.mesh_device)
+                    logger.info(f"[inc]     moe T={T} tc={tc} cdt={cdt} cbw={cbw} {what} ok")
+
+            _msync("chunk start")
             with prof.phase(self.mesh_device, "moe.repeat"), sp.region("moe.repeat"):
                 xs = ttnn.slice(x2, [t0, 0], [t1, hidden])
                 if xs.dtype != cdt:  # cast the [tc, hidden] slice, i.e. BEFORE the E-fold broadcast
@@ -774,6 +784,7 @@ class TtMoE(LightweightModule):
                     compute_kernel_config=self.compute_kernel_config,
                 )  # [E, tc, 2*inter]; dtype INHERITED from in0 (BFLOAT8_B by default, 68 MB at tc=256)
                 _drop(xe)  # the E-fold broadcast (136 MB at tc=256), dead the moment it is consumed
+                _msync("gate_up_mm")
             with prof.phase(self.mesh_device, "moe.swiglu"), sp.region("moe.swiglu"):
                 gate = ttnn.slice(hgu, [0, 0, 0], [E, tc, I])
                 up = ttnn.slice(hgu, [0, 0, I], [E, tc, 2 * I])
@@ -789,6 +800,7 @@ class TtMoE(LightweightModule):
                 # (At the default both are already BFLOAT8_B, so `dtype=cdt` folds rather than narrows.)
                 _drop(h)
                 h = hw
+                _msync("swiglu")
             with prof.phase(self.mesh_device, "moe.down_mm"), sp.region("moe.down_mm"):
                 ye = ttnn.matmul(
                     h,
@@ -797,6 +809,7 @@ class TtMoE(LightweightModule):
                     compute_kernel_config=self.compute_kernel_config,
                 )  # [E, tc, hidden] — `dtype` is INHERITED from in0, so this is `cdt` too
                 _drop(h)
+                _msync("down_mm")
             with prof.phase(self.mesh_device, "moe.reduce"), sp.region("moe.reduce"):
                 # Land every chunk in BFLOAT16: `ye` (and so this sum) inherits in0's dtype, which
                 # differs between a full chunk and a short tail, and ttnn.concat rejects mixed dtypes.
@@ -805,4 +818,5 @@ class TtMoE(LightweightModule):
                 y = ttnn.sum(ye, dim=0)  # [tc, hidden]
                 _drop(ye)  # 136 MB at tc=256; only the [tc, hidden] reduction survives the chunk
                 outs.append(y if y.dtype == ttnn.bfloat16 else ttnn.typecast(y, ttnn.bfloat16))
+                _msync("reduce")
         return outs[0] if len(outs) == 1 else ttnn.concat(outs, dim=0)  # [T, hidden]

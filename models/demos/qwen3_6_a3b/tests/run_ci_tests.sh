@@ -10,6 +10,11 @@
 # pcc_thresholds.json. test_cache_topology reads only the checkpoint's config.json (no weights) and
 # skips cleanly if it is absent.
 #
+# The three *_verify tests are also checkpoint-free and belong here: the speculative verify path is a
+# SECOND implementation of every sub-block (attention batches its K rows through one paged sdpa_decode,
+# the linear layers run a chained recurrence, the MoE takes K token rows), so nothing else in this list
+# would catch a regression in it.
+#
 # Wire this into tt-metal CI by adding one entry that invokes this script to the Blackhole
 # single-card unit-test matrix (tests/pipeline_reorg/*.yaml, consumed by
 # .github/scripts/utils/prepare_test_matrix.py) — the same mechanism TT uses for
@@ -24,9 +29,12 @@ exec "$PYTHON" -m pytest -p no:cacheprovider -q \
   "$TESTDIR/test_norms.py" \
   "$TESTDIR/test_attention.py" \
   "$TESTDIR/test_attention_decode.py" \
+  "$TESTDIR/test_attention_verify.py" \
   "$TESTDIR/test_gated_delta.py" \
   "$TESTDIR/test_gated_delta_decode.py" \
+  "$TESTDIR/test_gated_delta_verify.py" \
   "$TESTDIR/test_moe.py" \
   "$TESTDIR/test_moe_sparse.py" \
+  "$TESTDIR/test_moe_verify.py" \
   "$TESTDIR/test_tool_parsing.py" \
   "$@"

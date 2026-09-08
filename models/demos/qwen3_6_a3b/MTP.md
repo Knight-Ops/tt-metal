@@ -178,6 +178,90 @@ not as dominant at these shapes as moe.py's comment implies. Worth a one-line re
   prerequisite** — the opposite of what the plan assumed ("without it every gamma is break-even").
   The plan's premise was wrong because it implicitly attributed the whole GDN layer to the kernel.
 
+## The verify attention was K SDPA launches, not one — SHIPPED (`QWEN36_VERIFY_BATCH_SDPA`, 2026-08-23)
+
+A3 below concluded the verify-attention primitive was "confirmed trivial" because it measured the SDPA
+OP's growth with K (0.0224 -> 0.0336 ms for K=1..8, i.e. 0.0016 ms/token) and folded that into the cost
+model as `attn = 0.295 + 0.0016(K-1)`. That measurement was right and the conclusion drawn from it was
+wrong: the shipped `forward_verify` did not grow ONE SDPA to K rows, it launched **K separate SDPA
+calls**, each re-reading the whole cache prefix, plus a q `slice` + `transpose` per row and a K-row
+`concat` at the end. The real per-token attention cost was ~40 us per layer, not 1.6 us.
+
+`sdpa_decode` genuinely cannot batch this (its output batch comes from the KV cache's batch dim, so a
+batch-1 cache returns one row, and `share_cache=True` has no in-tree users). The PAGED op can: it takes
+the batch from `page_table.shape[0]` (`sdpa_decode_device_operation.cpp:196`), so **K identical page-table
+rows present the K verify positions as K "decode users" that all read the same physical pages**, each
+masked by its own `cur_pos`. And the flat `[1, n_kv, max_seq, hd]` cache is already a paged cache with one
+block of `max_seq` tokens -- so the table is `zeros([K,1])` and this needs no paging and no extra memory.
+(Muse Glimmer's packed verifier is built on the same reading; see `tt/attention.py::_verify_page_table`.)
+
+PAIRED A/B, whole verify trace, real 40-layer model (`prof_mtp.py --sweep`, ms per traced replay):
+
+| K | loop @pos~30 | batched | Δ | loop @pos~2048 | batched | Δ |
+|--:|--:|--:|--:|--:|--:|--:|
+| 1 | 27.11 | 27.11 | +0.00 | 27.40 | 27.40 | −0.00 |
+| 3 | 41.97 | 41.18 | **−0.79 (1.9%)** | 42.83 | 41.66 | **−1.17 (2.7%)** |
+| 4 | 45.60 | 44.48 | −1.12 (2.5%) | 46.73 | 45.04 | −1.69 (3.6%) |
+| 8 | 69.22 | 66.50 | −2.72 (3.9%) | 71.49 | 67.50 | −3.99 (5.6%) |
+| 16 | 125.51 | 119.45 | −6.06 (4.8%) | 130.05 | 121.36 | −8.69 (6.7%) |
+
+    fit  pos~30    loop 20.55 + 6.560*K  ->  batched 20.95 + 6.156*K    marginal -6.2%
+         pos~2048  loop 20.55 + 6.843*K  ->  batched 21.13 + 6.264*K    marginal -8.5%
+
+**Read the fit, not the table.** The intercept is unchanged and the slope drops, so this removes a
+PER-SPECULATIVE-TOKEN cost — it compounds with K and with context, which is exactly the axis a block
+drafter would grow (at the shipping gamma=2 it is only ~2-3%). It also closes part of the "marginal is
+1.40x/1.46x the model" gap `prof_mtp` prints: now 1.31x / 1.34x.
+
+**The write does NOT batch, and this is measured, not assumed.** `paged_update_cache` accepts the same
+K-user shape and is much faster (K=16 @pos=1024: 252.7 -> 136.9 us per layer) but CORRUPTS the cache: the
+program factory dispatches one user per core and K consecutive positions share a 32-row tile, so K cores
+read-modify-write the same tile. Max |written − intended| on the new rows is **0.88–1.05 against a ~0.25
+value scale**, while the identical batched write with the rows spread **32 apart — one tile each — is
+bit-exact**. So the 2K looped writes stay. Muse Glimmer hits the same wall and pays for it with a
+hand-written NOC kernel that serializes each core's row writes; that kernel is the remaining ~1.2
+ms/verify at K=16 and is not part of this change.
+
+Gates: `tests/test_attention_verify.py::test_attention_verify_batched_matches_loop` — batched vs the row
+loop is **PCC 1.0 with bit-identical K and V caches** (the loop is the reference, and
+`QWEN36_VERIFY_BATCH_SDPA=0` restores it). Per-op numbers: `tests/probe_packed_verify.py`.
+
+### Follow-on: the verify SDPA's core grid — measured, and NOT shipped (`QWEN36_VERIFY_SDPA_WIDE`, off)
+
+Having batched the SDPA, the natural next question was whether its program config — inherited from the
+one-row decode path — still fits a K-row shape. Swept `k_chunk_size` x grid x `max_cores_per_head_batch`
+(`probe_packed_verify.py --pcsweep`). Three findings, in descending usefulness:
+
+1. **`max_cores_per_head_batch` does nothing here** (0.99-1.03x at every shape). Muse Glimmer switches
+   this knob on context length; at these dims it is inert. Worth knowing before copying their config.
+2. **`k_chunk_size=128` is already right.** 256 is neutral-to-worse and 64 is much worse at long context
+   (1.27x at 32K bf8, **1.38x at 128K bf8**), which independently justifies attention.py's existing
+   comment. Do not touch it.
+3. **The grid was never examined.** `sdpa_decode_pc` hardcodes `CoreCoord(8,8)` — 64 of this card's 110
+   usable Tensix. Widening it is worth 0.89-0.95x of the SDPA op once there is enough work to fill it,
+   but it LOSES below a crossover (1.07x worse at K=3/pos=2048). `K*cur_pos >= ~12288` predicts every
+   measured point, K=1 decode rows included.
+
+**Why it is off anyway.** The SDPA is a small slice of the verify, so 0.89x of it is not 0.89x of
+anything that matters. Paired 40-layer A/B, 8192-token prompt:
+
+| K | wide=0 | wide=1 | delta | predicted from per-op |
+|--:|--:|--:|--:|--:|
+| 3 | 42.709 | 42.617 | **-0.092 ms (-0.22%)** | -0.085 |
+| 16 | 126.807 | 126.041 | **-0.766 ms (-0.60%)** | -0.74 |
+
+The per-op model predicted the real result to within 5% — the effect is simply small (extrapolating to
+~1.2%/~2.4% at 32K). At 0.22% for the shipping gamma=2 it does not earn its plumbing (a host-side
+`pos_hint` threaded model -> decoder -> attention, because a program config is baked at CAPTURE time and
+cannot read the device positions tensor), and there is no 40-layer numerics gate for it. Same call
+FUTURE_OPTIMIZATIONS makes for `lm_head` in the wide-1D set. Kept, gated, tested
+(`test_attention_verify_wide_grid_matches_loop`), default off.
+
+**Also measured, also not shipped: the same grid on plain `forward_decode`.** 0.94-0.96x of the SDPA op
+at 32K-128K but 1.03-1.05x WORSE at 1024, i.e. ~1.2% of the decode step at 128K bf8 and negative at
+typical lengths. That one additionally perturbs plain-decode numerics, so it needs an MMLU baseline
+first. Numbers are in the `_VERIFY_SDPA_WIDE` comment so this does not have to be rediscovered.
+
 ## A3 — verify-attention via share_cache: PASS
 
     K   sdpa ms   vs K=1

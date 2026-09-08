@@ -30,6 +30,235 @@ from models.demos.qwen3_6_a3b.tt.paged_kv import PagedKV
 from models.demos.qwen3_6_a3b.tt.rms_norm import TtRMSNorm
 
 
+def common_prefix_len(a, b) -> int:
+    """Length of the longest common prefix of two token-id sequences."""
+    n = min(len(a), len(b))
+    i = 0
+    while i < n and a[i] == b[i]:
+        i += 1
+    return i
+
+
+def pick_checkpoint(positions, prefix_len: int, min_reuse: int = 0) -> int:
+    """Deepest checkpoint position that the new prompt still agrees with, or 0 for "prefill fresh".
+
+    ``positions`` are context lengths whose gated-delta state we hold (see TtModel.snapshot_gdn_state);
+    ``prefix_len`` is how far the new prompt matches the one the caches were built from. A checkpoint is
+    usable iff it lies at or before that divergence point, and worth using iff it saves at least
+    ``min_reuse`` positions."""
+    best = max((p for p in positions if p <= prefix_len), default=0)
+    return best if best >= min_reuse else 0
+
+
+class ConversationSlots:
+    """Which parked conversation an incoming prompt belongs to, and which one to evict.
+
+    Slot identity is the LONGEST COMMON PREFIX between the prompt and each slot's remembered
+    history. That is not a heuristic stand-in for a session id, it is the only thing that is
+    actually load-bearing: reuse is correct exactly as far as the token prefixes agree, so a slot
+    whose history shares 6272 tokens with this prompt IS this conversation for reuse purposes, and
+    one that shares 3 is not, whatever the client thinks. It also handles the cases a session id
+    would get wrong -- a re-rendered transcript, a regenerated turn, a branch of an earlier message
+    all land on the right slot at the right depth.
+
+    Eviction is least-recently-used. A slot that is claimed but yields no reuse is still claimed:
+    that is the point, since its FIRST turn cannot reuse anything and its second is where the win
+    is. `min_lcp` keeps unrelated short prompts from stealing a long conversation's slot on the
+    strength of a shared system prompt -- below it the prompt is treated as a new conversation.
+    """
+
+    def __init__(self, n, min_lcp):
+        self.n = n
+        self.min_lcp = min_lcp
+        self.hist = [None] * n  # remembered prompt per slot (list[int]); None = free
+        self.used = [0] * n  # LRU stamp
+        self.streak = [0] * n  # consecutive reuses, for QWEN36_PREFIX_REUSE_MAX_TURNS
+        self.clock = 0
+
+    def match(self, ids):
+        """(slot, lcp, evicted) for `ids`. `evicted` is the slot whose conversation was discarded."""
+        self.clock += 1
+        best, best_lcp = None, 0
+        for i, h in enumerate(self.hist):
+            if not h:
+                continue
+            lcp = common_prefix_len(h, ids)
+            if lcp > best_lcp:
+                best, best_lcp = i, lcp
+        if best is not None and best_lcp >= self.min_lcp:
+            self.used[best] = self.clock
+            return best, best_lcp, None
+        free = next((i for i, h in enumerate(self.hist) if not h), None)
+        if free is not None:
+            self.used[free] = self.clock
+            return free, 0, None
+        victim = min(range(self.n), key=lambda i: self.used[i])
+        self.used[victim] = self.clock
+        return victim, 0, victim
+
+    def commit(self, slot, ids, reused):
+        self.hist[slot] = ids
+        self.streak[slot] = self.streak[slot] + 1 if reused else 0
+
+    def forget(self, slot):
+        self.hist[slot] = None
+        self.streak[slot] = 0
+
+    def lru(self, exclude=()):
+        """Least-recently-used OCCUPIED slot, or None. For freeing KV blocks before a prefill that
+        would otherwise exhaust the pool -- `exclude` is the conversation about to run."""
+        live = [i for i, h in enumerate(self.hist) if h and i not in exclude]
+        return min(live, key=lambda i: self.used[i]) if live else None
+
+    def describe(self):
+        return " ".join(f"{i}:{len(h) if h else '-'}" for i, h in enumerate(self.hist))
+
+
+# Chunked-SDPA q_chunk_size for the ragged remainder. 128 is what the shipped ragged path uses and
+# the only value regression-tested at an offset the block width does not divide (test_ragged_prefill:
+# P=512, padded width 384).
+_RAGGED_Q_CHUNK = 128
+
+# The set of padded widths a prefill block may run at. EVERY distinct width costs ~90-110 device
+# programs, one time, and those stay live for the process -- so this ladder IS the model's steady-state
+# program working set, and it is the thing to keep small.
+#
+# This was {128, 512} for a while, on the reasoning that four widths take ~384 programs of a ~550
+# working set "and the device starts hanging around there". That hang was NOT program pressure -- it
+# was the per-width-constant corruption fixed by prewarm_prefill_shapes (section 5 of
+# IMPLEMENTATION_GUIDE.md), and a synthetic loop has since reached 801 cached programs with a
+# replaying trace and 21.5 GB of ballast without complaint. So the ladder is back to every
+# 128-multiple, because the padding it saves is now the dominant prefill cost:
+#
+#   a reuse turn re-ingests ~130-260 tokens. At {128,512} that pads to 512 and costs ~614 ms; at
+#   {128,256,384,512} it pads to 256 and costs ~370 ms (block cost = 127 ms + 0.95 ms/token,
+#   PREFILL.md 0.9). MEASURED end to end, 40 layers, 10-turn chat: 0.34 s per reuse turn against
+#   0.56 s, and the worst turn 0.62 s against 0.88 s.
+#
+# It still pays to keep this SHORT -- every width is ~90-110 one-time programs, and they are all
+# built up front by prewarm_prefill_shapes -- so add a width only for a length range that actually
+# recurs. QWEN36_PREFILL_WIDTHS overrides; "128,512" restores the narrow ladder.
+_PREFILL_WIDTHS = sorted(int(x) for x in os.environ.get("QWEN36_PREFILL_WIDTHS", "128,256,384,512").split(","))
+
+
+def pad_width(m: int, widths=None, limit: int | None = None) -> int:
+    """Smallest allowed padded width >= m (rounding up to a multiple of the largest for long blocks).
+
+    ``limit`` caps the result -- the room left in the KV cache. Padding writes real KV rows, so a block
+    near the end of the context cannot be widened past ``max_seq``; there the ladder is abandoned for
+    the minimal 128-multiple. That costs a couple of extra shapes, but only for prompts within one
+    width of the context limit, which is rare and bounded.
+
+    Pure, so the ladder's effect on the shape space is testable without a device."""
+    widths = _PREFILL_WIDTHS if widths is None else sorted(widths)
+    big = widths[-1]
+    if m % big == 0 and (limit is None or m <= limit):
+        return m  # already a whole number of full-width blocks; nothing to pad
+    for w in widths:
+        if m <= w and (limit is None or w <= limit):
+            return w
+    minimal = ((m + _RAGGED_Q_CHUNK - 1) // _RAGGED_Q_CHUNK) * _RAGGED_Q_CHUNK
+    return minimal  # may still exceed `limit`; the caller's own bounds check reports that properly
+
+
+# Debug: synchronize the device and log after every layer of an incremental prefill (and inside the
+# head), so a device HANG localizes to one op instead of surfacing at the next readback -- which is
+# wherever the queue happens to drain, and told us nothing while chasing the prefix-reuse hang.
+# Costs a full pipeline drain per layer, so it is strictly a diagnostic. QWEN36_PREFILL_LAYER_SYNC=1.
+_LAYER_SYNC = os.environ.get("QWEN36_PREFILL_LAYER_SYNC") == "1"
+
+
+def plan_prefill_blocks(
+    T: int,
+    start: int = 0,
+    chunk: int = 512,
+    single_shot_max: int = 2048,
+    snap: int = _RAGGED_Q_CHUNK,
+    inblock: bool = False,
+):
+    """Block schedule for prefill_from: ``(offset, width, kind, q_chunk)`` ingesting positions
+    [start, T) in order, where kind is "single" (single-shot, allocates the caches), "block" (a full
+    incremental block) or "ragged" (the right-padded remainder).
+
+    Every offset is a multiple of ``chunk`` and every full block is exactly ``chunk`` wide, which is
+    NOT a stylistic choice -- it is the entire safety argument. Those are the only shapes the shipped
+    chunked prefill (prefill_long) has ever run, so a resumed walk emits nothing new: full blocks are
+    ``chunk`` wide at ``chunk``-multiple offsets, and the remainder is a ragged block at a
+    ``chunk``-multiple offset with ``_RAGGED_Q_CHUNK``, which is test_ragged_prefill's case.
+
+    ``snap`` is the SNAPSHOT granularity, and it is decoupled from ``chunk`` on purpose: the coarse
+    512 structure (the single-shot head and the full blocks) is kept because a block width has to come
+    off the padding ladder or every prompt length compiles ~90 new programs (section 2), while the
+    TAIL is split so a snapshot lands on a ``snap`` multiple. A turn then re-ingests at most
+    ``snap - 1`` tokens it could have skipped instead of ``chunk - 1``.
+
+    HISTORY, worth keeping: this used to emit only ``chunk``-wide blocks at ``chunk``-multiple offsets,
+    because two configurations that satisfy chunked-SDPA's stated rule (``chunk_start % q_chunk == 0``)
+    hung the device outright:
+        P=640, width=256, q_chunk=128
+        P=768, width=256, q_chunk=256
+    while P=512/640/768 at width=128 were all fine. Note the pattern: both failures are width **256**
+    and every pass is width **128** -- keyed on the WIDTH, not the offset. That is the signature of the
+    lazily-built per-width constants fixed by prewarm_prefill_shapes (section 5), and with that fix
+    both configurations now pass with a decode trace resident (hangdbg/envelope.py). So the envelope
+    was a workaround for that bug, not a real alignment rule, and the tail can be split.
+
+    The one rule that IS real: chunked-SDPA requires ``chunk_start % q_chunk_size == 0``, and
+    q_chunk_size defaults to the block width. So a block whose width does not divide its offset must
+    be handed ``_RAGGED_Q_CHUNK`` explicitly -- every offset here is a ``snap`` multiple, so 128
+    always divides it."""
+    assert 0 <= start < T, f"start {start} must be in [0, {T})"
+    assert chunk % snap == 0, f"chunk {chunk} must be a multiple of the snapshot grain {snap}"
+    assert snap % _RAGGED_Q_CHUNK == 0, f"snapshot grain {snap} must be a multiple of {_RAGGED_Q_CHUNK}"
+    assert start % snap == 0, f"resume offset {start} must be a multiple of the snapshot grain {snap}"
+
+    def _block(P, m, kind):
+        # q_chunk=None lets attention use the width itself; legal only when the width divides the
+        # offset. Otherwise pin it to 128, which every snap-multiple offset is divisible by.
+        return (P, m, kind, _RAGGED_Q_CHUNK if (kind == "ragged" or P % m) else None)
+
+    coarse = (T // chunk) * chunk  # the 512 structure, unchanged
+    snap_end = (T // snap) * snap  # last position a snapshot may be taken at
+    plan, P = [], start
+    if inblock:
+        # The recurrence can export its carried state at an interior row (see
+        # GatedDelta.supports_inblock_snapshot), so the tail does NOT need its own block to land a
+        # snapshot on the grain: prefill_from asks the last block for a checkpoint at snap_end. Full
+        # blocks run while a whole chunk still fits, which keeps the remainder below `chunk` and so
+        # on the padding ladder.
+        if P == 0:
+            if coarse == 0:
+                return [(0, T, "single", None)]
+            plan.append(_block(0, coarse if coarse <= single_shot_max else chunk, "single"))
+            P = plan[-1][1]
+        while P + chunk <= T:
+            plan.append(_block(P, chunk, "block"))
+            P += chunk
+        if T > P:
+            plan.append(_block(P, T - P, "ragged"))
+        return plan
+    if P == 0:
+        if coarse == 0:  # T < chunk: nothing coarse to align to
+            if snap_end == 0:  # and under one snap grain: nothing to snapshot either
+                return [(0, T, "single", None)]
+            plan.append(_block(0, snap_end, "single"))
+            P = snap_end
+        else:
+            # Keep the head as wide as forward() would have taken in one shot, and on a CHUNK
+            # multiple so its padded width stays on the ladder.
+            plan.append(_block(0, coarse if coarse <= single_shot_max else chunk, "single"))
+            P = plan[-1][1]
+    while P + chunk <= snap_end:
+        plan.append(_block(P, chunk, "block"))
+        P += chunk
+    if P < snap_end:  # one narrower block so a snapshot lands on the snap grain
+        plan.append(_block(P, snap_end - P, "block"))
+        P = snap_end
+    if T > P:  # the sub-snap remainder; no snapshot is taken here
+        plan.append(_block(P, T - P, "ragged"))
+    return plan
+
+
 class TtModel(LightweightModule):
     def __init__(self, mesh_device, args, loader, num_layers=None):
         super().__init__()
@@ -91,6 +320,21 @@ class TtModel(LightweightModule):
         # supplies its OWN page table and can simply overwrite `self.kv_pager.table`.
         self.paged_kv = os.environ.get("QWEN36_PAGED_KV") == "1"
         self.kv_pager = None
+        # PARKED CONVERSATIONS. How many independent conversations keep their KV blocks and their
+        # gated-delta checkpoints resident at once, so an interleaved request from another
+        # conversation does not destroy this one's prefix. 1 = the historical single-slot behaviour.
+        #
+        # WHY THIS IS NEEDED AT ALL, and why it cannot live in the serving adapter: prefix reuse
+        # restores the gated-delta state at position P and recomputes only [P, T). That is correct
+        # ONLY if the KV rows below P still belong to this sequence. With one flat cache they do not
+        # -- any other request's prefill writes rows [0, its T) -- so an adapter that merely
+        # remembered several histories would restore state against another conversation's KV and
+        # emit plausible garbage. MEASURED in a real deployment: a chat UI's title/tag side-requests
+        # (209..409 tokens) interleave with the user's 6.3K conversation, and every single turn fell
+        # back to a full prefill. Paging is what makes parking free: each conversation owns its own
+        # blocks out of one pool, so nothing overlaps and nothing is copied.
+        self.n_conv_slots = 1
+        self._conv_active = 0
         # Captured decode trace (one at a time). Re-captured per request; the PRIOR trace is released
         # first (capture_decode_trace) so traces never accumulate — that accumulation, together with
         # per-request cache reallocation, was the leak that OOMed the server.
@@ -126,8 +370,14 @@ class TtModel(LightweightModule):
             x = ttnn.slice(x, [0, 0, T - 1, 0], [1, 1, T, self.args.dim])
             x = self.final_norm.forward(x)
             x = ttnn.reshape(x, [1, self.args.dim])
+        if _LAYER_SYNC:
+            ttnn.synchronize_device(self.mesh_device)
+            logger.info(f"[inc] head.norm ok (T={T})")
         with sp.region("head.lm_head"):
             logits = self._lmh(x)  # [1, vocab]
+        if _LAYER_SYNC:
+            ttnn.synchronize_device(self.mesh_device)
+            logger.info(f"[inc] head.lm_head ok (T={T})")
         with sp.region("head.d2h"):
             # ROW_MAJOR before the readback. A [1, vocab] TILE tensor is PHYSICALLY [32, vocab] =
             # 15.9 MB at vocab=248320, so a tiled D2H moves 32x the bytes the caller actually uses.
@@ -172,12 +422,15 @@ class TtModel(LightweightModule):
             x = layer.forward_prefill(x, cos, sin, cache)
         return self._head_all(x, T, last_n=last_n)
 
-    def _kv_advance(self, slot=0):
+    def _kv_advance(self, slot=None):
         """Map any KV blocks the NEXT decode step will touch. Call from the Python decode loop, never
         from inside a captured graph: it may issue a host->device write. It is a no-op on the ~63 of
-        every 64 steps that do not cross a block boundary, so the steady-state step stays host-free."""
+        every 64 steps that do not cross a block boundary, so the steady-state step stays host-free.
+
+        `slot=None` means the conversation currently activated (activate_conversation), which is what
+        every decode caller wants: it is decoding whatever prefill_reuse last ran."""
         if self.paged_kv and self.kv_pager is not None:
-            self.kv_pager.ensure(self.pos, slot)
+            self.kv_pager.ensure(self.pos, self._conv_active if slot is None else slot)
 
     def _kv_fill_table_at(self, P, M, slot=0):
         """Fill table for an INCREMENTAL chunk writing M tokens at offset P.
@@ -272,6 +525,10 @@ class TtModel(LightweightModule):
                     max_seq=self.max_seq,
                     batch=max(1, getattr(self, "batch_size", 1)),
                     dtype=self.args.kv_cache_dtype,
+                    # Extra HOST mapping rows for parked conversations. The device table keeps its
+                    # `batch` rows (and therefore its baked address), so this costs nothing but a
+                    # few int32s of host memory -- see PagedKV.activate.
+                    nslots=self.n_conv_slots,
                 )
                 logger.info(f"[qwen36] paged KV: {self.kv_pager}")
             return self.kv_pager.alloc_layer_cache()
@@ -292,6 +549,340 @@ class TtModel(LightweightModule):
             if isinstance(c, dict) and "conv_state" in c:
                 ttnn.multiply(c["conv_state"], 0.0, output_tensor=c["conv_state"])
 
+    # Escape hatch, OFF by default. This existed only to bound the program cache while the
+    # long-conversation wedge was unexplained; that wedge is now root-caused (lazily-built per-width
+    # constants corrupted under a live decode trace -- see prewarm_prefill_shapes and
+    # IMPLEMENTATION_GUIDE.md section 5) and the cache was never the problem:
+    #   * the whole cache is ~31-42 MiB of kernel binaries (~70-79 KiB/program) against >10 GB free;
+    #   * a bare op loop reached 801 cached programs with 21.5 GB of DRAM ballast AND a resident
+    #     trace being replayed, with no trouble.
+    # Leaving it enabled is actively harmful once the ladder is four widths wide: the steady-state
+    # working set is ~544 entries, so a 450 limit fires mid-conversation, drops every trace and every
+    # binary, and the next request recompiles -- MEASURED as 0.55 s and 0.63 s prefills against
+    # 0.34 s on the turns either side of it. If you ever do need it, set it ABOVE the working set;
+    # setting it below is a cure worse than the disease. QWEN36_PROGRAM_CACHE_LIMIT=<n> enables.
+    _PROGRAM_CACHE_LIMIT = int(os.environ.get("QWEN36_PROGRAM_CACHE_LIMIT", "0"))
+
+    _CKPT_DEPTH = int(os.environ.get("QWEN36_STATE_CKPT_DEPTH", "4"))
+
+    # Per-conversation BAND depth once several conversations are parked (n_conv_slots > 1). The ring
+    # is partitioned statically, band `c` = ring slots [c*band, (c+1)*band), so one conversation can
+    # never evict another's checkpoint -- which a shared LRU ring would do constantly under the
+    # traffic this exists for (a 6.3K conversation interleaved with 200-400 token side requests
+    # would lose its only checkpoint to them every turn). Static partitioning also makes the owner of
+    # a ring slot derivable from its index, so no slot needs an owner tag.
+    #
+    # 2 rather than _CKPT_DEPTH: at 40 layers a slot is ~45 MiB, so 4 conversations x 4 = 720 MiB
+    # against ~10.6 GB free, and the extra depth only buys tolerance for edits to EARLIER turns
+    # (append-only chat, the case that matters, needs exactly one). QWEN36_CKPT_BAND overrides.
+    _CKPT_BAND_ENV = int(os.environ.get("QWEN36_CKPT_BAND", "0"))
+
+    @property
+    def CKPT_BAND(self):
+        """Checkpoints held per parked conversation."""
+        if self._CKPT_BAND_ENV:
+            return max(1, self._CKPT_BAND_ENV)
+        return self._CKPT_DEPTH if self.n_conv_slots <= 1 else 2
+
+    # Snapshot / resume grain, now decoupled from the prefill chunk. It USED to be forced to the
+    # chunk (512) because resuming at a 128-multiple that is not a chunk-multiple was measured to
+    # hang the device -- that turned out to be the per-width-constant corruption fixed by
+    # prewarm_prefill_shapes, and both offending configurations now pass (see plan_prefill_blocks'
+    # HISTORY note). So 128 is available. It is NOT the default, because it was measured to be a
+    # wash, 40 layers, 10-turn growing chat, prefill seconds on the reuse turns:
+    #
+    #     grain 512: 0.33 0.55 0.88 0.33 0.55 0.61 0.88 0.33 0.56   mean 0.558  worst 0.88
+    #     grain 128: 0.56 0.32 0.82 0.54 0.55 0.55 0.56 0.56 0.55   mean 0.557  worst 0.82
+    #
+    # Identical mean. The reason is the measured block cost, 127 ms fixed + 0.95 ms/token: the finer
+    # grain re-ingests up to 383 fewer tokens (~364 ms) but always needs a SECOND block to land the
+    # snapshot on the grain (+127 ms) and pays padding on both, which cancels it. It does flatten the
+    # sawtooth, and it costs branch-reuse coverage: at 4 ring slots, 512 spans 2048 tokens of history
+    # and 128 spans only 512, so an edit to an earlier turn is likelier to miss. QWEN36_CKPT_ALIGN=128
+    # selects it. The real win needs ONE block, i.e. snapshotting at 128 boundaries INSIDE the block
+    # (the gated-delta chunked recurrence already iterates in 128-token chunks) -- predicted ~370 ms
+    # flat against 0.55 s now.
+    # Resolved in the property, not here: _PREFILL_CHUNK is defined further down the class body.
+    _CKPT_ALIGN_ENV = int(os.environ.get("QWEN36_CKPT_ALIGN", "0"))
+
+    @property
+    def CKPT_ALIGN(self):
+        """Context lengths a snapshot may be taken at, and therefore the resume grain.
+
+        With in-block checkpoints the fine grain is free -- the tail is still ONE block, so there is
+        no second MoE sweep to pay for -- and it cuts the tokens a turn re-ingests from up to
+        chunk-1 to up to 127. Without them the fine grain needs its own block and measures as a wash
+        (see _CKPT_ALIGN_ENV), so fall back to the chunk."""
+        if self._CKPT_ALIGN_ENV:
+            return self._CKPT_ALIGN_ENV
+        return _RAGGED_Q_CHUNK if self.supports_inblock_snapshot else self._PREFILL_CHUNK
+
+    def _gdn_state_keys(self):
+        """(cache index, key) for every gated-delta tensor a PREFILL reads or writes.
+
+        `conv_rows` is deliberately absent: it is the decode add-chain's own copy of the conv window,
+        re-seeded from conv_state by start_decode (sync_conv_rows), so restoring conv_state is enough
+        and a snapshot taken during prefill never has to know about it."""
+        return [
+            (i, k)
+            for i, c in enumerate(getattr(self, "caches", []) or [])
+            if isinstance(c, dict)
+            for k in ("recurrent_state", "conv_state")
+        ]
+
+    # ---------------------------------------------------------------- parked conversations
+    def alloc_conversation_slots(self, n: int):
+        """Park up to `n` conversations at once. Call BEFORE the caches are allocated.
+
+        Ordering matters twice over. The KV pager is built inside the first `_alloc_cache`, and its
+        host mapping row count is fixed there; the checkpoint ring is sized from `n` as well. Both
+        are read from `self.n_conv_slots`, so this must run before `alloc_state_checkpoints()` and
+        before the model builds its caches -- i.e. immediately after construction.
+
+        REQUIRES paged KV. This is not a policy choice, it is the whole mechanism: with the flat
+        `[1, n_kv, max_seq, hd]` cache every conversation writes the same rows starting at 0, so two
+        of them cannot coexist no matter how much state the caller remembers. Raising here is
+        deliberate -- silently falling back to one slot would leave a server advertising a feature
+        that quietly does nothing, which is exactly the failure this whole change exists to fix.
+        """
+        n = max(1, int(n))
+        if n > 1 and not self.paged_kv:
+            raise RuntimeError(
+                f"alloc_conversation_slots({n}) requires paged KV (QWEN36_PAGED_KV=1): parked "
+                "conversations each need their own KV blocks, and the flat cache has one set of rows"
+            )
+        if getattr(self, "caches", None) is not None or getattr(self, "_ckpt_ring", None) is not None:
+            raise RuntimeError(
+                "alloc_conversation_slots must run before the caches and the checkpoint ring are "
+                f"allocated (n_conv_slots is baked into both); found n_conv_slots={self.n_conv_slots}"
+            )
+        self.n_conv_slots = n
+        self._conv_active = 0
+
+    def activate_conversation(self, conv: int):
+        """Make `conv` the conversation that prefill and decode read and write.
+
+        Switches the device page table to that conversation's block mapping -- CONTENTS only, at the
+        table's baked address, which is the same in-place rewrite `PagedKV.ensure` already does on
+        block boundaries and is therefore safe with a decode trace resident (MEMORY.md §1). Never
+        call this from inside a captured graph: it can issue a host->device write.
+        """
+        if not 0 <= conv < self.n_conv_slots:
+            raise IndexError(f"conversation {conv} out of range (n_conv_slots={self.n_conv_slots})")
+        self._conv_active = conv
+        if self.paged_kv and self.kv_pager is not None:
+            self.kv_pager.activate(conv)
+        return conv
+
+    def release_conversation(self, conv: int):
+        """Age a conversation out: return its KV blocks to the pool and forget its checkpoints.
+
+        The ring BUFFERS stay allocated (they are pre-allocated once, before any trace capture, and
+        must never be freed and re-made -- see alloc_state_checkpoints); only the positions they
+        advertise are cleared, so the band is immediately reusable by the next conversation.
+
+        `PagedKV.release` deliberately leaves the DEVICE page table alone, so releasing the
+        conversation that is currently shown leaves stale entries in it. That is safe here and only
+        here: the caller releases a conversation either (a) to prefill a new one into the same slot,
+        and that prefill's `ensure` remaps from block 0 and rewrites the table before anything reads
+        it, or (b) to free blocks for a DIFFERENT slot, which is not the shown one. Do not add a
+        decode between the release and the prefill."""
+        self.drop_state_checkpoints(conv=conv)
+        if self.paged_kv and self.kv_pager is not None:
+            self.kv_pager.release(conv)
+
+    def conversation_tokens(self, conv: int):
+        """Positions of `conv` that currently have KV blocks mapped (0 when not paging)."""
+        if self.paged_kv and self.kv_pager is not None:
+            return self.kv_pager.mapped_tokens(conv)
+        return 0
+
+    def kv_headroom_tokens(self):
+        """Tokens of KV the pool can still hand out, across all conversations.
+
+        Parked conversations hold their blocks until they are aged out, so a caller that parks
+        several long ones has to check this BEFORE a prefill: the pool has no eviction of its own
+        and `ensure` raises "block pool exhausted" mid-prefill, which is a failed request rather
+        than a slow one. Returns a large number when not paging (the flat cache is per-position and
+        bounded by max_seq, which prefill already asserts)."""
+        if not (self.paged_kv and self.kv_pager is not None):
+            return self.args.max_seq_len
+        _, free = self.kv_pager.slot_usage()
+        return free * self.kv_pager.block_size
+
+    def alloc_state_checkpoints(self):
+        """Allocate the snapshot ring from ``args`` alone, WITHOUT needing the caches to exist.
+
+        Call this immediately after building the model, before any prefill and before any trace
+        capture. That ordering is the whole point, and it is a MEASURED requirement, not hygiene:
+        allocating the ring the lazy way -- cloning the caches once they exist, i.e. after the first
+        prefill's transients have been allocated and freed -- drops 180 MiB (40 layers) into that
+        freed hole and fragments the region the traces and later prefill transients share. The 40-layer
+        server then served its first request and HUNG on the second, inside an ordinary
+        `ttnn.concat` in the gated-delta conv, needing a `tt-smi -r`. Same server with
+        QWEN36_PREFIX_REUSE=0 (no ring at all) served the same conversation fine, which is what pinned
+        it on the allocation rather than on anything prefix reuse actually does -- reuse had not even
+        engaged, the prompts being shorter than one chunk. See MEMORY.md §1-3 and
+        tests/probe_prefix_reuse_hang.py."""
+        if getattr(self, "_ckpt_ring", None) is not None:
+            return
+        a = self.args
+        z = lambda shape, dt: ttnn.zeros(shape, dtype=dt, layout=ttnn.TILE_LAYOUT, device=self.mesh_device)
+        spec = []  # (cache index, key, shape, dtype) -- mirrors _alloc_cache's linear-layer branch
+        for i, layer in enumerate(self.layers):
+            if layer.is_linear:
+                spec.append(
+                    (i, "recurrent_state", [1, a.lin_num_v_heads, a.lin_head_k_dim, a.lin_head_v_dim], _STATE_DT)
+                )
+                spec.append((i, "conv_state", [a.conv_kernel_size - 1, a.lin_conv_dim], ttnn.bfloat16))
+        self._ckpt_ring = [{(i, k): z(sh, dt) for i, k, sh, dt in spec} for _ in range(self._ckpt_slots())]
+        self._ckpt_reset_bands()
+        self._log_ckpt_ring("pre-allocated")
+
+    def _ensure_ckpt_ring(self):
+        """Allocate the snapshot ring (all slots at once -- see the class note). Requires caches.
+
+        FALLBACK for callers that did not call alloc_state_checkpoints() first -- prefer that one,
+        which allocates before any prefill has churned the allocator. This variant clones the caches,
+        so it can only run once they exist.
+
+        MUST run before the first trace capture, which is why prefill_from calls it as soon as the
+        caches exist rather than waiting for the first snapshot. Allocating it later -- e.g. lazily on
+        the first prompt long enough to checkpoint, by which time warmup has captured a decode trace
+        -- lands 30-126 MiB in the hole that capture's freed transients left, and MEASURED that
+        wedged the device on the NEXT request (`allocator.cpp:123`: "Allocating device buffers is
+        unsafe due to the existence of an active trace"). Same failure mode as the multi-bucket
+        prefill wedge; see MEMORY.md §1-3. The warning below is the canary for a regression."""
+        if getattr(self, "_ckpt_ring", None) is not None:
+            return
+        if getattr(self, "trace_id", None) is not None:
+            logger.warning(
+                "[qwen36] allocating the gated-delta checkpoint ring while a decode trace is LIVE -- "
+                "this is the trace/allocator aliasing hazard (MEMORY.md §1-3) and can corrupt the "
+                "trace. It should have been allocated with the caches; please file this."
+            )
+        keys = self._gdn_state_keys()
+        self._ckpt_ring = [{k: ttnn.clone(self.caches[k[0]][k[1]]) for k in keys} for _ in range(self._ckpt_slots())]
+        self._ckpt_reset_bands()
+        self._log_ckpt_ring("cloned from caches")
+
+    # ---- ring geometry. Slot i belongs to conversation i // CKPT_BAND; see _CKPT_BAND_ENV. -----
+    def _ckpt_slots(self):
+        return max(1, self.n_conv_slots) * max(1, self.CKPT_BAND)
+
+    def _ckpt_reset_bands(self):
+        self._ckpt_pos = [None] * len(self._ckpt_ring)
+        self._ckpt_next = [0] * max(1, self.n_conv_slots)  # per-band round-robin cursor
+
+    def _ckpt_span(self, conv=None):
+        """`range` of ring slot indices owned by `conv` (the active conversation by default)."""
+        conv = self._conv_active if conv is None else conv
+        band = max(1, self.CKPT_BAND)
+        return range(conv * band, min((conv + 1) * band, len(self._ckpt_ring or ())))
+
+    def _ckpt_cursor(self, conv=None):
+        """Absolute ring index the next snapshot for `conv` will be written into."""
+        conv = self._conv_active if conv is None else conv
+        span = self._ckpt_span(conv)
+        return span[self._ckpt_next[conv] % len(span)]
+
+    def _log_ckpt_ring(self, how):
+        mib = sum(t.volume() * t.element_size() for t in self._ckpt_ring[0].values()) / 2**20
+        n = len(self._ckpt_ring)
+        logger.info(
+            f"[qwen36] gated-delta state checkpoints: {n} x {mib:.1f} MiB ({n * mib:.1f} MiB total, "
+            f"{how}) = {self.n_conv_slots} conversation slot(s) x {self.CKPT_BAND} checkpoint(s)"
+        )
+
+    def snapshot_gdn_state(self, pos: int) -> bool:
+        """Record the gated-delta state as it stands at context length ``pos`` (a CKPT_ALIGN multiple),
+        overwriting the oldest ring slot. In-place copies only; no allocation after the first call."""
+        if pos <= 0 or pos % self.CKPT_ALIGN != 0:
+            return False
+        self._ensure_ckpt_ring()
+        conv = self._conv_active
+        slot = self._ckpt_cursor(conv)
+        for key, dst in self._ckpt_ring[slot].items():
+            ttnn.copy(self.caches[key[0]][key[1]], dst)
+        self._ckpt_pos[slot] = pos
+        self._ckpt_next[conv] += 1
+        return True
+
+    @property
+    def supports_inblock_snapshot(self):
+        """True when every linear mixer can export its state at an interior row of a block."""
+        return all(l.mixer.supports_inblock_snapshot for l in self.layers if l.is_linear)
+
+    def _begin_inblock_snapshot(self, pos: int):
+        """Claim the ring slot an in-block checkpoint at ``pos`` will be written into, and return it.
+
+        Unlike snapshot_gdn_state, which COPIES the caches after a block, this hands the destination
+        buffers to the layers so they write the interior state as they compute it -- there is no
+        moment afterwards when the caches still hold the state at ``pos``. The slot's position is
+        published only by _commit_inblock_snapshot, after the block has actually run, so a failure
+        part-way cannot leave a slot advertising a state it does not hold."""
+        if pos <= 0 or pos % self.CKPT_ALIGN != 0:
+            return None
+        self._ensure_ckpt_ring()
+        return self._ckpt_ring[self._ckpt_cursor()]
+
+    def _commit_inblock_snapshot(self, pos: int):
+        """Publish the slot claimed by _begin_inblock_snapshot and advance the active band."""
+        conv = self._conv_active
+        self._ckpt_pos[self._ckpt_cursor(conv)] = pos
+        self._ckpt_next[conv] += 1
+
+    def checkpoint_positions(self, conv=None):
+        """Context lengths the gated-delta state can currently be rewound to, ascending.
+
+        Scoped to ONE conversation (the active one by default): a checkpoint from another
+        conversation describes a different token sequence and a different set of KV blocks, so it
+        must never appear in this one's resume search. Identical to the flat list when only one
+        conversation slot exists."""
+        if not getattr(self, "_ckpt_pos", None):
+            return []
+        return sorted(p for i in self._ckpt_span(conv) if (p := self._ckpt_pos[i]) is not None)
+
+    def restore_gdn_state(self, pos: int, conv=None) -> bool:
+        """Rewind the gated-delta state to context length ``pos`` and set self.pos. False if no
+        snapshot for ``pos`` is held.
+
+        Nothing else needs rewinding: KV rows at and beyond ``pos`` are overwritten by the resumed
+        prefill (and any left over past its end are masked by causality / `cur_pos`), and `conv_rows`
+        is rebuilt from the restored conv_state when start_decode runs."""
+        ring = getattr(self, "_ckpt_ring", None)
+        if ring is None:
+            return False
+        slot = next((i for i in self._ckpt_span(conv) if self._ckpt_pos[i] == pos), None)
+        if slot is None:
+            return False
+        for key, src in ring[slot].items():
+            ttnn.copy(src, self.caches[key[0]][key[1]])
+        self.pos = pos
+        return True
+
+    def drop_state_checkpoints(self, above: int | None = None, conv=None):
+        """Invalidate snapshots (buffers stay allocated). ``above`` keeps only positions <= it, which is
+        how a prefill that SHORTENS the sequence discards snapshots belonging to the longer one -- a
+        stale snapshot at a position the new sequence also reaches would otherwise restore the wrong
+        context's state. ``None`` invalidates all.
+
+        ``conv`` scopes it to ONE conversation's band; ``None`` (the default) spans every band, which
+        is what a warmup or a global reset wants. Note the asymmetry, because it is the bug this
+        whole change fixes: ``drop_state_checkpoints(above=T)`` unscoped is exactly what let a
+        200-token side request wipe a 6.3K conversation's only checkpoint, so every per-request call
+        in prefill_reuse passes its own ``conv``."""
+        if getattr(self, "_ckpt_pos", None) is None:
+            return
+        span = range(len(self._ckpt_pos)) if conv is None else self._ckpt_span(conv)
+        for i in span:
+            p = self._ckpt_pos[i]
+            if above is None or (p is not None and p > above):
+                self._ckpt_pos[i] = None
+        if above is None:  # the band(s) are empty: restart their round-robin at the bottom
+            for c in range(len(self._ckpt_next)) if conv is None else (conv,):
+                self._ckpt_next[c] = 0
+
     # Long prompts are prefilled in chunks via prefill_long (single-shot can't hold full-sequence
     # activations/attention past ~1-2K). forward() routes there above this length; QWEN36_PREFILL_CHUNK
     # sets the chunk size. The threshold stays above the chunk so the per-chunk single-shot calls don't recurse.
@@ -309,14 +900,16 @@ class TtModel(LightweightModule):
             return self.prefill_long(input_ids)
         return self._prefill_single(input_ids)
 
-    def _prefill_single(self, input_ids: torch.Tensor, slot: int = 0):
+    def _prefill_single(self, input_ids: torch.Tensor, slot: int = 0, valid_len: int | None = None):
         """Single-shot prefill (bounded to short prompts: materializes the full [T,*] activations).
         Allocates per-layer caches and sets self.pos.
 
         `slot` selects which PAGED KV row this prompt's blocks come from (continuous batching); it is
         ignored on the flat path, where the caller instead copies row-wise after the fact. See
         prefill_into_slot."""
-        T = input_ids.shape[1]
+        self._release_traces_for_prefill(widths={int(input_ids.reshape(1, -1).shape[1])})
+        T = input_ids.shape[1]  # the (possibly bucket-padded) width every op runs at
+        real = T if valid_len is None else int(valid_len)  # the real token count
         self.max_seq = self.args.max_seq_len
         # Allocate per-layer caches ONCE and reuse them across prefills (the same _pf_caches_ready
         # guard the traced-prefill path uses). Reallocating per request was the OOM: the decode
@@ -326,7 +919,7 @@ class TtModel(LightweightModule):
             self._pf_caches_ready = True
         else:
             self._reset_linear_state()  # fresh prefill: clear the gated-delta conv left-pad
-        self.pos = T
+        self.pos = real
         prof.reset()
         with prof.phase(self.mesh_device, "embed"), sp.region("embed"):
             x = self._embed(input_ids, T)
@@ -334,7 +927,7 @@ class TtModel(LightweightModule):
             cos, sin = precompute_rope(T, self.args.rotary_dim, self.args.rope_theta, self.mesh_device)
         fpt = self._kv_fill_table(T, slot)
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_prefill(x, cos, sin, cache, fill_page_table=fpt)
+            x = layer.forward_prefill(x, cos, sin, cache, fill_page_table=fpt, valid_len=valid_len)
         if self._keep_prefill_hidden:
             # The per-position POST-final-norm hidden, for prime_mtp. This is the only moment it
             # exists: _head slices to the last row BEFORE the norm (a T-fold lm_head + D2H saving),
@@ -343,7 +936,7 @@ class TtModel(LightweightModule):
             with sp.region("prefill.keep_hidden"):
                 self._prefill_hidden = self.final_norm.forward(x)
         with prof.phase(self.mesh_device, "head"), sp.region("head"):
-            out = self._head(x, T)
+            out = self._head(x, real)  # the REAL last token, not the padding
         prof.report()
         return out
 
@@ -362,6 +955,7 @@ class TtModel(LightweightModule):
         forward_incremental block (right-padded to a 128-multiple internally for attention; gated-delta
         processes only the real tokens via valid_len). Every offset P passed to a block is still a
         multiple of chunk, so the chunk-start alignment holds."""
+        self._release_traces_for_prefill()
         M = chunk or self._PREFILL_CHUNK
         T = input_ids.shape[1]
         assert M % 128 == 0, f"prefill chunk {M} must be a multiple of 128"
@@ -379,6 +973,292 @@ class TtModel(LightweightModule):
         # the whole one. Drop it: prime_mtp then no-ops and long prompts keep today's behaviour.
         self._prefill_hidden = None
         return logits
+
+    def prefill_from(self, input_ids: torch.Tensor, start: int = 0, slot: int = 0):
+        """Prefill ``input_ids`` (torch [1, T]) computing only positions [start, T), and snapshot the
+        gated-delta state at every block boundary crossed so the NEXT turn can resume in turn.
+
+        ``start`` is 0 (from scratch) or a CKPT_ALIGN multiple for which restore_gdn_state has just
+        run. Returns the last token's logits [1, 1, vocab], like forward().
+
+        Block structure, and why it differs from prefill_long: the prompt is ingested up to
+        ``floor(T / CKPT_ALIGN) * CKPT_ALIGN`` and its remainder handled as one ragged block, so a
+        snapshot always exists at the last CKPT_ALIGN multiple -- which is where the next turn's
+        divergence point (typically T-2) floors to. For a prompt short enough that forward() would
+        have gone single-shot, the first block is kept that wide, so the only added work versus
+        today's path is one extra MoE pass over the (<= CKPT_ALIGN-1 token) remainder. That pass is
+        the price of the next turn's reuse; callers that will never resume should use forward()."""
+        ids = input_ids.reshape(1, -1)
+        T = int(ids.shape[1])
+        assert T <= self.args.max_seq_len, f"prompt {T} exceeds max_seq_len {self.args.max_seq_len}"
+        plan = plan_prefill_blocks(
+            T,
+            start=start,
+            chunk=self._PREFILL_CHUNK,  # coarse structure: keeps block widths on the padding ladder
+            snap=self.CKPT_ALIGN,  # one source of truth: the plan's grain IS the snapshot's
+            inblock=self.supports_inblock_snapshot,
+            single_shot_max=self._LONG_PREFILL_THRESHOLD,
+        )
+        # The padded widths this prefill will touch; whether any is new decides whether the resident
+        # decode trace has to be dropped first (see _release_traces_for_prefill).
+        self._release_traces_for_prefill(
+            widths={
+                pad_width(m, limit=self.args.max_seq_len)
+                if kind == "single"
+                else pad_width(m, limit=max(self.args.max_seq_len - P, _RAGGED_Q_CHUNK))
+                for P, m, kind, _q in plan
+            }
+        )
+        logits = None
+        if getattr(self, "_pf_caches_ready", False):
+            self._ensure_ckpt_ring()  # before any capture -- see _ensure_ckpt_ring
+        for P, m, kind, q_chunk in plan:
+            block = ids[:, P : P + m]
+            logger.debug(f"[prefill_from] block {kind} P={P} m={m} q_chunk={q_chunk} (T={T}, start={start})")
+            _pc0 = self.mesh_device.num_program_cache_entries()
+            if kind == "single":
+                # Bucket a short prompt up to a _RAGGED_Q_CHUNK multiple and mask the padding, exactly
+                # as the ragged tail does. Without this, every prompt under one chunk runs at its RAW
+                # length and compiles ~90 new device programs that will never be reused -- the common
+                # case in chat, and the last unbounded source feeding the program-cache ceiling.
+                w = pad_width(m, limit=self.args.max_seq_len)
+                if w != m:
+                    padded = torch.zeros(1, w, dtype=block.dtype)
+                    padded[0, :m] = block[0]
+                    logits = self._prefill_single(padded, slot, valid_len=m)
+                else:
+                    logits = self._prefill_single(block, slot)  # allocates caches, resets the conv left-pad
+                self._ensure_ckpt_ring()  # the caches now exist, and no trace can have been captured yet
+            else:
+                # In-block checkpoint for the LAST block: the deepest grain multiple this prompt
+                # reaches usually falls INSIDE the final block, and exporting the recurrence state
+                # there costs one extra slice per linear layer instead of a whole extra block.
+                snap_at = None
+                if self.supports_inblock_snapshot:
+                    grain = self.CKPT_ALIGN
+                    snap_end = (T // grain) * grain
+                    if P < snap_end < P + m:
+                        snap_at = snap_end - P
+                logits = self.forward_incremental(
+                    block, ragged=kind == "ragged", slot=slot, q_chunk=q_chunk, snap_at=snap_at
+                )
+            _pc1 = self.mesh_device.num_program_cache_entries()
+            logger.debug(f"[prefill_from] {kind} P={P} m={m} compiled {_pc1 - _pc0} new programs (total {_pc1})")
+            if kind != "ragged":  # the remainder does not land on a CKPT_ALIGN multiple
+                self.snapshot_gdn_state(P + m)
+        # Never valid for a multi-block prefill: only the FIRST block's hidden was materialised (see
+        # prefill_long), so priming the MTP head off it would claim a prompt it never saw.
+        self._prefill_hidden = None
+        return logits
+
+    # Prefill must never allocate device buffers while a decode trace is resident. tt-metal warns
+    # about exactly this once per device ("Allocating device buffers is unsafe due to the existence
+    # of an active trace. These buffers may be corrupted once a trace is executed.",
+    # allocator.cpp:123) and then goes quiet, so the hazard is silent from then on.
+    #
+    # What actually gets corrupted: the read-only per-WIDTH constants the prefill path builds lazily
+    # (GatedDelta._conv_stack_const, MoE._rowsel). First use of a width happens under the resident
+    # trace, a replay stomps them, and being write-once they are never repaired -- so the wedge lands
+    # on the next turn that REUSES that width (measured 6/6 at turn 5: width 256 built at turn 2,
+    # reused at turn 5). prewarm_prefill_shapes() builds them all before any capture and is the real
+    # fix; with it the trace stays resident for the whole conversation and this release never fires.
+    # This remains as the backstop for a width that was never pre-warmed.
+    # See IMPLEMENTATION_GUIDE.md sections 4b and 5.
+    _RELEASE_TRACE_BEFORE_PREFILL = os.environ.get("QWEN36_RELEASE_TRACE_BEFORE_PREFILL", "1") != "0"
+
+    def prewarm_prefill_shapes(self, widths=None):
+        """Force every LAZY per-shape device constant into existence before any trace is captured.
+
+        The prefill path caches read-only device constants keyed by block width and builds them on
+        first use of that width -- `GatedDelta._conv_stack_const(T)` (five 0/1 selection/summation
+        matrices per width, per linear layer) and `MoE._rowsel(K)` are the ones in this repo, and the
+        set is not closed: any future per-shape constant inherits the same hazard. After warmup, the
+        first use of a width always happens with the decode trace resident, so those constants are
+        allocated under an active trace -- exactly what allocator.cpp warns about ("These buffers may
+        be corrupted once a trace is executed") -- and, being read-only, they are never rewritten, so
+        a single stomp is permanent. That is the same fault MEMORY.md 1-3 fixed for the prefill
+        buckets by allocating every bucket's buffers before any capture.
+
+        Running one real prefill per ladder width here fills those caches through the actual code
+        paths, so nothing has to enumerate them. Costs a few seconds of startup, once."""
+        if getattr(self, "trace_id", None) is not None:
+            logger.warning(
+                "[qwen36] prewarm_prefill_shapes ran with a decode trace already live -- it must run "
+                "BEFORE the first capture or it defeats its own purpose; please file this."
+            )
+        chunk = self._PREFILL_CHUNK
+        widths = sorted({int(w) for w in (widths or _PREFILL_WIDTHS)} | {_RAGGED_Q_CHUNK})
+        ids = torch.zeros(1, chunk + max(widths) + 8, dtype=torch.long)
+        for W in widths:
+            self._prefill_single(ids[:, :chunk])
+            # ragged=True/q_chunk=128 is the tail shape; ragged=False with q_chunk=None is the full
+            # "block" shape, whose chunked-SDPA q_chunk_size is the WIDTH. They are different
+            # programs, and with a runtime chunk_start the first of each costs a ~1.4 s compile --
+            # which showed up as a 2.36 s request when only the tail shape had been warmed. Warm both.
+            self.forward_incremental(ids[:, chunk : chunk + W], ragged=True, q_chunk=_RAGGED_Q_CHUNK)
+            self._prefill_single(ids[:, :chunk])
+            self.forward_incremental(ids[:, chunk : chunk + W], ragged=False)
+        self.drop_state_checkpoints()
+        self.pos = 0
+        self._warmed_widths = set(widths)
+        logger.info(
+            f"[qwen36] pre-warmed per-shape prefill constants for widths {widths} " f"(before any trace capture)"
+        )
+
+    def release_traces(self):
+        """Release every captured trace. They are re-captured on demand, so this is always safe at a
+        quiescent point; it must NEVER run while a trace is being replayed."""
+        if getattr(self, "trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.trace_id)
+            self.trace_id = None
+            self._trace_sig = None
+        if getattr(self, "logits_trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.logits_trace_id)
+            self.logits_trace_id = None
+            self._logits_trace_sig_v = None
+        for tid in list(getattr(self, "_pf_traces", {}).values()):
+            ttnn.release_trace(self.mesh_device, tid)
+        if hasattr(self, "_pf_traces"):
+            self._pf_traces.clear()
+        if getattr(self, "mtp_trace_ids", None) or getattr(self, "_mtp_traces", None):
+            try:
+                self.release_mtp_traces()
+            except Exception as e:  # never let cleanup take the server down
+                logger.warning(f"[qwen36] trace release: MTP trace release failed ({e})")
+
+    def _release_traces_for_prefill(self, widths=None):
+        """Drop the DECODE-side traces so the prefill about to run cannot allocate into space they own.
+
+        ``widths`` are the padded block widths this prefill will use. If every one of them has already
+        had its per-shape constants built (prewarm_prefill_shapes, or an earlier prefill that paid for
+        it), there is nothing left to allocate and the traces can stay resident -- which is the whole
+        point, since re-capturing the decode trace costs ~0.33 s. ``widths=None`` means "caller cannot
+        tell us", and is treated conservatively.
+
+        Deliberately leaves ``_pf_traces`` alone: those are prefill's own traces, they are captured
+        after alloc_prefill_buffers has placed every bucket's persistent buffers (which is what fixed
+        the multi-bucket aliasing), and an eager fallback prefill must not tear them down.
+        """
+        if not self._RELEASE_TRACE_BEFORE_PREFILL:
+            return
+        if widths is not None:
+            warmed = getattr(self, "_warmed_widths", None)
+            if warmed is not None and all(w in warmed for w in widths):
+                return  # constants already exist: this prefill allocates nothing new
+            # About to build constants for a new width. Do it with no trace resident, then remember
+            # the width so no later turn pays this again.
+            if warmed is None:
+                self._warmed_widths = warmed = set()
+            warmed.update(widths)
+        if (
+            getattr(self, "trace_id", None) is None
+            and getattr(self, "logits_trace_id", None) is None
+            and not getattr(self, "mtp_trace_ids", None)
+            and not getattr(self, "_mtp_traces", None)
+        ):
+            return  # nothing resident; keep the common path free of work
+        if getattr(self, "trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.trace_id)
+            self.trace_id = None
+            self._trace_sig = None
+        if getattr(self, "logits_trace_id", None) is not None:
+            ttnn.release_trace(self.mesh_device, self.logits_trace_id)
+            self.logits_trace_id = None
+            self._logits_trace_sig_v = None
+        if getattr(self, "mtp_trace_ids", None) or getattr(self, "_mtp_traces", None):
+            try:
+                self.release_mtp_traces()
+            except Exception as e:  # never let cleanup take the server down
+                logger.warning(f"[qwen36] pre-prefill trace release: MTP release failed ({e})")
+        logger.debug("[qwen36] released decode-side traces before prefill (allocator/trace aliasing)")
+
+    def maybe_recycle_programs(self) -> bool:
+        """Drop the device program cache if it has grown past ``_PROGRAM_CACHE_LIMIT``. True if it did.
+
+        MUST be called at a quiescent point -- between requests, before a prefill -- and never while a
+        trace is being replayed: every captured trace references the program binaries this frees, so
+        the traces are released first and re-captured on demand. Checkpoints and caches are DATA, not
+        programs, so they survive untouched and prefix reuse keeps working across a recycle."""
+        limit = self._PROGRAM_CACHE_LIMIT
+        if not limit:
+            return False
+        n = self.mesh_device.num_program_cache_entries()
+        if n < limit:
+            return False
+        self.release_traces()
+        if os.environ.get("QWEN36_RECYCLE_TRACES_ONLY") == "1":
+            # Diagnostic: release the traces but KEEP the program cache. Separates "freeing the kernel
+            # binaries" from "re-capturing the traces" -- the recycle does both, and only one of them
+            # may be what actually prevents the hang.
+            logger.info(f"[qwen36] traces released at {n} entries; program cache KEPT (diagnostic)")
+            return True
+        # The DRAM delta across the clear IS the kernel-binary bytes the cache was holding -- the one
+        # number that distinguishes "too many programs" from "too many program BYTES".
+        from models.demos.qwen3_6_a3b.tt import memstat
+
+        before = memstat.region(self.mesh_device, ttnn.BufferType.DRAM).allocated
+        self.mesh_device.clear_program_cache()
+        after = memstat.region(self.mesh_device, ttnn.BufferType.DRAM).allocated
+        logger.info(
+            f"[qwen36] program cache recycled at {n} entries (limit {limit}); "
+            f"freed {(before - after) / 2**20:.1f} MiB of kernel binaries "
+            f"({(before - after) / max(n, 1) / 1024:.1f} KiB/program); next request recompiles"
+        )
+        return True
+
+    def prefill_reuse(
+        self, input_ids: torch.Tensor, hist_ids=None, min_reuse: int | None = None, slot: int = 0, conv=None
+    ):
+        """Prefill with multi-turn PREFIX REUSE: continue from the deepest gated-delta checkpoint the
+        new prompt still agrees with instead of recomputing the whole context.
+
+        ``hist_ids``: the token ids the caches currently represent, i.e. the prompt this model
+        prefilled last (in order). The resume point is the longest common prefix of ``hist_ids`` and
+        ``input_ids``, floored to a checkpoint we still hold. Returns ``(logits, reused)`` where
+        ``reused`` is the number of prompt positions that were NOT recomputed (0 = full prefill).
+
+        Correctness rests on comparing tokens, not on any assumption about the chat template: if the
+        client re-renders history differently -- dropped reasoning, normalised whitespace,
+        re-serialised tool arguments, a compacted transcript -- the common prefix simply lands
+        earlier and everything after it is recomputed. The caller owns ``hist_ids`` and must set it to
+        the prompt it just passed here; handing over a stale list is the one way to get this wrong,
+        which is why nothing infers it from device state.
+
+        ``conv`` selects which PARKED CONVERSATION this request belongs to (see
+        alloc_conversation_slots). It activates that conversation's KV block mapping and scopes the
+        checkpoint search, the resume and both invalidations to its own band, so an interleaved
+        request from another conversation cannot see, restore or destroy this one's state. It also
+        defaults ``slot`` -- on the single-sequence path the KV slot IS the conversation -- so
+        callers pass one number, not two that must agree."""
+        conv = self._conv_active if conv is None else self.activate_conversation(conv)
+        if slot == 0 and conv:
+            slot = conv  # the conversation's own KV blocks; see the docstring
+        self.maybe_recycle_programs()  # quiescent point: before any prefill work for this request
+        ids = input_ids.reshape(1, -1)
+        T = int(ids.shape[1])
+        start = 0
+        if hist_ids is not None and len(hist_ids) and getattr(self, "caches", None) is not None:
+            lcp = common_prefix_len(hist_ids, ids[0].tolist())
+            start = pick_checkpoint(
+                self.checkpoint_positions(conv), min(lcp, T - 1), self.CKPT_ALIGN if min_reuse is None else min_reuse
+            )
+        logger.debug(f"[prefill_reuse] conv={conv} T={T} start={start} checkpoints={self.checkpoint_positions(conv)}")
+        if start and self.restore_gdn_state(start, conv):
+            logits = self.prefill_from(ids, start=start, slot=slot)
+        else:
+            # Fresh prefill: every checkpoint THIS conversation holds describes a different token
+            # sequence at those positions, so none of them may survive into its next turn's search.
+            # Other conversations' bands are untouched -- their checkpoints still match their own
+            # histories and their own KV blocks.
+            self.drop_state_checkpoints(conv=conv)
+            start = 0
+            logits = self.prefill_from(ids, start=0, slot=slot)
+        # Discard checkpoints past the end of THIS sequence (this conversation's previous prompt may
+        # have been longer): the next turn's prefix can only reach T, but a stale snapshot at a
+        # position <= T would restore an older revision of the same conversation at a position this
+        # one also has. Scoped to `conv` -- unscoped, this line WAS the bug.
+        self.drop_state_checkpoints(above=T, conv=conv)
+        return logits, start
 
     # ---- Traced prefill (additive; mirrors capture_decode_trace). Prefill is ~54% host-dispatch over
     # ~11k tiny ops; replaying a captured graph removes that per-op launch latency. Shape-static, so we
@@ -539,7 +1419,9 @@ class TtModel(LightweightModule):
             self._prefill_hidden = self.final_norm.forward(real)
         return self._head(self._pf_out[B], T)  # head slices the REAL last token (T-1), not the bucket
 
-    def forward_incremental(self, input_ids: torch.Tensor, ragged: bool = False, slot: int = 0):
+    def forward_incremental(
+        self, input_ids: torch.Tensor, ragged: bool = False, slot: int = 0, q_chunk=None, snap_at: int | None = None
+    ):
         """Incremental (from-cache) prefill of M NEW tokens continuing from the existing caches
         (self.pos = current context length P), instead of re-prefilling the whole P+M context.
         Requires a prior forward()/forward_incremental() to have populated the caches. P and M must be
@@ -554,13 +1436,25 @@ class TtModel(LightweightModule):
         reads the real last token, so the padded KV rows (past self.pos) are never read.
 
         `slot` selects the PAGED KV row (continuous batching); ignored on the flat path, which has one
-        cache per model. See _kv_read_table for why the read table must be per-slot."""
+        cache per model. See _kv_read_table for why the read table must be per-slot.
+
+        `q_chunk` overrides chunked-SDPA's q_chunk_size. It defaults to the block width M, which is
+        only legal while P is a multiple of M -- true of the from-scratch chunked walk, but NOT of a
+        prefill RESUMED from a state checkpoint, whose offset is only a CKPT_ALIGN multiple. Callers
+        on that path pass 128 (see prefill_from)."""
+        self._release_traces_for_prefill(
+            widths={
+                pad_width(int(input_ids.reshape(1, -1).shape[1]), limit=max(self.max_seq - self.pos, _RAGGED_Q_CHUNK))
+            }
+        )
         M = input_ids.shape[1]
         P = self.pos
         if ragged:
-            M_pad = ((M + 127) // 128) * 128  # minimal 128-multiple padding (bounds extra KV rows)
+            # a width from the ladder, NOT the minimal 128-multiple (see _PREFILL_WIDTHS), capped by
+            # the room left in the KV cache -- padding writes real rows and must not run past max_seq
+            M_pad = pad_width(M, limit=self.max_seq - P)
             valid = M if M_pad != M else None  # tell gated-delta the real length when we padded
-            q_chunk = 128  # q_chunk_size that divides P (multiple of the chunk) and M_pad
+            q_chunk = q_chunk or 128  # q_chunk_size that divides P (multiple of the chunk) and M_pad
             assert P + M_pad <= self.max_seq, (
                 f"ragged block overflows the KV cache: P({P}) + padded_M({M_pad}) > max_seq({self.max_seq}); "
                 f"raise QWEN36_MAX_SEQ to a multiple of 128 >= {((P + M + 127) // 128) * 128}"
@@ -570,12 +1464,22 @@ class TtModel(LightweightModule):
                 padded[0, :M] = input_ids[0]
                 input_ids = padded
         else:
-            M_pad, valid, q_chunk = M, None, None  # full chunk: already aligned, unchanged path
+            M_pad, valid = M, None  # full chunk: already aligned; q_chunk None -> the kernel uses M
         inc_fpt = self._kv_fill_table_at(P, M_pad, slot)
         read_pt = self._kv_read_table(slot)
         x = self._embed(input_ids, M_pad)
+        if _LAYER_SYNC:
+            ttnn.synchronize_device(self.mesh_device)
+            logger.info(f"[inc] P={P} M={M_pad} embed ok")
         cos, sin = precompute_rope(M_pad, self.args.rotary_dim, self.args.rope_theta, self.mesh_device, start_pos=P)
-        for layer, cache in zip(self.layers, self.caches):
+        if _LAYER_SYNC:
+            ttnn.synchronize_device(self.mesh_device)
+            logger.info(f"[inc] P={P} M={M_pad} rope ok")
+        # In-block checkpoint: hand each LINEAR layer the ring slot it should write its state into
+        # `snap_at` rows into this block. That leaves a resumable snapshot at P + snap_at without
+        # splitting the block, so the block's MoE sweep (127 ms, PREFILL.md 0.9) is paid once.
+        snap_slot = self._begin_inblock_snapshot(P + snap_at) if snap_at else None
+        for li, (layer, cache) in enumerate(zip(self.layers, self.caches)):
             x = layer.forward_prefill_incremental(
                 x,
                 cos,
@@ -586,7 +1490,18 @@ class TtModel(LightweightModule):
                 valid_len=valid,
                 q_chunk=q_chunk,
                 fill_page_table=inc_fpt,
+                snap_at=snap_at,
+                snap_dst=None
+                if snap_slot is None
+                else {k: snap_slot[(li, k)] for k in ("recurrent_state", "conv_state") if (li, k) in snap_slot},
             )
+            if _LAYER_SYNC:
+                ttnn.synchronize_device(self.mesh_device)
+                logger.info(
+                    f"[inc] P={P} M={M_pad} valid={valid} layer {li} " f"({'linear' if layer.is_linear else 'attn'}) ok"
+                )
+        if snap_slot is not None:
+            self._commit_inblock_snapshot(P + snap_at)
         self.pos = P + M  # advance by the REAL token count (not the padded width)
         return self._head(x, M)  # slice the real last token (index M-1)
 
@@ -1322,7 +2237,9 @@ class TtModel(LightweightModule):
             ttnn.embedding(self._m_tok, self.embed_weight, layout=ttnn.TILE_LAYOUT), [1, 1, K, self.args.dim]
         )
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_verify(x, cos, sin, cache, self._m_pos_i32)
+            # host-side position: the SDPA program config is baked at CAPTURE time, so it cannot
+            # read the device positions tensor. See Attention._verify_sdpa_pc.
+            x = layer.forward_verify(x, cos, sin, cache, self._m_pos_i32, pos_hint=self.pos)
         x = self.final_norm.forward(x)
         ttnn.copy(x, self._m_vhidden)
         logits = self._lmh(ttnn.reshape(x, [K, self.args.dim]))  # [K, vocab]
@@ -1492,7 +2409,7 @@ class TtModel(LightweightModule):
         cos, sin = self._rope_for(self._pos_tensor(positions))
         x = ttnn.reshape(ttnn.embedding(ids, self.embed_weight, layout=ttnn.TILE_LAYOUT), [1, 1, K, self.args.dim])
         for layer, cache in zip(self.layers, self.caches):
-            x = layer.forward_verify(x, cos, sin, cache, pos_i32)
+            x = layer.forward_verify(x, cos, sin, cache, pos_i32, pos_hint=self.pos)
         x = self.final_norm.forward(x)
         logits = self._lmh(ttnn.reshape(x, [K, self.args.dim]))  # [K, vocab]
         return logits, x
@@ -2053,9 +2970,77 @@ class TtModel(LightweightModule):
         if self.trace_id is not None:
             ttnn.release_trace(self.mesh_device, self.trace_id)
         snap = [ttnn.clone(t) for t in self._trace_snapshot_tensors()]
+        # HIGH-WATER BALLAST. A capture's in-graph transients are freed the moment end_trace_capture
+        # returns, but every REPLAY still writes their recorded addresses. Captured on a quiet
+        # allocator (warmup prefills a 1-token prompt) those addresses sit LOW -- exactly where a real
+        # prefill's much larger transients will later be allocated. That collision is the
+        # long-conversation hang: it needs a captured trace (with the decode trace off, the same
+        # conversation that hangs on turn 3 runs clean), it is not the program cache (801 cached
+        # programs synthetically is fine; the model's cache is 31 MiB) and no memory metric moves.
+        #
+        # Holding a ballast across the capture pushes the trace's transients ABOVE the high-water mark
+        # a prefill can reach, so prefill allocations can never land on them. Same fix, same reason, as
+        # alloc_prefill_buffers' "allocate every bucket before any capture" (MEMORY.md §1-3).
+        # MEASURED which region actually collides. A probe that samples both allocators after every
+        # heavy op during the real prefills (hangdbg/peak_probe.py) gives prefill's peak footprint
+        # above the quiescent post-warmup baseline:
+        #
+        #     DRAM  +233..252 MiB   (flat across turns)
+        #     L1    +9.45 MiB       (11.2 MiB total, ~88 KiB of the 1.5 MB per core)
+        #
+        # So DRAM is NOT the colliding region: a 3 GB DRAM ballast is 12x prefill's whole DRAM
+        # working set, and it still only bought one extra turn. L1 is where the aliasing happens --
+        # which also explains why QWEN36_GDN_L1=0 (moving gated-delta off L1) shifted the failure by
+        # exactly one turn. Ballast BOTH, sized from the measurement with margin, and the decode
+        # trace's transients land above anything a prefill can reach.
+        #
+        # QWEN36_TRACE_BALLAST_L1_KB is per BANK (L1 banks == worker cores), because that is the
+        # dimension the allocator hands out; QWEN36_TRACE_BALLAST_MB is a DRAM total.
+        ballast = []
+        mb = int(os.environ.get("QWEN36_TRACE_BALLAST_MB", "0"))
+        if mb:
+            ballast.append(
+                ttnn.zeros(
+                    [1, 1, 32, mb * 1024 * 1024 // 2 // 32],
+                    dtype=ttnn.bfloat16,
+                    layout=ttnn.TILE_LAYOUT,
+                    device=self.mesh_device,
+                )
+            )
+        l1_kb = int(os.environ.get("QWEN36_TRACE_BALLAST_L1_KB", "0"))
+        if l1_kb:
+            from models.demos.qwen3_6_a3b.tt import memstat
+
+            banks = memstat.region(self.mesh_device, ttnn.BufferType.L1).banks
+            want = l1_kb * 1024 * banks
+            # Several modest tensors rather than one huge one: an interleaved L1 tensor has to fit
+            # every bank, and a single request for the whole amount is the one most likely to fail.
+            per = max(1, want // 8)
+            got = 0
+            for _ in range(8):
+                try:
+                    ballast.append(
+                        ttnn.zeros(
+                            [1, 1, 32, max(32, per // 2 // 32)],
+                            dtype=ttnn.bfloat16,
+                            layout=ttnn.TILE_LAYOUT,
+                            device=self.mesh_device,
+                            memory_config=ttnn.L1_MEMORY_CONFIG,
+                        )
+                    )
+                    got += per
+                except Exception as e:  # out of L1 -- keep what we got, the capture still needs room
+                    logger.warning(f"[qwen36] L1 capture ballast stopped at {got / 2**20:.1f} MiB ({e})")
+                    break
+            logger.info(
+                f"[qwen36] capture ballast: DRAM {mb} MiB + L1 {got / 2**20:.1f} MiB "
+                f"({l1_kb} KiB/bank x {banks} banks requested)"
+            )
         self.trace_id = ttnn.begin_trace_capture(self.mesh_device, cq_id=0)
         self._decode_graph()
         ttnn.end_trace_capture(self.mesh_device, self.trace_id, cq_id=0)
+        for b in ballast:
+            ttnn.deallocate(b)  # the hole it leaves is BELOW the trace's transients: safe to reuse
         for orig, s in zip(self._trace_snapshot_tensors(), snap):
             ttnn.copy(s, orig)  # undo the mutation done while recording
         self._trace_sig = self._decode_trace_sig()

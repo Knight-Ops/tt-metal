@@ -40,6 +40,174 @@ standing harness is `tests/bench_prefill.py`).
 > rather than throughput (same run: 37.7 tok/s at 24 tokens, 257 tok/s at 220). The old "~200 tok/s
 > prefill" headline was that mean. Steady-state is the table above.
 
+### 0.9 Prefill block cost model, and what it rules out (2026-09-08)
+
+One incremental prefill block, 40 layers, decode trace resident, best of 3
+(`hangdbg/blockcost.py`, widths 128/256/384/512 at a fixed offset):
+
+```
+time = 127 ms fixed + 0.95 ms per (padded) token
+```
+
+The 127 ms floor is a full sweep of the MoE expert weights (~16 GB of the 21.7 GB resident model), so
+it is DRAM-bound and irreducible **per block**. Two consequences that overturn the obvious
+intuitions:
+
+| | |
+|---|---|
+| a 512-token tail as **one** block | **613 ms** |
+| the same 512 as **4x128** blocks | **995 ms** (62% worse) |
+
+1. **Fewer, wider blocks win.** Chunking finer to reduce padding waste loses to the per-block MoE
+   sweep every time.
+2. **Finer prefix-reuse checkpoints do NOT pay.** A 128 snapshot grain re-ingests up to 383 fewer
+   tokens (~364 ms) but always needs a second block to land the snapshot on the grain (+127 ms) and
+   pays padding on both. Measured over a 10-turn growing chat, prefill on the reuse turns:
+
+   ```
+   grain 512: 0.33 0.55 0.88 0.33 0.55 0.61 0.88 0.33 0.56   mean 0.558  worst 0.88
+   grain 128: 0.56 0.32 0.82 0.54 0.55 0.55 0.56 0.56 0.55   mean 0.557  worst 0.82
+   ```
+
+   Identical mean. The finer grain only flattens the sawtooth, and it costs branch-reuse coverage
+   (at 4 ring slots, 512 spans 2048 tokens of history against 512). Available as
+   `QWEN36_CKPT_ALIGN=128`; not the default.
+
+**Where the win actually is, and it is now implemented:** one block per turn containing only the
+genuinely new tokens, with the snapshot taken at a 128 boundary *inside* that block.
+
+`ttnn.transformer.chunk_gated_delta_rule` takes an `initial_state` and returns the final one, so the
+recurrence splits **exactly** -- running `[0,j)` then `[j,T)` seeded with the first half's result is
+identical to one pass (measured core PCC 1.000000, final-state PCC 1.000000,
+`hangdbg/splitprobe.py`). Only the recurrence splits: attention, MoE and the norms still run once
+over the whole block, so a resumable checkpoint at an interior 128 boundary costs one extra kernel
+launch and one extra conv slice per linear layer instead of a second 127 ms MoE sweep.
+
+Plumbed as `snap_at`/`snap_dst` from `TtModel.forward_incremental` through the decoder into
+`GatedDelta.forward`, writing straight into the checkpoint ring slot
+(`TtModel._begin_inblock_snapshot`). `GatedDelta.supports_inblock_snapshot` is False when the fused
+op is off (`QWEN36_GDN_FUSED_OP=0`), and the planner then falls back to the separate snapshot block.
+
+MEASURED, 40 layers, 10-turn growing chat, prefill per reuse turn:
+
+```
+before (512 grain):  0.33 0.55 0.88 0.33 0.56 0.61 0.88 0.33 0.56   mean 0.559  worst 0.88
+in-block (128 grain):0.34 0.32 0.62 0.34 0.34 0.34 0.34 0.34 0.34   mean 0.369  worst 0.62
+```
+
+**mean -34%, worst -30%, and 7 of 9 turns flat at 0.34 s.** This only pays with the finer padding
+ladder ({128,256,384,512}): a ~130-token tail padded to 512 costs ~614 ms, padded to 256 it costs
+~370 ms -- which is why the ladder default was widened at the same time.
+
+Also from this pass: **tracing the reuse prefill is not the lever** -- see the note at the top of
+this file (~1.02x) and the component profile below (glue is ~1% of prefill; there is no dispatch pool
+to reclaim).
+
+### 0.95 Parked conversations — the fix that made reuse actually engage in production (2026-09-08)
+
+Everything in §0.9 measures prefix reuse *in a lab loop*, one conversation at a time. In the shipped
+vLLM container it delivered **nothing**: every request logged `reused 0 (0%) ... [full prefill]`.
+
+The cause was not the reuse machinery. Real clients interleave prompt streams — a chat UI runs the
+user's conversation *and* short auto-title / auto-tag completions against the same engine. From the
+container's own logs:
+
+```
+21:12:12  T=6288  start=0  checkpoints=[]                     reused 0    <- conversation, turn 1
+21:12:23  T=209   start=0  checkpoints=[5120,5632,6144,6272]  reused 0    <- a side request
+21:12:48  T=318   start=0  checkpoints=[]                     reused 0
+21:13:57  T=6344  start=0  checkpoints=[]                     reused 0    <- turn 2, only +56 tokens
+21:14:18  T=409   start=0  checkpoints=[5120,5632,6144,6272]  reused 0
+```
+
+Two single-slot pieces of state destroying each other. The adapter kept ONE `_reuse_hist`, so a side
+request overwrote the conversation's history and the next turn's common prefix collapsed to ~0; and
+`prefill_reuse` ended with an **unscoped** `drop_state_checkpoints(above=T)`, so a 209-token request
+discarded every checkpoint the 6.3K conversation held — which is the `checkpoints=[]` above. Turn 2
+extends turn 1 by 56 tokens and should have been ~99% reuse; it paid 7.65 s.
+
+**Why the adapter could not fix this alone.** Reuse restores the gated-delta state at position P and
+recomputes only `[P, T)`. That is correct *only if the KV rows below P still belong to this
+sequence*. With one flat `[1, n_kv, max_seq, hd]` cache they do not — every prefill writes rows from
+0 — so an adapter that merely remembered four histories would restore state against another
+conversation's KV and emit plausible garbage instead of a slow answer. Paging is what makes parking
+free: each conversation owns its own blocks out of one pool, so nothing overlaps and nothing is
+copied. `QWEN36_PAGED_KV` is therefore forced on at B=1 whenever conversation slots are enabled, and
+it is **memory-neutral** — the pool defaults to `max_model_len`, exactly the tokens the flat cache
+reserved anyway, and the parked conversations share it.
+
+The pieces:
+
+| piece | where |
+|---|---|
+| N host page-table mapping rows behind ONE device table row | `PagedKV.__init__(nslots=)`, `activate()` |
+| per-conversation band of the checkpoint ring (static partition, no cross-eviction) | `TtModel._ckpt_span`, `CKPT_BAND` |
+| conversation-scoped search / restore / invalidate | `checkpoint_positions(conv)`, `restore_gdn_state(pos, conv)`, `drop_state_checkpoints(conv=)` |
+| routing a prompt to a conversation, LRU aging | `ConversationSlots` (`tt/model.py`) |
+| pool headroom check before a prefill | `kv_headroom_tokens()`, `_prefill_single_seq` |
+
+Switching conversations rewrites only the page table's **contents**, at its baked address — the same
+in-place `copy_host_to_device_tensor` `PagedKV.ensure` already does on block boundaries, so it is
+safe with a decode trace resident (`MEMORY.md` §1). Nothing is reallocated per conversation, which is
+what keeps this compatible with everything in `IMPLEMENTATION_GUIDE.md` §1.
+
+**MEASURED, 40 layers, decode trace resident throughout** (`hangdbg/multiconv.py`, 4 slots): the
+container's traffic shape — one 6.3K conversation growing +56 tokens a turn, two short side streams
+between every pair of turns, 6 decoded tokens per request.
+
+```
+chat turn 0: T=6288  reused 0     (  0%)   7.66 s     <- cold, unavoidable
+chat turn 1: T=6344  reused 6272  ( 99%)   0.29 s
+chat turn 2: T=6400  reused 6272  ( 98%)   0.28 s
+chat turn 3: T=6456  reused 6272  ( 97%)   0.35 s
+chat turn 4: T=6512  reused 6272  ( 96%)   0.35 s
+                                mean 0.32 s, worst 0.35 s
+```
+
+**7.66 s → 0.32 s** on the turns that were previously paying full price, no wedge, program cache
+saturating at 552 entries and DRAM flat at 10.50 GB free across the run. Correctness is gated
+separately: `test_interleaved_conversations_keep_their_prefix` resumes a conversation *after* an
+interleaved request and holds PCC 0.99649 against a full prefill of the same prompt — which it can
+only do if the interloper's KV went somewhere else.
+
+Cost at 40 layers: the ring goes from 4 slots to `4 x CKPT_BAND` (2), i.e. 8 x 45 MiB = 360 MiB,
+against ~10.6 GB free. `QWEN36_CONV_SLOTS=1` restores the single-conversation behaviour exactly.
+
+### 1.0 Tracy per-component profile (2026-09-05) — the MoE is 69% of prefill
+
+`prof_prefill.py` under Tracy, T=512, 4 layers, eager window, **device-kernel time** (not synced, not
+inflated by a per-phase barrier). Window total 60.104 ms. Proportions hold at 40 layers (identical op
+shapes); absolutes do not.
+
+| component | self % | note |
+|---|--:|---|
+| `moe.gate_up_mm` | 21.4 | the [E,tc,H]@[E,H,2I] dense expert matmul |
+| `moe.swiglu` | 16.1 | |
+| `moe.down_mm` | 14.0 | |
+| **`moe.repeat`** | **9.0** | pure overhead: the E-fold broadcast of the activations |
+| **`moe.reduce`** | **5.9** | pure overhead: the sum over all 256 experts |
+| `moe` router/shared/scatter/combine | 2.0 | |
+| **MoE total** | **68.6** | |
+| `delta.conv` | 7.3 | |
+| `delta.qknorm` | 6.2 | |
+| `delta.norm_out` | 5.8 | |
+| `delta.recurrence` | 4.2 | |
+| `delta.in_proj` + split + gate | 1.6 | |
+| **gated-delta total** | **25.1** | |
+| attention (out/qk_norm/qkv/rope/sdpa/kv_write) | 3.7 | |
+| head (lm_head + norm + d2h) | 2.0 | |
+| **glue** (norms, residuals, embed, rope table) | **~1.0** | |
+
+Two conclusions that change where the work should go:
+
+1. **There is no "dispatch/glue" pool to reclaim.** Norms, residuals, scatter, combine, split, gate,
+   embed and the rope table together are ~1% of prefill. Any earlier framing that put ~40% of prefill
+   in elementwise/layout/dispatch is not supported by this capture; it is ~94% real MoE + gated-delta
+   work. (Consistent with tracing the prefill being worth only ~1.02x.)
+2. **`repeat` + `reduce` alone are 14.9% of ALL prefill time**, and they are work a gathered/sparse
+   expert path would not do at all — they exist only to materialise `[E, tc, H]` and then sum it away.
+   Together with the 32x FLOP redundancy in the three matmuls, this is where the roofline gap lives.
+
 ### 1.1 Where the time goes now
 
 Device-synced per-phase (`QWEN36_PROFILE_PHASES=1`), T=512, 40 layers, warm. Absolute ms are inflated

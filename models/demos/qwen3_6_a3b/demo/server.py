@@ -35,9 +35,20 @@ This is a testing server; for multi-user serving see ``generator_vllm.py``.
 
 Launch (tt-metal python_env), standalone — opens the 1x1 mesh directly like demo.py:
     QWEN36_LAYERS=40 python models/demos/qwen3_6_a3b/demo/server.py
+Multi-turn prompts are prefilled INCREMENTALLY: a turn whose prompt extends the previous one
+continues from the device caches instead of recomputing the whole conversation, so TTFT tracks the
+new tokens rather than the transcript (``TtModel.prefill_reuse``; ``QWEN36_PREFIX_REUSE=0`` disables
+it). Measured at 40 layers on a 10-turn conversation out to 2586 prompt tokens: 47-87% of each
+prompt reused, 1-5 s per turn against a full re-prefill. Two things make it safe -- the prefill shape
+space is bucketed (``plan_prefill_blocks``, ``QWEN36_GDN_RAGGED_MASK``) and the device program cache
+is recycled past a limit (``QWEN36_PROGRAM_CACHE_LIMIT``); see IMPLEMENTATION_GUIDE.md for why both
+are needed.
+
 Env knobs: QWEN36_SERVER_HOST (0.0.0.0), QWEN36_SERVER_PORT (8000),
 QWEN36_CKPT, QWEN36_LAYERS (40), QWEN36_MAX_SEQ (32768), QWEN36_MAX_NEW_DEFAULT (8192),
-QWEN36_SERVER_TRACE (1 = capture a decode trace per request for the fast path).
+QWEN36_SERVER_TRACE (1 = capture a decode trace per request for the fast path),
+QWEN36_PREFIX_REUSE (1 = continue a multi-turn prompt from the cached prefix),
+QWEN36_PREFIX_REUSE_MIN (512 = positions a checkpoint must save to be used).
 """
 
 import json
@@ -513,6 +524,15 @@ class Qwen36Engine:
 
         self.tokenizer = AutoTokenizer.from_pretrained(ckpt)
         self.eos_ids = self._resolve_eos_ids(ckpt)
+        # Multi-turn prefix reuse: the prompt ids the device caches currently represent, so the next
+        # turn can continue from the deepest gated-delta checkpoint that still agrees with it (see
+        # TtModel.prefill_reuse). Only the PROMPT is tracked, not what was generated from it --
+        # checkpoints only exist at prefill block boundaries, and the divergence point of the next
+        # turn's render sits inside the previous prompt anyway. Safe to keep on the engine because
+        # generation is serialized under self.lock.
+        self.prefix_reuse = os.environ.get("QWEN36_PREFIX_REUSE", "1") != "0"
+        self.prefix_reuse_min = int(os.environ.get("QWEN36_PREFIX_REUSE_MIN", "512"))
+        self._hist_ids = None
 
         args = ModelArgs(mesh_device, ckpt_dir=ckpt, max_seq_len=max_seq)
         loader = CheckpointLoader(ckpt)
@@ -560,15 +580,58 @@ class Qwen36Engine:
         would pay the sampling-kernel compile (~seconds). Each generate() captures (and releases the
         prior) decode trace; persistent caches + that release keep device memory flat across
         requests (the OOM fix)."""
+        # Persistent buffers FIRST, before any prefill runs or any trace is captured, biggest first.
+        # The gated-delta checkpoint ring is 180 MiB at 40 layers; allocating it later (the lazy path,
+        # once the caches exist) drops it into the hole the first prefill's freed transients left and
+        # wedges the device on the SECOND request -- measured, see TtModel.alloc_state_checkpoints.
+        if self.prefix_reuse:
+            self.model.alloc_state_checkpoints()
+        # Then every per-shape prefill constant, still before any capture. GatedDelta caches five
+        # read-only selection matrices per block width and MoE caches a per-K one-hot; both are built
+        # on FIRST USE of that width, which after warmup means "while the decode trace is resident".
+        # Read-only + allocated under a live trace = corrupted by a replay and never repaired, which
+        # is what wedged turn 5 of a growing chat. See TtModel.prewarm_prefill_shapes.
+        if os.environ.get("QWEN36_PREWARM_SHAPES", "1") != "0":
+            self.model.prewarm_prefill_shapes()
+        # Allocate the SAMPLING tail's persistent buffers (chunked-topk offsets/indices, the
+        # vocab-sized presence mask, the per-request param buffers) BEFORE anything captures a trace,
+        # rather than between the two warm generates. Allocating device buffers while a trace is live
+        # is the aliasing hazard in MEMORY.md §1-3 and allocator.cpp's own warning; doing it late used
+        # to silently DEGRADE the device (measured: prefill 149 vs 743 tok/s, decode 5.5 vs 24.5).
+        # enable_sampling(0) then restores greedy; the buffers persist and are rewritten in place.
+        self.model.enable_sampling(1.0, top_k=20, top_p=0.95, seed=0, presence_penalty=1.5)
+        self.model.enable_sampling(0.0)
         warm_ids = self.tokenizer.encode("Hello", return_tensors="pt").squeeze(0)
         mtp, self.use_mtp = self.use_mtp, False  # the two warm generates below must stay PLAIN: they
         try:  # compile the plain tails and provide the break-even reference _decode_mtp compares to
+            # SAMPLING FIRST, GREEDY SECOND, and the order is load-bearing -- do not "tidy" it back.
+            #
+            # Each generate() captures a decode trace, and capture_decode_trace RELEASES the previous
+            # one first. The sampling graph is the larger of the two (chunked topk + ttnn.sampling +
+            # the presence mask on top of the greedy argmax), and capturing the LARGER graph into the
+            # hole left by releasing the SMALLER one leaves the trace region in a state that a later
+            # large eager prefill collides with: the collision hangs the device inside that prefill --
+            # a readback that never returns, `tt-smi -r` to recover.
+            #
+            # MEASURED (tests/probe_prefix_reuse_hang.py, 4 layers, prefill T=636 twice):
+            #     warmup none / greedy only / sampling only ....... pass
+            #     greedy -> greedy (release + re-capture, one tail)  pass
+            #     greedy -> sampling (the old order) .............. HANG on the 2nd prefill
+            #     sampling -> greedy (this order) ................. pass
+            # So it is the size change across the release, not the release itself. Capturing the big
+            # one first means the second capture fits in the freed hole.
+            #
+            # This was a PRE-EXISTING bug in this server, not something prefix reuse introduced:
+            # sending the SAME prompt twice was enough to wedge the board. It stayed hidden because a
+            # growing chat transcript gives every turn a different prompt length, so the second
+            # prefill of a given shape rarely happened.
+            #
             # 24 tokens, not 4: long enough for _decode_plain to record an end-to-end ms/token
             # (it needs >16 steps), which is the reference the MTP break-even guard uses.
-            self.generate(warm_ids, 64 if mtp else 4)  # greedy tail
-            greedy_ms, greedy_e2e = self._calibrate_plain() if mtp else None, self.plain_ms_per_token
             self.generate(warm_ids, 64 if mtp else 4, temperature=1.0, top_k=20, top_p=0.95, presence_penalty=1.5)
             sampling_ms, sampling_e2e = self._calibrate_plain() if mtp else None, self.plain_ms_per_token
+            self.generate(warm_ids, 64 if mtp else 4)  # greedy tail
+            greedy_ms, greedy_e2e = self._calibrate_plain() if mtp else None, self.plain_ms_per_token
         finally:
             self.use_mtp = mtp
         if self.use_mtp:
@@ -727,8 +790,22 @@ class Qwen36Engine:
         self.model._keep_prefill_hidden = mtp and self.mtp_prime
         if self.use_prefill_trace:
             logits = self.model.forward_prefill_traced(ids)  # prefill -> [1, 1, vocab] host logits
+        elif self.prefix_reuse and not self.model._keep_prefill_hidden:
+            # Continue from the previous turn's cached prefix when this prompt extends it. Skipped
+            # when the MTP head is to be primed: priming needs the per-position hidden, which only a
+            # single-shot prefill materialises (see TtModel.prefill_from).
+            t0 = time.time()
+            logits, reused = self.model.prefill_reuse(ids, self._hist_ids, min_reuse=self.prefix_reuse_min)
+            self._hist_ids = ids[0].tolist()
+            dt, new_tok = time.time() - t0, prompt_len - reused
+            logger.info(
+                f"[prefill] {prompt_len} tok in {dt:.2f}s: reused {reused} "
+                f"({100.0 * reused / max(prompt_len, 1):.0f}%), computed {new_tok}"
+                + (f" = {new_tok / dt:.0f} tok/s" if dt > 0 else "")
+            )
         else:
             logits = self.model.forward(ids)
+            self._hist_ids = None  # the caches no longer match a tracked prompt
         next_id = int(logits[0, -1].argmax())  # first token is greedy argmax
         self.model.start_decode(next_id)
 

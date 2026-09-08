@@ -46,6 +46,7 @@ def _allocator(mesh_device, args, max_seq, paged=False):
     m.max_seq = max_seq
     m.paged_kv = paged
     m.kv_pager = None
+    m.n_conv_slots = 1  # parked conversations: the pager's host mapping rows (TtModel.__init__)
     return m
 
 

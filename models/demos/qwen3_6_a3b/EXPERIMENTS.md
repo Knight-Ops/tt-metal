@@ -168,6 +168,36 @@ Two things this settles:
   tile-columns, so slicing 3 of 32 rows is a strided gather across all of them. That is why the conv
   dominates, and it is why experiment #7 (which added a `concat` and a `sum` reduction) went backwards.
 
+## The verify SDPA batches; the verify WRITE does not (2026-08-23)
+
+Two halves of one idea, measured separately, and only one shipped. Both from
+`tests/probe_packed_verify.py`; the mechanism and the end-to-end A/B are in `MTP.md`.
+
+**SHIPPED — batch the read.** `paged_scaled_dot_product_attention_decode` takes its batch from
+`page_table.shape[0]`, not from the KV cache, so K identical table rows turn the K verify positions into
+K "decode users" over one sequence. `-1.9%` on the verify trace at the shipping gamma=2 and `-4.8%` at
+K=16 (short context); `-2.7%` / `-6.7%` at pos~2048. The marginal cost per speculative token drops
+6.843 -> 6.264 ms, i.e. **it is a slope change, not an intercept change**, which is why it compounds with
+K. `QWEN36_VERIFY_BATCH_SDPA`, default on.
+
+**REJECTED — batch the write.** `paged_update_cache` accepts the identical K-user shape and is a further
+1.85x on the pair (K=16 @pos=1024: 252.7 -> 136.9 us per attention layer), and it silently CORRUPTS the
+cache. The program factory dispatches one user per core; K consecutive positions share a 32-row tile; K
+cores then read-modify-write that tile. Max |written - intended| on the K new rows is **0.88-1.05 against
+a ~0.25 value scale** at every K>1 and both cache dtypes.
+
+The diagnostic that pins the mechanism rather than just the symptom: run the SAME batched write with the
+rows **32 apart** — one tile each — and it is **bit-exact**. So the op is not broken and the shape is not
+wrong; sharing a tile across cores is. Muse Glimmer's packed verifier hits this too and pays for it with
+a hand-written NOC kernel (`tt/attention/kernels/packed_kv_update.cpp`) whose comment says outright that
+each core serializes its own row writes. That kernel is worth the remaining ~1.2 ms/verify at K=16.
+
+**Rule this adds to the section below:** when an op's program factory maps one core per batch entry, ask
+what tile those entries land in before batching them. Row-granular NOC writes into a shared tile are a
+data race that no validation checks and no PCC gate on the OUTPUT will reliably catch — the corruption
+here moved output PCC only from 0.99989 to 0.9961, which passes a 0.99 gate. Gate the CACHE, not just the
+output.
+
 ## What did NOT work, and the rule it establishes
 
 Op count is a bad predictor of traced cost on this hardware. Three predictions failed:

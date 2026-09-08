@@ -2,6 +2,29 @@
 # SPDX-License-Identifier: Apache-2.0
 """Prove a staged bundle is self-contained by IMPORTING it the way a serve host would.
 
+DEPRECATED — this targets an interface that no longer exists.
+================================================================
+``tt-kernel push --backend vllm`` is gone: ``tt-kernel`` is now a deprecated alias for
+``tt-model``, and its ``push`` subcommand publishes a v5.1 CONTAINER package directory
+(there is no ``--backend`` flag any more). The v4 manifest schema this pairs with is also
+refused by current tt-model ("Older bundles (pre-v5 schemas) are refused").
+
+The live packaging path is ``../tt-model.yaml`` (a v5.1 container manifest):
+
+    tt-model package --container models/demos/qwen3_6_a3b/tt-model.yaml
+    tt-model push    build/qwen3.6-a3b-blackhole --public --publish
+
+That ships an OCI image with the OS, tt-metal, stock vLLM (built VLLM_TARGET_DEVICE=empty)
+and the plugin baked in, so a consumer needs only Docker and a card -- no host tt-metal, no
+venv negotiation, and none of the vendoring this script does.
+
+Kept for reference because its import-closure analysis is what established the model's
+actual dependency set (23 modules plus exactly two upstream imports), which is where
+tt-model.yaml's ``source.code`` allowlist comes from. Note one bug if you do read it: its
+data-file globbing pulled in ``demo/generated/**`` -- watcher/inspector run artifacts, ~30 MB
+of them -- so the bundles it produced shipped build junk.
+
+
 Why this exists
 ---------------
 The v4 bundle shipped with a hidden dependency: ``tt/moe.py`` did an unconditional

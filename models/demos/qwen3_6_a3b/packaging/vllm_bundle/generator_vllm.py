@@ -22,6 +22,11 @@ So V1 **overrides** prefill_forward/decode_forward to drive that loop directly, 
 model-internals refactor. Trace is OFF in V1 (eager decode) for simplicity; continuous
 batching and traced decode are V2 (see packaging/VLLM_CONTINUOUS_BATCHING.md).
 
+PREFIX REUSE (B=1): a turn is prefilled by CONTINUING from the previous turn's device caches
+rather than recomputing the whole conversation -- see the `_PREFIX_REUSE` block below and
+`TtModel.prefill_reuse`. This is the fix for multi-turn TTFT growing with the transcript; it is
+model-internal because vLLM's own prefix caching cannot represent gated-delta state.
+
 PAGED KV (2026-08-23): wired, and ON by default for `--max-num-seqs > 1`. One block pool
 shared across slots and across the 10 attention layers, so the KV budget follows concurrent
 demand (`QWEN36_KV_POOL_TOKENS`) rather than `max_num_seqs x max_model_len` — which is what
@@ -48,6 +53,7 @@ from __future__ import annotations
 
 import os
 import random
+import time
 
 import torch
 from loguru import logger
@@ -66,7 +72,7 @@ from vllm.multimodal import MULTIMODAL_REGISTRY
 
 # Model primitives (present in the serving env's tt-metal checkout).
 from models.demos.qwen3_6_a3b.tt.load_checkpoints import CheckpointLoader
-from models.demos.qwen3_6_a3b.tt.model import TtModel
+from models.demos.qwen3_6_a3b.tt.model import ConversationSlots, TtModel
 from models.demos.qwen3_6_a3b.tt.model_config import ModelArgs
 from models.tt_transformers.tt.generator import Generator
 
@@ -123,6 +129,71 @@ def _resolve_weights(hf_config) -> str:
     return os.path.expanduser(name_or_path)
 
 
+# ── Multi-turn prefix reuse (B=1) ──────────────────────────────────────────────
+# Without this, EVERY turn re-prefills the whole conversation: vLLM's own prefix caching is
+# unavailable here (the plugin disables it unless `supports_prefix_caching`, and it could not help
+# anyway -- it reuses blocks in vLLM's KV pool, while this model owns its KV *and* 30 layers of
+# gated-delta recurrent state that has no block representation). So the reuse is done here, against
+# the model's own caches, via TtModel.prefill_reuse.
+#
+# What makes it cheap: a turn's prompt is nearly always an extension of the previous turn's, because
+# the chat template re-renders older history identically. Measured on Qwen3.6's template, the two
+# token streams first differ 2 tokens before the end of the previous prompt (the generation prompt's
+# "<think>\n") in plain chat, and NOT AT ALL in a tool-call loop -- there the template retains the
+# reasoning of every assistant turn since the last real user query, so the cache is an exact prefix.
+# Either way the per-turn ingest is the last answer's visible text plus the new message, not the
+# whole context. Thinking mode needs no special handling: dropped <think> blocks move the divergence
+# point, and the reuse point is derived by COMPARING TOKENS, never by trusting the template.
+#
+# Validated in tests/test_prefix_reuse.py (resumed vs full prefill PCC 0.9988, and 0.9994 after four
+# chained turns, so it does not drift) and end to end on a 5-turn conversation: 83.5 s of prefill
+# without it against 11.3 s with it.
+#
+# Measured at 40 layers: 47-87% of each prompt reused across a 10-turn conversation out to 2586
+# tokens. Two supporting fixes are what make it safe, and neither is optional -- the prefill shape
+# space is bucketed so the program cache saturates instead of growing ~90 entries a turn, and the
+# cache is recycled past QWEN36_PROGRAM_CACHE_LIMIT. Without them the device hangs a few turns in.
+# See IMPLEMENTATION_GUIDE.md and tests/probe_prefix_reuse_hang.py.
+#
+#   QWEN36_PREFIX_REUSE=0            disable (every turn re-prefills in full, the old behaviour)
+#   QWEN36_PREFIX_REUSE_MIN          positions a checkpoint must save to be worth using (default 512)
+#   QWEN36_PREFIX_REUSE_MAX_TURNS    force a full re-prefill after N consecutive reuses (0 = never).
+#                                    A resumed turn builds on a RESTORED state rather than one
+#                                    recomputed from the prompt, so numerical divergence from a full
+#                                    prefill compounds across turns; this bounds it. Single-hop
+#                                    incremental prefill is PCC >= 0.999 (PREFILL.md §3.5) but the
+#                                    many-hop case is unmeasured -- see tests/test_prefix_reuse.py.
+#   QWEN36_STATE_CKPT_DEPTH          checkpoint ring depth (tt/model.py, default 4 x 31.4 MiB). Also
+#                                    how far back a client that rewrites OLD history can resume from.
+#   QWEN36_CONV_SLOTS                parked conversations at B=1 (default 4; 1 = the old single-slot
+#                                    behaviour). See the MULTI-CONVERSATION note below.
+#
+# MULTI-CONVERSATION (2026-09-08). One remembered history is not enough, and the failure is silent.
+# Real clients interleave prompt streams: a chat UI runs the user's conversation AND short
+# auto-title / auto-tag completions against the same engine. MEASURED in the shipped container --
+# a 6.3K conversation growing +56 tokens a turn, interleaved with 209/263/318/409-token side
+# requests, and EVERY prefill logged "reused 0 (0%) ... [full prefill]". Two single-slot pieces of
+# state destroyed each other:
+#
+#   * this adapter kept ONE `_reuse_hist`, so each side request overwrote the conversation's
+#     history and the next real turn's common prefix collapsed to ~0;
+#   * `prefill_reuse` ended with an UNSCOPED `drop_state_checkpoints(above=T)`, so a 209-token
+#     request discarded every checkpoint the 6.3K conversation held (`checkpoints=[]` in its logs).
+#
+# So the fix is two-sided, and the adapter half alone would be worse than useless -- restoring a
+# gated-delta state against another conversation's KV rows produces plausible garbage rather than a
+# slow answer. `TtModel.alloc_conversation_slots` gives each conversation its own KV blocks (paged;
+# see tt/paged_kv.py activate()) and its own band of the checkpoint ring; `ConversationSlots`
+# (tt/model.py, next to the rest of the reuse policy) picks which one a prompt belongs to. There is
+# no conversation id to key on -- the plugin hands prefill_forward only tokens -- so identity comes
+# from the longest common prefix, which is the same comparison prefix reuse already trusts, and
+# slots age out least-recently-used.
+_PREFIX_REUSE = os.environ.get("QWEN36_PREFIX_REUSE", "1") != "0"
+_PREFIX_REUSE_MIN = int(os.environ.get("QWEN36_PREFIX_REUSE_MIN", "512"))
+_PREFIX_REUSE_MAX_TURNS = int(os.environ.get("QWEN36_PREFIX_REUSE_MAX_TURNS", "0"))
+_CONV_SLOTS = max(1, int(os.environ.get("QWEN36_CONV_SLOTS", "4")))
+
+
 @MULTIMODAL_REGISTRY.register_processor(
     Qwen3VLMultiModalProcessor,
     info=TT_Qwen3_5MoeProcessingInfo,
@@ -151,6 +222,12 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
     # full-vocab D2H + CPU sampling per step — the throughput unlock for B>1. Presence penalty is
     # omitted on the batched path (v1); requests needing host-only features still route to host sampling.
     model_capabilities = {
+        # Stays False, and that is not a TODO: vLLM's prefix caching reuses blocks in ITS KV pool,
+        # which this model bypasses entirely (allocate_kv_cache returns []), and 30 of 40 layers carry
+        # gated-delta recurrent state that has no block representation to reuse. Cross-turn reuse is
+        # instead done against the model's own caches in _prefill_single_seq / TtModel.prefill_reuse,
+        # which is invisible to vLLM: we are always handed the full prompt and simply decline to
+        # recompute the part we already hold.
         "supports_prefix_caching": False,
         "supports_async_decode": False,
         "supports_sample_on_device": True,
@@ -239,6 +316,30 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
                     f"[qwen36-vllm][cb] B={cls._max_batch_size}: QWEN36_PAGED_KV=0, capping per-slot "
                     f"context to {max_seq_len} tokens (contiguous KV)"
                 )
+        conv_slots = 1
+        if cls._max_batch_size == 1 and _PREFIX_REUSE and _CONV_SLOTS > 1:
+            # PARKED CONVERSATIONS need paged KV -- see the MULTI-CONVERSATION note at the top of
+            # this file and TtModel.alloc_conversation_slots. This is the one place the single-
+            # sequence path turns paging on, and it is memory-NEUTRAL: the pool defaults to
+            # max_model_len, exactly the tokens the flat cache reserved anyway, and the parked
+            # conversations SHARE it instead of each getting their own. Explicitly opting out
+            # (QWEN36_PAGED_KV=0) keeps the flat cache and drops back to one conversation.
+            if os.environ.get("QWEN36_PAGED_KV") == "0":
+                logger.warning(
+                    "[qwen36-vllm] QWEN36_PAGED_KV=0: parked conversations need paged KV, so prefix "
+                    "reuse falls back to ONE conversation. Interleaved prompt streams (a chat UI's "
+                    "auto-title requests, say) will each force a full prefill."
+                )
+            else:
+                os.environ["QWEN36_PAGED_KV"] = "1"
+                pool = int(os.environ.get("QWEN36_KV_POOL_TOKENS", str(max_seq_len)))
+                os.environ["QWEN36_KV_POOL_TOKENS"] = str(pool)
+                conv_slots = _CONV_SLOTS
+                logger.info(
+                    f"[qwen36-vllm] paged KV, pool={pool} tokens shared by {conv_slots} parked "
+                    f"conversation slots (~{pool * 10880 / 2**30:.2f} GiB at bf8). Any one "
+                    f"conversation may use the whole pool; slots age out least-recently-used."
+                )
         ckpt = _resolve_weights(hf_config)
         os.environ.setdefault("QWEN36_EXPERT_DTYPE", "bf4")  # only bf4 (~17.5 GB) fits a 32 GB P150
         os.environ.setdefault("TT_CACHE_PATH", os.path.join(ckpt, "tt_weight_cache"))
@@ -246,6 +347,33 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         args = ModelArgs(mesh_device, ckpt_dir=ckpt, max_batch_size=int(max_batch_size), max_seq_len=max_seq_len)
         loader = CheckpointLoader(ckpt)
         model = TtModel(mesh_device, args, loader, num_layers=n_layers)
+        # BEFORE the caches and the checkpoint ring: the conversation-slot count is baked into both
+        # (the KV pager's host mapping rows, and the ring's per-conversation bands), and neither can
+        # be regrown afterwards -- the page table is an address a decode trace bakes, and the ring
+        # must not be reallocated once a trace exists (IMPLEMENTATION_GUIDE.md §1).
+        if conv_slots > 1:
+            model.alloc_conversation_slots(conv_slots)
+        # Persistent buffers FIRST, before any prefill or trace capture -- biggest first. The
+        # gated-delta checkpoint ring is 180 MiB at 40 layers and fragments the trace region if it is
+        # allocated later; see TtModel.alloc_state_checkpoints for the measurement.
+        if _PREFIX_REUSE:
+            model.alloc_state_checkpoints()
+        # Then every per-WIDTH prefill constant, still before any capture. GatedDelta caches five
+        # read-only selection matrices per block width and MoE a per-K one-hot, both built on FIRST
+        # use of that width -- which, once a trace exists, means "allocated under an active trace".
+        # A replay stomps them and, being write-once, they are never repaired, so the next request
+        # that reuses that width wedges the device (measured 6/6 at 40 layers). See
+        # TtModel.prewarm_prefill_shapes.
+        if os.environ.get("QWEN36_PREWARM_SHAPES", "1") != "0":
+            model.prewarm_prefill_shapes()
+        # Allocate the on-device sampling tail's persistent buffers NOW, before any prefill or trace
+        # capture. decode_forward otherwise allocates them on the first request that samples, which
+        # may be after an earlier request captured a trace -- allocating device buffers while a trace
+        # is live is the aliasing hazard in MEMORY.md §1-3 and can wedge the device on a LATER
+        # request (see the same fix, and the bisection, in demo/server.py's warmup). enable_sampling(0)
+        # restores greedy; the buffers persist and every later call just rewrites them in place.
+        model.enable_sampling(1.0, top_k=20, top_p=0.95, seed=0, presence_penalty=0.0)
+        model.enable_sampling(0.0)
         model._vllm_decode_started = False  # bespoke prefill→decode handoff flag (V1)
         return cls([model], [args], mesh_device)
 
@@ -274,11 +402,13 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
 
     # ── prefill (model-owned) ─────────────────────────────────────────────────────
     def prefill_forward(self, tokens, page_table=None, kv_cache=None, prompt_lens=None, **kwargs):
-        """Eager prefill via TtModel.forward(); returns last-token host logits [B,1,vocab].
+        """Eager prefill; returns last-token host logits [B,1,vocab].
 
-        forward() re-zeros the GDN state for a fresh sequence (_reset_linear_state in
-        _prefill_single), so each new request starts clean. page_table/kv_cache are accepted
-        but unused (model-bound caches)."""
+        At B=1 this goes through _prefill_single_seq, which continues from the previous turn's cached
+        prefix when the new prompt extends it (QWEN36_PREFIX_REUSE) and otherwise prefills fresh --
+        a fresh prefill re-zeros the gated-delta conv left-pad (_reset_linear_state in
+        _prefill_single), so an unrelated request never inherits state. page_table/kv_cache are
+        accepted but unused (model-bound caches)."""
         model = self.model[0]
         # ── V2 continuous batching: prefill each newly-scheduled request into a free slot ──
         # Each request gets a STABLE model slot keyed by its first KV block id (page_table[i][0]); the
@@ -355,13 +485,86 @@ class Qwen36ForCausalLM(Generator, SupportsMultiModal):
         model._vllm_decode_started = False  # new sequence → reseat the decode handoff
         T = int(prompt_lens[0]) if prompt_lens is not None else int(tokens.shape[1])
         ids = tokens[:, :T] if tokens.shape[1] > T else tokens
-        logger.info(f"[qwen36-vllm] prefill user up to {T} tokens")
-        logits = model.forward(ids)  # host logits [1, 1, vocab]
+        logits = self._prefill_single_seq(model, ids, T)  # host logits [1, 1, vocab]
         logits = torch.as_tensor(logits).reshape(1, 1, -1).float()
         # The TT plugin's submit_prefill unpacks (logits, rope_deltas); rope_deltas are zeros
         # for this text-only port (no mrope position shift). CONFIRMED on-device 2026-07-18.
         rope_deltas = torch.zeros(logits.shape[0], dtype=torch.long)
         return logits, rope_deltas
+
+    def _prefill_single_seq(self, model, ids, T):
+        """B=1 prefill, continuing from the previous turn's cached prefix where possible.
+
+        The history this compares against is the prompt we prefilled LAST -- not the tokens the model
+        went on to generate. That is deliberate and sufficient: every checkpoint sits at or before the
+        end of a prefill, and the next turn's divergence point (the newest assistant turn) is inside
+        the previous prompt, so decode-time checkpointing would buy nothing and would have to deal
+        with the conv add-chain (`conv_rows`) that a prefill-time snapshot can ignore."""
+        if not _PREFIX_REUSE:
+            logger.info(f"[qwen36-vllm] prefill user up to {T} tokens")
+            return model.forward(ids)
+        toks = ids[0].tolist()
+        slots = self._conv_slots
+        conv, lcp, evicted = slots.match(toks)
+        if evicted is not None:
+            # Aged out: hand the conversation's KV blocks back to the pool and forget its
+            # checkpoints, so the incoming prompt starts from a clean slot rather than resuming
+            # against a stranger's cache.
+            logger.info(
+                f"[qwen36-vllm] conversation slot {conv} aged out "
+                f"({len(slots.hist[conv] or ())} tok) to make room for a {T}-token prompt"
+            )
+            slots.forget(conv)
+            model.release_conversation(conv)
+        # A slot being FREE is not the same as the pool having room for it. Parked conversations keep
+        # their blocks until aged out, and the pool has no eviction of its own -- `ensure` raises
+        # "block pool exhausted" partway through a prefill, which fails the request outright. So make
+        # room first, least-recently-used, and only ever from conversations other than this one.
+        need = T - model.conversation_tokens(conv)
+        while need > 0 and model.kv_headroom_tokens() < need:
+            victim = slots.lru(exclude=(conv,))
+            if victim is None:
+                break  # nothing left to give; let the pool raise with its own actionable message
+            logger.info(
+                f"[qwen36-vllm] KV pool headroom {model.kv_headroom_tokens()} < {need} needed: "
+                f"aging out conversation slot {victim} ({len(slots.hist[victim] or ())} tok)"
+            )
+            slots.forget(victim)
+            model.release_conversation(victim)
+        # Escape hatch: drop the history every N reuses so the context is periodically recomputed
+        # from the prompt rather than extended from a restored state.
+        streak = slots.streak[conv]
+        hist = None if (_PREFIX_REUSE_MAX_TURNS and streak >= _PREFIX_REUSE_MAX_TURNS) else slots.hist[conv]
+        t0 = time.time()
+        logits, reused = model.prefill_reuse(ids, hist_ids=hist, min_reuse=_PREFIX_REUSE_MIN, conv=conv)
+        slots.commit(conv, toks, reused)
+        dt = time.time() - t0
+        new_tok = T - reused
+        logger.info(
+            f"[qwen36-vllm] prefill {T} tok in {dt:.2f}s: reused {reused} ({100.0 * reused / max(T, 1):.0f}%), "
+            f"computed {new_tok}"
+            + (f" = {new_tok / dt:.0f} tok/s" if dt > 0 else "")
+            + (
+                f" [conv {conv}/{slots.n} lcp {lcp}"
+                + (f" streak {slots.streak[conv]}]" if reused else " full prefill]")
+            )
+            + (f" slots {slots.describe()}" if slots.n > 1 else "")
+        )
+        return logits
+
+    @property
+    def _conv_slots(self):
+        """The parked-conversation table, built on first use.
+
+        Sized to what the MODEL actually allocated, not to QWEN36_CONV_SLOTS: if the model came up
+        with one slot (paging off, or an older build) the table must be one slot too, or the adapter
+        would hand prefill_reuse a conversation index the model has no KV blocks for."""
+        t = getattr(self, "_conv_slots_tbl", None)
+        if t is None:
+            n = max(1, int(getattr(self.model[0], "n_conv_slots", 1)))
+            t = self._conv_slots_tbl = ConversationSlots(n, _PREFIX_REUSE_MIN)
+            logger.info(f"[qwen36-vllm] prefix reuse across {n} parked conversation slot(s)")
+        return t
 
     # ── decode (dual path: on-device sampling → tokens; host sampling → logits) ────────
     def decode_forward(
